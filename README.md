@@ -17,6 +17,48 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
+### Data path and leg roles
+
+Leg 0 is the session anchor and preferred path. It creates the session, carries
+cumulative acknowledgements and stream control, and carries all application data
+before aggregation activates. This keeps connection setup and small transfers on the
+configured low-latency path. Losing leg 0 closes the logical connection because the
+session no longer has its control path.
+
+Leg 1 is a capacity booster. It can attach while the connection is still using only
+leg 0, but it does not carry application data until a local activation trigger fires.
+Each direction makes that decision independently from its own sent-byte count,
+measured rate, and leg 0 queue pressure. Once active, new frames are assigned by each
+leg's queued bytes divided by its `bandwidth_mbps` weight, so a backing-up leg becomes
+less attractive without delaying writes already queued on the other leg.
+
+The logical byte stream is split into globally sequenced frames. The receiver accepts
+frames from both legs, buffers only bounded out-of-order data, and writes contiguous
+frames to the application. Cumulative ACKs return on leg 0. A frame assigned to leg 1
+is retained once in the replay map until that ACK covers it; the queue and replay map
+refer to the same payload rather than keeping duplicate copies.
+
+### Weak leg 1 and fallback
+
+The two legs have independent send queues and writers. A slow leg 1 therefore cannot
+block the leg 0 socket or its queue. If leg 1 stops making progress, unacknowledged
+frames reach `leg1_replay_timeout`; leg 1 is detached, those frames are re-injected on
+leg 0 in sequence order, and the client retries leg 1 in the background. Leg 0 remains
+the usable fallback path throughout this process.
+
+Because the result is still one ordered TCP byte stream, a missing earlier frame on
+leg 1 can temporarily hold later frames from the same connection until replay starts.
+This head-of-line delay is bounded by the replay timeout. It does not stop leg 0 for
+other connections: shared memory pressure pauses new booster work first, preserves
+the final budget for leg 0, and applies backpressure only to an affected session that
+still has outstanding leg 1 replay. Memory pressure alone does not close leg 1.
+
+Payload buffers and estimated per-session overhead share one budget per multipath
+inbound or outbound. With `memory_limit` omitted, the budget is
+`min(512 MiB, MemAvailable * 0.5)`. Leg 1 pauses at 7/8 of the budget and resumes at
+3/4; leg 0 may use the hard limit. Below the high watermark, scheduling and queueing
+behavior is unchanged.
+
 ### Client outbound example
 
 The following example uses a system WireGuard interface for the preferred leg and an
@@ -129,6 +171,7 @@ exceed the server value.
 | `max_reorder_bytes` | Limit for buffered out-of-order data. Default: 64 MiB; maximum: 512 MiB. |
 | `leg1_replay_bytes` | Maximum retained send history used to recover data assigned to a stalled leg 1. Default: 64 MiB; maximum: 512 MiB. |
 | `leg1_replay_timeout` | Time before unacknowledged leg 1 data is replayed on leg 0. Default: `5s`. |
+| `memory_limit` | Shared memory budget for all sessions of this multipath inbound or outbound. Defaults to `min(512 MiB, MemAvailable * 0.5)`. Booster backpressure starts at 7/8 and clears at 3/4. |
 | `handshake_timeout` | Timeout for a multipath leg handshake. Default: `10s`. |
 
 The server inbound also accepts the standard sing-box listen fields, including
