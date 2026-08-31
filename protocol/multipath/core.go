@@ -46,6 +46,7 @@ type coreConfig struct {
 	MaxReorderBytes      int64
 	ReplayBytes          int64
 	ReplayTimeout        time.Duration
+	Memory               *memoryBudget
 	OnLeg1Active         func(activationInfo, bool)
 	OnLegFailure         func(uint8, legFailureStage, error)
 }
@@ -212,6 +213,8 @@ func (c *logicalConn) SetWriteDeadline(deadline time.Time) error {
 
 type mpLeg struct {
 	id           uint8
+	ctx          context.Context
+	cancel       context.CancelFunc
 	conn         net.Conn
 	readPreamble func(net.Conn) error
 	send         chan wireFrame
@@ -232,6 +235,7 @@ func (l *mpLeg) Done() <-chan struct{} {
 func (l *mpLeg) close(err error) {
 	l.closeOne.Do(func() {
 		close(l.done)
+		l.cancel()
 		_ = l.conn.Close()
 		if l.onClose != nil {
 			l.onClose(err)
@@ -321,6 +325,7 @@ type mpCore struct {
 	remoteFIN    atomic.Bool
 	ackNext      atomic.Uint64
 	ackedNext    atomic.Uint64
+	rxExpected   atomic.Uint64
 	ackWake      chan struct{}
 	replayMu     sync.Mutex
 	replay       map[uint64]*replayEntry
@@ -330,10 +335,24 @@ type mpCore struct {
 	failureMu    sync.Mutex
 	failure      string
 	failureAt    time.Time
-	bufferPool   sync.Pool
+	memory       *memoryBudget
+	sessionBytes int64
+	bufferMu     sync.Mutex
+	buffers      map[*byte][]byte
+	workerMu     sync.Mutex
+	workerGroup  sync.WaitGroup
+	workerClosed bool
 }
 
 func newCore(parent context.Context, cfg coreConfig) (*mpCore, net.Conn) {
+	core, appConn, err := newCoreWithError(parent, cfg)
+	if err != nil {
+		panic(err)
+	}
+	return core, appConn
+}
+
+func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn, error) {
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = 64 * 1024
 	}
@@ -361,36 +380,62 @@ func newCore(parent context.Context, cfg coreConfig) (*mpCore, net.Conn) {
 	if parent == nil {
 		parent = context.Background()
 	}
+	memory := cfg.Memory
+	if memory == nil {
+		memory = newMemoryBudget(1<<62, false)
+	}
+	sessionBytes := sessionMemoryReservation(cfg)
+	if !memory.reserveSession(sessionBytes) {
+		return nil, nil, errMemoryLimit
+	}
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	appConn, txPipe, rxPipe := newLogicalPipe()
 	c := &mpCore{
-		cfg:      cfg,
-		ctx:      ctx,
-		cancel:   cancel,
-		appConn:  appConn,
-		txPipe:   txPipe,
-		rxPipe:   rxPipe,
-		legs:     make(map[uint8]*mpLeg),
-		reserved: make(map[uint8]bool),
-		incoming: make(chan wireFrame, cfg.QueueFrames*2),
-		done:     make(chan struct{}),
-		activeCh: make(chan struct{}),
-		ackWake:  make(chan struct{}, 1),
-		replay:   make(map[uint64]*replayEntry),
+		cfg:          cfg,
+		ctx:          ctx,
+		cancel:       cancel,
+		appConn:      appConn,
+		txPipe:       txPipe,
+		rxPipe:       rxPipe,
+		legs:         make(map[uint8]*mpLeg),
+		reserved:     make(map[uint8]bool),
+		incoming:     make(chan wireFrame, cfg.QueueFrames*2),
+		done:         make(chan struct{}),
+		activeCh:     make(chan struct{}),
+		ackWake:      make(chan struct{}, 1),
+		replay:       make(map[uint64]*replayEntry),
+		memory:       memory,
+		sessionBytes: sessionBytes,
+		buffers:      make(map[*byte][]byte),
 	}
 	appConn.onClose = func() { c.fail(io.EOF) }
-	c.bufferPool.New = func() any {
-		return make([]byte, cfg.ChunkSize)
-	}
 	if cfg.ThresholdBytesPS == 0 && cfg.ActivationAfterBytes == 0 {
 		c.activate(activationInfo{Reason: activationReasonImmediate})
 	}
-	go c.txLoop()
-	go c.rxLoop()
-	go c.activationLoop()
-	go c.ackLoop()
-	go c.replayLoop()
-	return c, appConn
+	c.startWorkers(c.txLoop, c.rxLoop, c.activationLoop, c.ackLoop, c.replayLoop)
+	return c, appConn, nil
+}
+
+func (c *mpCore) startWorkers(workers ...func()) bool {
+	c.workerMu.Lock()
+	defer c.workerMu.Unlock()
+	if c.workerClosed {
+		return false
+	}
+	for _, worker := range workers {
+		c.workerGroup.Add(1)
+		go func(run func()) {
+			defer c.workerGroup.Done()
+			run()
+		}(worker)
+	}
+	return true
+}
+
+func (c *mpCore) stopWorkerAdmission() {
+	c.workerMu.Lock()
+	c.workerClosed = true
+	c.workerMu.Unlock()
 }
 
 func (c *mpCore) Context() context.Context {
@@ -432,6 +477,7 @@ func (c *mpCore) terminate(err error, terminalFrameType byte) {
 		err = errCoreClosed
 	}
 	c.closeOne.Do(func() {
+		c.stopWorkerAdmission()
 		c.failureMu.Lock()
 		c.failure = err.Error()
 		c.failureAt = time.Now()
@@ -450,14 +496,19 @@ func (c *mpCore) terminate(err error, terminalFrameType byte) {
 		_ = c.txPipe.Close()
 		_ = c.rxPipe.Close()
 		_, _ = c.appConn.closeInternal()
-		go closeLegsAfterDrain(legs, err)
-		// Buffers possibly referenced by blocked writers are deliberately left to
-		// the garbage collector instead of being returned to the pool here.
 		c.replayMu.Lock()
 		c.replay = make(map[uint64]*replayEntry)
 		c.replayBytes = 0
 		c.replayMu.Unlock()
+		go c.releaseAfterShutdown(legs, err)
 	})
+}
+
+func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
+	closeLegsAfterDrain(legs, err)
+	c.workerGroup.Wait()
+	c.releaseAllBuffers()
+	c.memory.releaseSession(c.sessionBytes)
 }
 
 func (c *mpCore) protocolFail(err error) {
@@ -523,8 +574,11 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		c.legsMu.Unlock()
 		return nil, errors.New("duplicate multipath leg")
 	}
+	legCtx, legCancel := context.WithCancel(c.ctx)
 	leg := &mpLeg{
 		id:           id,
+		ctx:          legCtx,
+		cancel:       legCancel,
 		conn:         conn,
 		readPreamble: readPreamble,
 		send:         make(chan wireFrame, c.cfg.QueueFrames),
@@ -535,9 +589,13 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		writerDone:   make(chan struct{}),
 	}
 	c.legs[id] = leg
+	if !c.startWorkers(func() { c.legWriteLoop(leg) }, func() { c.legReadLoop(leg) }) {
+		delete(c.legs, id)
+		c.legsMu.Unlock()
+		legCancel()
+		return nil, errCoreClosed
+	}
 	c.legsMu.Unlock()
-	go c.legWriteLoop(leg)
-	go c.legReadLoop(leg)
 	if id == 1 {
 		c.notifyLeg1Active()
 	}
@@ -579,20 +637,54 @@ func (c *mpCore) availableLegs() []*mpLeg {
 	return legs
 }
 
-func (c *mpCore) getBuffer() []byte {
-	return c.bufferPool.Get().([]byte)
+func (c *mpCore) getBuffer(ctx context.Context, class memoryClass) ([]byte, error) {
+	buffer, err := c.memory.acquire(ctx, c.cfg.ChunkSize, class)
+	if err != nil {
+		return nil, err
+	}
+	key := &buffer[0]
+	c.bufferMu.Lock()
+	c.buffers[key] = buffer
+	c.bufferMu.Unlock()
+	return buffer, nil
 }
 
 func (c *mpCore) putBuffer(buffer []byte) {
 	if cap(buffer) != c.cfg.ChunkSize {
 		return
 	}
-	c.bufferPool.Put(buffer[:c.cfg.ChunkSize])
+	fullBuffer := buffer[:cap(buffer)]
+	key := &fullBuffer[0]
+	c.bufferMu.Lock()
+	owned, loaded := c.buffers[key]
+	if loaded {
+		delete(c.buffers, key)
+	}
+	c.bufferMu.Unlock()
+	if loaded {
+		c.memory.release(owned)
+	}
+}
+
+func (c *mpCore) releaseAllBuffers() {
+	c.bufferMu.Lock()
+	buffers := make([][]byte, 0, len(c.buffers))
+	for _, buffer := range c.buffers {
+		buffers = append(buffers, buffer)
+	}
+	c.buffers = make(map[*byte][]byte)
+	c.bufferMu.Unlock()
+	for _, buffer := range buffers {
+		c.memory.release(buffer)
+	}
 }
 
 func (c *mpCore) txLoop() {
 	for {
-		buffer := c.getBuffer()
+		buffer, bufferErr := c.getBuffer(c.ctx, memoryClassPrimary)
+		if bufferErr != nil {
+			return
+		}
 		n, err := c.txPipe.Read(buffer[:c.cfg.ChunkSize])
 		if n > 0 {
 			c.ingressBytes.Add(uint64(n))
@@ -765,6 +857,9 @@ func (c *mpCore) chooseLeg(frameLength int) *mpLeg {
 	var best *mpLeg
 	var bestNum, bestDen uint64
 	for _, leg := range legs {
+		if leg.id == 1 && !c.memory.boosterAllowed() {
+			continue
+		}
 		weight := uint64(c.weightFor(leg.id))
 		num := uint64(leg.backlogBytes() + int64(frameLength))
 		if best == nil || num*bestDen < bestNum*weight {
@@ -803,6 +898,14 @@ func (c *mpCore) enqueue(frame wireFrame) error {
 		case <-c.done:
 			return errCoreClosed
 		default:
+		}
+		if !c.memory.boosterAllowed() && c.hasReplay() {
+			select {
+			case <-c.done:
+				return errCoreClosed
+			case <-ticker.C:
+			}
+			continue
 		}
 		leg := c.chooseLeg(len(frame.data))
 		if c.tryQueueNewFrame(leg, frame) {
@@ -903,7 +1006,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		}
 	}
 	for {
-		frame, err := readWireFrame(leg.conn, c)
+		frame, err := readWireFrameForLeg(leg.ctx, leg.conn, c, leg.id)
 		if err != nil {
 			if !c.isDone() {
 				c.legFailed(leg, legFailureReadData, err)
@@ -960,16 +1063,17 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		c.fail(err)
 		return
 	}
-	go func() {
+	c.startWorkers(func() {
 		<-leg.writerDone
 		if !c.isDone() {
 			c.reinjectLeg1()
 		}
-	}()
+	})
 }
 
 func (c *mpCore) rxLoop() {
 	expected := uint64(0)
+	c.rxExpected.Store(expected)
 	pending := make(map[uint64]wireFrame)
 	var pendingBytes int64
 	var finSeq *uint64
@@ -1049,6 +1153,7 @@ func (c *mpCore) rxLoop() {
 					c.egressBytes.Add(uint64(len(frame.data)))
 					c.putBuffer(frame.data)
 					expected++
+					c.rxExpected.Store(expected)
 					c.requestACK(expected)
 					next, exists := pending[expected]
 					if !exists {
@@ -1127,6 +1232,13 @@ func (c *mpCore) trackReplay(frame *wireFrame) bool {
 	c.replay[frame.seq] = &replayEntry{frame: *frame}
 	c.replayBytes += length
 	return true
+}
+
+func (c *mpCore) hasReplay() bool {
+	c.replayMu.Lock()
+	hasReplay := len(c.replay) > 0
+	c.replayMu.Unlock()
+	return hasReplay
 }
 
 func (c *mpCore) untrackReplay(seq uint64, release bool) {
@@ -1302,6 +1414,10 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 }
 
 func readWireFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
+	return readWireFrameForLeg(core.ctx, conn, core, 0)
+}
+
+func readWireFrameForLeg(ctx context.Context, conn net.Conn, core *mpCore, legID uint8) (wireFrame, error) {
 	var frame wireFrame
 	var frameType [1]byte
 	if _, err := io.ReadFull(conn, frameType[:]); err != nil {
@@ -1319,7 +1435,15 @@ func readWireFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
 		if length <= 0 || length > core.cfg.ChunkSize || length > maxFramePayload {
 			return wireFrame{}, errors.New("invalid multipath frame length")
 		}
-		buffer := core.getBuffer()[:length]
+		class := memoryClassPrimary
+		if legID == 1 && frame.seq != core.rxExpected.Load() {
+			class = memoryClassBooster
+		}
+		buffer, err := core.getBuffer(ctx, class)
+		if err != nil {
+			return wireFrame{}, err
+		}
+		buffer = buffer[:length]
 		if _, err := io.ReadFull(conn, buffer); err != nil {
 			core.putBuffer(buffer)
 			return wireFrame{}, err

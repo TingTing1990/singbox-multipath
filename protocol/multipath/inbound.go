@@ -97,6 +97,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
 		return nil, E.New("invalid leg1_replay_timeout")
 	}
+	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
+	if memoryErr != nil {
+		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
+	}
+	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames}) + int64(chunkSize)
+	if memoryLimit < minimumMemory {
+		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
+	}
+	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 10 * time.Second
@@ -126,6 +135,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			MaxReorderBytes:      maxReorderBufferBytes,
 			ReplayBytes:          replayBytes,
 			ReplayTimeout:        replayTimeout,
+			Memory:               memory,
 		},
 	}
 	i.listener = listener.New(listener.Options{
@@ -231,7 +241,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			" ", info.String(),
 		)
 	}
-	core, appConn := newCore(i.ctx, cfg)
+	core, appConn, err := newCoreWithError(i.ctx, cfg)
+	if err != nil {
+		i.access.Unlock()
+		i.rejectHello(conn, onClose, helloRejectLegUnavailable, E.Cause(err, "create multipath session"))
+		return
+	}
 	session = &serverSession{
 		id:          hello.Session,
 		destination: destination,

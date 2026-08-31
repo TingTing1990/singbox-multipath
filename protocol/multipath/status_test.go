@@ -73,6 +73,7 @@ func TestCoreStatusCounters(t *testing.T) {
 func TestOutboundStatusDocument(t *testing.T) {
 	cfg := testCoreConfig()
 	cfg.ActivationAfterBytes = 1
+	cfg.Memory = newMemoryBudget(8<<20, true)
 	left, leftApp := newCore(context.Background(), cfg)
 	right, rightApp := newCore(context.Background(), cfg)
 	defer left.Close()
@@ -116,6 +117,9 @@ func TestOutboundStatusDocument(t *testing.T) {
 	})
 
 	document := status.buildDocument(time.Now().Add(time.Second))
+	if document.Node.Parameters.MemoryLimitBytes != 8<<20 || document.Node.Memory.LimitBytes != 8<<20 || !document.Node.Memory.Automatic {
+		t.Fatalf("unexpected memory status: %+v", document.Node.Memory)
+	}
 	if document.Node.Logical.Connections != 1 {
 		t.Fatalf("unexpected connection count: %d", document.Node.Logical.Connections)
 	}

@@ -119,6 +119,15 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
 		return nil, E.New("invalid leg1_replay_timeout")
 	}
+	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
+	if memoryErr != nil {
+		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
+	}
+	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames}) + int64(chunkSize)
+	if memoryLimit < minimumMemory {
+		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
+	}
+	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 10 * time.Second
@@ -153,6 +162,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			MaxReorderBytes:      maxReorderBufferBytes,
 			ReplayBytes:          replayBytes,
 			ReplayTimeout:        replayTimeout,
+			Memory:               memory,
 		},
 	}, nil
 }
@@ -244,7 +254,11 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.Cause(err, "multipath preferred handshake")
 	}
 	cfg := o.connectionCoreConfig(ctx, destination, sessionID)
-	core, appConn := newCore(ctx, cfg)
+	core, appConn, err := newCoreWithError(ctx, cfg)
+	if err != nil {
+		primaryConn.Close()
+		return nil, E.Cause(err, "create multipath session")
+	}
 	if _, err = core.addLeg(0, primaryConn, nil); err != nil {
 		appConn.Close()
 		primaryConn.Close()
@@ -278,7 +292,11 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 		return nil, E.Cause(err, "prepare multipath preferred fast open")
 	}
 	cfg := o.connectionCoreConfig(ctx, destination, sessionID)
-	core, appConn := newCore(ctx, cfg)
+	core, appConn, err := newCoreWithError(ctx, cfg)
+	if err != nil {
+		fastOpenConn.Close()
+		return nil, E.Cause(err, "create multipath session")
+	}
 	readResponse := func(conn net.Conn) error {
 		if waitErr := fastOpenConn.waitStarted(); waitErr != nil {
 			return waitErr

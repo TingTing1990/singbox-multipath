@@ -339,7 +339,21 @@ type statusParameters struct {
 	MaxReorderBytes         int64  `json:"max_reorder_bytes"`
 	Leg1ReplayBytes         int64  `json:"leg1_replay_bytes"`
 	Leg1ReplayTimeoutMS     int64  `json:"leg1_replay_timeout_ms"`
+	MemoryLimitBytes        int64  `json:"memory_limit_bytes"`
 	HandshakeTimeoutMS      int64  `json:"handshake_timeout_ms"`
+}
+
+type statusMemory struct {
+	LimitBytes         int64  `json:"limit_bytes"`
+	UsedBytes          int64  `json:"used_bytes"`
+	CachedBytes        int64  `json:"cached_bytes"`
+	BoosterLimitBytes  int64  `json:"booster_limit_bytes"`
+	BoosterResumeBytes int64  `json:"booster_resume_bytes"`
+	Automatic          bool   `json:"automatic"`
+	Pressure           bool   `json:"pressure"`
+	PressureSince      string `json:"pressure_since,omitempty"`
+	PressureEvents     uint64 `json:"pressure_events"`
+	BackpressureEvents uint64 `json:"backpressure_events"`
 }
 
 type statusLogical struct {
@@ -413,6 +427,7 @@ type statusNode struct {
 	UDPOutbound string           `json:"udp_outbound"`
 	TCPFastOpen bool             `json:"tcp_fast_open"`
 	Parameters  statusParameters `json:"parameters"`
+	Memory      statusMemory     `json:"memory"`
 	Logical     statusLogical    `json:"logical"`
 	Legs        []statusLeg      `json:"legs"`
 }
@@ -525,6 +540,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	s.previousUDP = udpTotals
 	s.previousSessions = nextPreviousSessions
 
+	memorySnapshot := s.config.cfg.Memory.snapshot()
 	parameters := statusParameters{
 		ActivationThresholdMbps: s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
 		ActivationAfterBytes:    s.config.cfg.ActivationAfterBytes,
@@ -536,7 +552,22 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		MaxReorderBytes:         s.config.cfg.MaxReorderBytes,
 		Leg1ReplayBytes:         s.config.cfg.ReplayBytes,
 		Leg1ReplayTimeoutMS:     s.config.cfg.ReplayTimeout.Milliseconds(),
+		MemoryLimitBytes:        memorySnapshot.LimitBytes,
 		HandshakeTimeoutMS:      s.config.handshakeTimeout.Milliseconds(),
+	}
+	memory := statusMemory{
+		LimitBytes:         memorySnapshot.LimitBytes,
+		UsedBytes:          memorySnapshot.UsedBytes,
+		CachedBytes:        memorySnapshot.CachedBytes,
+		BoosterLimitBytes:  memorySnapshot.BoosterLimitBytes,
+		BoosterResumeBytes: memorySnapshot.BoosterResumeBytes,
+		Automatic:          memorySnapshot.Automatic,
+		Pressure:           memorySnapshot.Pressure,
+		PressureEvents:     memorySnapshot.PressureEvents,
+		BackpressureEvents: memorySnapshot.BackpressureEvents,
+	}
+	if !memorySnapshot.PressureSince.IsZero() {
+		memory.PressureSince = memorySnapshot.PressureSince.Format(time.RFC3339Nano)
 	}
 	logical := statusLogical{
 		Connections:      len(snapshots),
@@ -715,6 +746,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			UDPOutbound: s.config.udpOutbound,
 			TCPFastOpen: s.config.tcpFastOpen,
 			Parameters:  parameters,
+			Memory:      memory,
 			Logical:     logical,
 			Legs:        legs,
 		},
