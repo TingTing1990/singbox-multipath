@@ -274,6 +274,29 @@ func TestActivationInfoString(t *testing.T) {
 	}
 }
 
+func TestActivationAfterBytesMinRate(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.ActivationAfterBytes = 2 << 20
+	cfg.ActivationAfterBytesMinBytesPS = 8 << 20
+	cfg.ActivationWindow = time.Second
+
+	if _, ok := activationAfterBytes(cfg, 2<<20, 0, time.Second); ok {
+		t.Fatal("activation should wait for the minimum rate")
+	}
+	info, ok := activationAfterBytes(cfg, 10<<20, 0, time.Second)
+	if !ok {
+		t.Fatal("activation should pass the minimum rate")
+	}
+	if info.RateBytesPS != 10<<20 || info.MinRateBytesPS != 8<<20 || info.Elapsed != time.Second {
+		t.Fatalf("unexpected activation info: %+v", info)
+	}
+
+	cfg.ActivationAfterBytesMinBytesPS = 0
+	if _, ok = activationAfterBytes(cfg, 2<<20, 0, 0); !ok {
+		t.Fatal("activation without a minimum rate should keep the old immediate behavior")
+	}
+}
+
 func TestCoreHalfClosePreservesTail(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())

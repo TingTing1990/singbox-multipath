@@ -430,6 +430,7 @@ type statusActivation struct {
 	WindowBytes        uint64 `json:"window_bytes,omitempty"`
 	RateBytesPS        uint64 `json:"rate_bytes_per_second,omitempty"`
 	ThresholdBytesPS   uint64 `json:"threshold_bytes_per_second,omitempty"`
+	MinRateBytesPS     uint64 `json:"min_rate_bytes_per_second,omitempty"`
 	ElapsedMS          int64  `json:"elapsed_ms,omitempty"`
 	BacklogBytes       int64  `json:"backlog_bytes,omitempty"`
 	QueueBytes         int64  `json:"queue_bytes,omitempty"`
@@ -437,18 +438,19 @@ type statusActivation struct {
 }
 
 type statusParameters struct {
-	ActivationThresholdMbps uint64 `json:"activation_threshold_mbps"`
-	ActivationAfterBytes    uint64 `json:"activation_after_bytes"`
-	ActivationWindowMS      int64  `json:"activation_window_ms"`
-	ChunkSize               int    `json:"chunk_size"`
-	QueueFrames             int    `json:"queue_frames"`
-	QueueBytes              int64  `json:"queue_bytes"`
-	MaxReorderFrames        int    `json:"max_reorder_frames"`
-	MaxReorderBytes         int64  `json:"max_reorder_bytes"`
-	Leg1ReplayBytes         int64  `json:"leg1_replay_bytes"`
-	Leg1ReplayTimeoutMS     int64  `json:"leg1_replay_timeout_ms"`
-	MemoryLimitBytes        int64  `json:"memory_limit_bytes"`
-	HandshakeTimeoutMS      int64  `json:"handshake_timeout_ms"`
+	ActivationThresholdMbps     uint64 `json:"activation_threshold_mbps"`
+	ActivationAfterBytes        uint64 `json:"activation_after_bytes"`
+	ActivationAfterBytesMinMbps uint64 `json:"activation_after_bytes_min_mbps"`
+	ActivationWindowMS          int64  `json:"activation_window_ms"`
+	ChunkSize                   int    `json:"chunk_size"`
+	QueueFrames                 int    `json:"queue_frames"`
+	QueueBytes                  int64  `json:"queue_bytes"`
+	MaxReorderFrames            int    `json:"max_reorder_frames"`
+	MaxReorderBytes             int64  `json:"max_reorder_bytes"`
+	Leg1ReplayBytes             int64  `json:"leg1_replay_bytes"`
+	Leg1ReplayTimeoutMS         int64  `json:"leg1_replay_timeout_ms"`
+	MemoryLimitBytes            int64  `json:"memory_limit_bytes"`
+	HandshakeTimeoutMS          int64  `json:"handshake_timeout_ms"`
 }
 
 type statusMemory struct {
@@ -658,6 +660,7 @@ func activationStatus(info activationInfo, at time.Time) *statusActivation {
 		WindowBytes:        info.WindowBytes,
 		RateBytesPS:        info.RateBytesPS,
 		ThresholdBytesPS:   info.ThresholdBytesPS,
+		MinRateBytesPS:     info.MinRateBytesPS,
 		ElapsedMS:          info.Elapsed.Milliseconds(),
 		BacklogBytes:       info.BacklogBytes,
 		QueueBytes:         info.QueueBytes,
@@ -728,18 +731,19 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 
 	memorySnapshot := s.config.cfg.Memory.snapshot()
 	parameters := statusParameters{
-		ActivationThresholdMbps: s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
-		ActivationAfterBytes:    s.config.cfg.ActivationAfterBytes,
-		ActivationWindowMS:      s.config.cfg.ActivationWindow.Milliseconds(),
-		ChunkSize:               s.config.cfg.ChunkSize,
-		QueueFrames:             s.config.cfg.QueueFrames,
-		QueueBytes:              s.config.cfg.QueueBytes,
-		MaxReorderFrames:        s.config.cfg.MaxReorderFrames,
-		MaxReorderBytes:         s.config.cfg.MaxReorderBytes,
-		Leg1ReplayBytes:         s.config.cfg.ReplayBytes,
-		Leg1ReplayTimeoutMS:     s.config.cfg.ReplayTimeout.Milliseconds(),
-		MemoryLimitBytes:        memorySnapshot.LimitBytes,
-		HandshakeTimeoutMS:      s.config.handshakeTimeout.Milliseconds(),
+		ActivationThresholdMbps:     s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
+		ActivationAfterBytes:        s.config.cfg.ActivationAfterBytes,
+		ActivationAfterBytesMinMbps: s.config.cfg.ActivationAfterBytesMinBytesPS * 8 / 1_000_000,
+		ActivationWindowMS:          s.config.cfg.ActivationWindow.Milliseconds(),
+		ChunkSize:                   s.config.cfg.ChunkSize,
+		QueueFrames:                 s.config.cfg.QueueFrames,
+		QueueBytes:                  s.config.cfg.QueueBytes,
+		MaxReorderFrames:            s.config.cfg.MaxReorderFrames,
+		MaxReorderBytes:             s.config.cfg.MaxReorderBytes,
+		Leg1ReplayBytes:             s.config.cfg.ReplayBytes,
+		Leg1ReplayTimeoutMS:         s.config.cfg.ReplayTimeout.Milliseconds(),
+		MemoryLimitBytes:            memorySnapshot.LimitBytes,
+		HandshakeTimeoutMS:          s.config.handshakeTimeout.Milliseconds(),
 	}
 	memory := statusMemory{
 		LimitBytes:         memorySnapshot.LimitBytes,

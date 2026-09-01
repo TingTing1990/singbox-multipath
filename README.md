@@ -117,6 +117,8 @@ already configured Hysteria2 outbound for the secondary leg:
       "server_port": 39000,
       "tcp_fast_open": true,
       "activation_threshold_mbps": 120,
+      "activation_after_bytes": "2MB",
+      "activation_after_bytes_min_mbps": 120,
       "activation_window": "1s",
       "chunk_size": 65536,
       "queue_frames": 256,
@@ -168,34 +170,38 @@ exceed the server value.
 
 ### Outbound fields
 
-| Field | Description |
-| --- | --- |
-| `outbounds` | Exactly two child outbound tags. Both children must support TCP. |
-| `preferred` | Child used as leg 0 before aggregation activates. Defaults to the first entry in `outbounds`. |
-| `udp_outbound` | Child used for UDP without aggregation. Defaults to `preferred` and must support UDP. |
-| `server` / `server_port` | Address and port of the remote multipath inbound, reachable through both children. |
-| `tcp_fast_open` | Enables the multipath early-write path. Also enable TCP Fast Open on the preferred child and server inbound for SYN data. Default: `false`. |
-| `status_file` | Optional path for periodically written multipath runtime status JSON. |
+| Field | Description | Accepted format / example |
+| --- | --- | --- |
+| `outbounds` | Exactly two child outbound tags. Both children must support TCP. | `["leg0", "leg1"]` |
+| `preferred` | Child used as leg 0 before aggregation activates. Defaults to the first entry in `outbounds`. | `"leg0"` |
+| `udp_outbound` | Child used for UDP without aggregation. Defaults to `preferred` and must support UDP. | `"leg0"` |
+| `server` / `server_port` | Address and port of the remote multipath inbound, reachable through both children. | `"10.66.67.1"` / `39000` |
+| `tcp_fast_open` | Enables the multipath early-write path. Also enable TCP Fast Open on the preferred child and server inbound for SYN data. Default: `false`. | `true` or `false` |
+| `status_file` | Optional path for periodically written multipath runtime status JSON. | `"/var/run/multipath.json"` |
 
 ### Shared tuning fields
 
-| Field | Description |
-| --- | --- |
-| `activation_threshold_mbps` | Activates leg 1 when locally sent traffic reaches this average rate during `activation_window`. Defaults to `150` when this and `activation_after_bytes` are both unset. |
-| `activation_after_bytes` | Optional total locally sent byte count that activates leg 1. It is an alternative trigger to the rate and queue triggers. |
-| `activation_window` | Rate sampling window and sustained high-queue trigger duration. Default: `1s`. |
-| `chunk_size` | Maximum payload per multipath data frame, from 1 KiB to 1 MiB. Default: 64 KiB. |
-| `queue_frames` | Per-leg send queue capacity in frames, from 8 to 4096. `chunk_size * queue_frames` must not exceed 64 MiB. Default: 256. |
-| `bandwidth_mbps` | Optional two-entry scheduling weights in leg 0/leg 1 order. Values express the expected relative capacity and are not rate limits. |
-| `max_reorder_frames` | Server-only limit for buffered out-of-order frames. Default: 2048. |
-| `max_reorder_bytes` | Limit for buffered out-of-order data. Default: 64 MiB; maximum: 512 MiB. |
-| `leg1_replay_bytes` | Maximum retained send history used to recover data assigned to a stalled leg 1. Default: 64 MiB; maximum: 512 MiB. |
-| `leg1_replay_timeout` | Time before unacknowledged leg 1 data is replayed on leg 0. Default: `5s`. |
-| `memory_limit` | Shared memory budget for all sessions of this multipath inbound or outbound. Defaults to `min(512 MiB, MemAvailable * 0.5)`. Booster backpressure starts at 7/8 and clears at 3/4. |
-| `handshake_timeout` | Timeout for a multipath leg handshake. Default: `10s`. |
+| Field | Description | Accepted format / example |
+| --- | --- | --- |
+| `activation_threshold_mbps` | Activates leg 1 when locally sent traffic reaches this average rate during `activation_window`. Defaults to `150` when this and `activation_after_bytes` are both unset. | Non-negative integer Mbps, e.g. `120` |
+| `activation_after_bytes` | Optional total locally sent byte count that activates leg 1. It is an alternative trigger to the rate and queue triggers. | Non-negative integer or memory string, e.g. `2097152` or `"2MB"` |
+| `activation_after_bytes_min_mbps` | Optional recent-rate gate for `activation_after_bytes`. When non-zero, the byte trigger also requires the measured rate over a complete `activation_window` to reach this value. It does not change the throughput or leg 0 queue triggers. | Non-negative integer Mbps, e.g. `120` |
+| `activation_window` | Rate sampling window and sustained high-queue trigger duration. Default: `1s`. | Duration, e.g. `"1s"` |
+| `chunk_size` | Maximum payload per multipath data frame, from 1 KiB to 1 MiB. Default: 64 KiB. | Non-negative integer bytes, e.g. `65536` |
+| `queue_frames` | Per-leg send queue capacity in frames, from 8 to 4096. `chunk_size * queue_frames` must not exceed 64 MiB. Default: 256. | Non-negative integer, e.g. `256` |
+| `bandwidth_mbps` | Optional two-entry scheduling weights in leg 0/leg 1 order. Values express the expected relative capacity and are not rate limits. | Two-entry integer array, e.g. `[160, 700]` |
+| `max_reorder_frames` | Server-only limit for buffered out-of-order frames. Default: 2048. | Non-negative integer, e.g. `2048` |
+| `max_reorder_bytes` | Limit for buffered out-of-order data. Default: 64 MiB; maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
+| `leg1_replay_bytes` | Maximum retained send history used to recover data assigned to a stalled leg 1. Default: 64 MiB; maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
+| `leg1_replay_timeout` | Time before unacknowledged leg 1 data is replayed on leg 0. Default: `5s`. | Duration, e.g. `"5s"` |
+| `memory_limit` | Shared memory budget for all sessions of this multipath inbound or outbound. Defaults to `min(512 MiB, MemAvailable * 0.5)`. Booster backpressure starts at 7/8 and clears at 3/4. | Non-negative integer or memory string, e.g. `268435456` or `"256MB"` |
+| `handshake_timeout` | Timeout for a multipath leg handshake. Default: `10s`. | Duration, e.g. `"10s"` |
 
 The server inbound also accepts the standard sing-box listen fields, including
 `listen`, `listen_port`, and `tcp_fast_open`.
+
+Byte fields that accept a memory string use binary units: for example, `"2MB"`
+means 2 MiB. Bare integers remain supported and are interpreted as bytes.
 
 ## Documentation
 

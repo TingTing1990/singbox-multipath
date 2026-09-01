@@ -43,6 +43,7 @@ type coreConfig struct {
 	QueueBytes           int64
 	ThresholdBytesPS     uint64
 	ActivationAfterBytes uint64
+	ActivationAfterBytesMinBytesPS uint64
 	ActivationWindow     time.Duration
 	BandwidthMbps        []uint32
 	MaxReorderFrames     int
@@ -82,6 +83,7 @@ type activationInfo struct {
 	WindowBytes      uint64
 	RateBytesPS      uint64
 	ThresholdBytesPS uint64
+	MinRateBytesPS   uint64
 	Elapsed          time.Duration
 	BacklogBytes     int64
 	QueueBytes       int64
@@ -91,6 +93,17 @@ type activationInfo struct {
 func (i activationInfo) String() string {
 	switch i.Reason {
 	case activationReasonBytes:
+		if i.MinRateBytesPS > 0 {
+			return fmt.Sprintf(
+				"reason=%s current_bytes=%d threshold_bytes=%d measured_mbps=%.2f min_mbps=%.2f window=%s",
+				i.Reason,
+				i.CurrentBytes,
+				i.ThresholdBytes,
+				float64(i.RateBytesPS)*8/1_000_000,
+				float64(i.MinRateBytesPS)*8/1_000_000,
+				i.Elapsed.Round(time.Millisecond),
+			)
+		}
 		return fmt.Sprintf("reason=%s current_bytes=%d threshold_bytes=%d", i.Reason, i.CurrentBytes, i.ThresholdBytes)
 	case activationReasonThroughput:
 		return fmt.Sprintf(
@@ -848,15 +861,11 @@ func (c *mpCore) activationLoop() {
 				return
 			}
 			bytesNow := c.ingressBytes.Load()
-			if c.cfg.ActivationAfterBytes > 0 && bytesNow >= c.cfg.ActivationAfterBytes {
-				c.activate(activationInfo{
-					Reason:         activationReasonBytes,
-					CurrentBytes:   bytesNow,
-					ThresholdBytes: c.cfg.ActivationAfterBytes,
-				})
+			if info, ok := activationAfterBytes(c.cfg, bytesNow, windowBase, now.Sub(windowStart)); ok {
+				c.activate(info)
 				return
 			}
-			if c.cfg.ThresholdBytesPS > 0 && now.Sub(windowStart) >= c.cfg.ActivationWindow {
+			if (c.cfg.ThresholdBytesPS > 0 || (c.cfg.ActivationAfterBytes > 0 && c.cfg.ActivationAfterBytesMinBytesPS > 0)) && now.Sub(windowStart) >= c.cfg.ActivationWindow {
 				delta := bytesNow - windowBase
 				elapsed := now.Sub(windowStart)
 				rate := uint64(0)
@@ -899,6 +908,32 @@ func (c *mpCore) activationLoop() {
 			}
 		}
 	}
+}
+
+func activationAfterBytes(cfg coreConfig, bytesNow, windowBase uint64, elapsed time.Duration) (activationInfo, bool) {
+	if cfg.ActivationAfterBytes == 0 || bytesNow < cfg.ActivationAfterBytes {
+		return activationInfo{}, false
+	}
+	info := activationInfo{
+		Reason:         activationReasonBytes,
+		CurrentBytes:   bytesNow,
+		ThresholdBytes: cfg.ActivationAfterBytes,
+	}
+	if cfg.ActivationAfterBytesMinBytesPS == 0 {
+		return info, true
+	}
+	if elapsed < cfg.ActivationWindow || elapsed <= 0 {
+		return activationInfo{}, false
+	}
+	delta := bytesNow - windowBase
+	rate := uint64(float64(delta) / elapsed.Seconds())
+	if rate < cfg.ActivationAfterBytesMinBytesPS {
+		return activationInfo{}, false
+	}
+	info.RateBytesPS = rate
+	info.MinRateBytesPS = cfg.ActivationAfterBytesMinBytesPS
+	info.Elapsed = elapsed
+	return info, true
 }
 
 func (c *mpCore) activate(info activationInfo) {

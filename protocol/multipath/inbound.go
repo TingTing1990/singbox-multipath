@@ -45,8 +45,9 @@ type Inbound struct {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
+	activationAfterBytes := options.ActivationAfterBytes.Value()
 	threshold := options.ActivationThresholdMbps
-	if threshold == 0 && options.ActivationAfterBytes == 0 {
+	if threshold == 0 && activationAfterBytes == 0 {
 		threshold = 150
 	}
 	window := time.Duration(options.ActivationWindow)
@@ -127,18 +128,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
 		cfg: coreConfig{
-			ChunkSize:            chunkSize,
-			QueueFrames:          queueFrames,
-			QueueBytes:           queueBytes,
-			ThresholdBytesPS:     uint64(threshold) * 1000 * 1000 / 8,
-			ActivationAfterBytes: options.ActivationAfterBytes,
-			ActivationWindow:     window,
-			BandwidthMbps:        append([]uint32(nil), options.BandwidthMbps...),
-			MaxReorderFrames:     maxReorderFrames,
-			MaxReorderBytes:      maxReorderBufferBytes,
-			ReplayBytes:          replayBytes,
-			ReplayTimeout:        replayTimeout,
-			Memory:               memory,
+			ChunkSize:                      chunkSize,
+			QueueFrames:                    queueFrames,
+			QueueBytes:                     queueBytes,
+			ThresholdBytesPS:               uint64(threshold) * 1000 * 1000 / 8,
+			ActivationAfterBytes:           activationAfterBytes,
+			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
+			ActivationWindow:               window,
+			BandwidthMbps:                  append([]uint32(nil), options.BandwidthMbps...),
+			MaxReorderFrames:               maxReorderFrames,
+			MaxReorderBytes:                maxReorderBufferBytes,
+			ReplayBytes:                    replayBytes,
+			ReplayTimeout:                  replayTimeout,
+			Memory:                         memory,
 		},
 	}
 	i.listener = listener.New(listener.Options{

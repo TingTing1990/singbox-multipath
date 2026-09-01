@@ -10,6 +10,8 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/byteformats"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
@@ -17,6 +19,14 @@ const (
 	multipathTestLegDirect = "direct"
 	multipathTestLegProxy  = "shadowsocks"
 )
+
+func multipathMemoryBytes(value string) *byteformats.MemoryBytes {
+	var result byteformats.MemoryBytes
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		panic(err)
+	}
+	return &result
+}
 
 type multipathTestLeg struct {
 	tag       string
@@ -112,7 +122,7 @@ func multipathTFOTestOptions(
 					ListenPort:  serverPort,
 					TCPFastOpen: aggregationTFO,
 				},
-				ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
+				ActivationAfterBytes: multipathMemoryBytes("1"),
 				ActivationWindow:     sharedMultipathOptions.activationWindow,
 				ChunkSize:            sharedMultipathOptions.chunkSize,
 				QueueFrames:          sharedMultipathOptions.queueFrames,
@@ -181,7 +191,7 @@ func multipathTFOTestOptions(
 			Server:               "127.0.0.1",
 			ServerPort:           serverPort,
 			TCPFastOpen:          multipathTFO,
-			ActivationAfterBytes: sharedMultipathOptions.activationAfterBytes,
+			ActivationAfterBytes: multipathMemoryBytes("1"),
 			ActivationWindow:     sharedMultipathOptions.activationWindow,
 			ChunkSize:            sharedMultipathOptions.chunkSize,
 			QueueFrames:          sharedMultipathOptions.queueFrames,

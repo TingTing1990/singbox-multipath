@@ -49,6 +49,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Server == "" || options.ServerPort == 0 {
 		return nil, E.New("missing multipath server/server_port")
 	}
+	activationAfterBytes := options.ActivationAfterBytes.Value()
 	preferred := options.Preferred
 	if preferred == "" {
 		preferred = options.Outbounds[0]
@@ -73,7 +74,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		udpTag = preferred
 	}
 	threshold := options.ActivationThresholdMbps
-	if threshold == 0 && options.ActivationAfterBytes == 0 {
+	if threshold == 0 && activationAfterBytes == 0 {
 		threshold = 150
 	}
 	window := time.Duration(options.ActivationWindow)
@@ -151,18 +152,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		handshakeTimeout: handshakeTimeout,
 		statusFile:       options.StatusFile,
 		cfg: coreConfig{
-			ChunkSize:            chunkSize,
-			QueueFrames:          queueFrames,
-			QueueBytes:           queueBytes,
-			ThresholdBytesPS:     uint64(threshold) * 1000 * 1000 / 8,
-			ActivationAfterBytes: options.ActivationAfterBytes,
-			ActivationWindow:     window,
-			BandwidthMbps:        weights,
-			MaxReorderFrames:     2048,
-			MaxReorderBytes:      maxReorderBufferBytes,
-			ReplayBytes:          replayBytes,
-			ReplayTimeout:        replayTimeout,
-			Memory:               memory,
+			ChunkSize:                      chunkSize,
+			QueueFrames:                    queueFrames,
+			QueueBytes:                     queueBytes,
+			ThresholdBytesPS:               uint64(threshold) * 1000 * 1000 / 8,
+			ActivationAfterBytes:           activationAfterBytes,
+			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
+			ActivationWindow:               window,
+			BandwidthMbps:                  weights,
+			MaxReorderFrames:               2048,
+			MaxReorderBytes:                maxReorderBufferBytes,
+			ReplayBytes:                    replayBytes,
+			ReplayTimeout:                  replayTimeout,
+			Memory:                         memory,
 		},
 	}, nil
 }
