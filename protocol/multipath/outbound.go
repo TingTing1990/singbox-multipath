@@ -206,6 +206,7 @@ func (o *Outbound) Start() error {
 			o.logger.Warn("write multipath status: ", err)
 		})
 	}
+	o.cfg.Memory.startLogging(o.ctx, o.logger, "client")
 	return nil
 }
 
@@ -241,10 +242,11 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
 	}
 	err = o.clientHandshake(ctx, primaryConn, helloMessage{
-		Session:     sessionID,
-		LegID:       0,
-		ChunkSize:   uint32(o.cfg.ChunkSize),
-		Destination: destinationString,
+		Session:       sessionID,
+		LegID:         0,
+		RequestStatus: o.statusFile != "",
+		ChunkSize:     uint32(o.cfg.ChunkSize),
+		Destination:   destinationString,
 	})
 	if err != nil {
 		if o.status != nil {
@@ -281,10 +283,11 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 		return nil, E.Cause(err, "dial multipath preferred leg ", o.tags[0])
 	}
 	message := helloMessage{
-		Session:     sessionID,
-		LegID:       0,
-		ChunkSize:   uint32(o.cfg.ChunkSize),
-		Destination: destinationString,
+		Session:       sessionID,
+		LegID:         0,
+		RequestStatus: o.statusFile != "",
+		ChunkSize:     uint32(o.cfg.ChunkSize),
+		Destination:   destinationString,
 	}
 	fastOpenConn, err := newClientFastOpenConn(primaryConn, message, o.clientHandshakeDeadline(ctx))
 	if err != nil {
@@ -423,10 +426,11 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 		if err == nil {
 			stage = "secondary_handshake"
 			err = o.clientHandshake(attemptCtx, conn, helloMessage{
-				Session:     sessionID,
-				LegID:       1,
-				ChunkSize:   chunkSize,
-				Destination: destination,
+				Session:       sessionID,
+				LegID:         1,
+				RequestStatus: o.statusFile != "",
+				ChunkSize:     chunkSize,
+				Destination:   destination,
 			})
 		}
 		var leg *mpLeg

@@ -76,6 +76,9 @@ func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 	if snapshot.Pressure || snapshot.PressureEvents != 1 || snapshot.BackpressureEvents != 1 {
 		t.Fatalf("unexpected final memory snapshot: %+v", snapshot)
 	}
+	if snapshot.PeakUsedBytes < 1000 || snapshot.PeakCachedBytes < 64 {
+		t.Fatalf("memory peaks were not retained: %+v", snapshot)
+	}
 }
 
 func TestMemoryBudgetSessionAdmissionIsReleased(t *testing.T) {

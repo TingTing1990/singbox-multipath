@@ -9,25 +9,27 @@ import (
 )
 
 var (
-	helloMagic    = [4]byte{'S', 'M', 'P', '4'}
+	helloMagic    = [4]byte{'S', 'M', 'P', '5'}
 	responseMagic = [4]byte{'S', 'M', 'P', 'R'}
 )
 
 const (
-	helloVersion byte = 4
+	helloVersion    byte = 5
+	helloFlagStatus byte = 1 << 0
 
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1
 
-	helloHeaderSize    = 28
+	helloHeaderSize    = 29
 	responseHeaderSize = 10
 )
 
 type helloMessage struct {
-	Session     [16]byte
-	LegID       uint8
-	ChunkSize   uint32
-	Destination string
+	Session       [16]byte
+	LegID         uint8
+	RequestStatus bool
+	ChunkSize     uint32
+	Destination   string
 }
 
 type helloResponse struct {
@@ -106,9 +108,12 @@ func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
 	copy(header[0:4], helloMagic[:])
 	header[4] = helloVersion
 	header[5] = message.LegID
-	copy(header[6:22], message.Session[:])
-	binary.BigEndian.PutUint32(header[22:26], message.ChunkSize)
-	binary.BigEndian.PutUint16(header[26:28], uint16(len(message.Destination)))
+	if message.RequestStatus {
+		header[6] |= helloFlagStatus
+	}
+	copy(header[7:23], message.Session[:])
+	binary.BigEndian.PutUint32(header[23:27], message.ChunkSize)
+	binary.BigEndian.PutUint16(header[27:29], uint16(len(message.Destination)))
 	return header, nil
 }
 
@@ -142,13 +147,17 @@ func readHello(conn net.Conn) (helloMessage, error) {
 	if string(header[0:4]) != string(helloMagic[:]) || header[4] != helloVersion {
 		return message, errors.New("invalid multipath hello")
 	}
+	if header[6]&^helloFlagStatus != 0 {
+		return message, errors.New("invalid multipath hello flags")
+	}
 	message.LegID = header[5]
-	copy(message.Session[:], header[6:22])
-	message.ChunkSize = binary.BigEndian.Uint32(header[22:26])
+	message.RequestStatus = header[6]&helloFlagStatus != 0
+	copy(message.Session[:], header[7:23])
+	message.ChunkSize = binary.BigEndian.Uint32(header[23:27])
 	if message.ChunkSize == 0 || message.ChunkSize > maxFramePayload {
 		return message, errors.New("invalid multipath hello chunk size")
 	}
-	length := int(binary.BigEndian.Uint16(header[26:28]))
+	length := int(binary.BigEndian.Uint16(header[27:29]))
 	if length <= 0 {
 		return message, errors.New("empty multipath destination")
 	}

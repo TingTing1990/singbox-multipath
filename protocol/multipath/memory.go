@@ -6,6 +6,9 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/byteformats"
 )
 
 const (
@@ -36,6 +39,14 @@ type memorySnapshot struct {
 	PressureSince      time.Time
 	PressureEvents     uint64
 	BackpressureEvents uint64
+	PeakUsedBytes      int64
+	PeakCachedBytes    int64
+}
+
+type memoryPressureEvent struct {
+	entered  bool
+	snapshot memorySnapshot
+	duration time.Duration
 }
 
 type memoryBudget struct {
@@ -53,7 +64,11 @@ type memoryBudget struct {
 	pressureSince time.Time
 	pressureCount uint64
 	waitCount     uint64
+	peakUsed      int64
+	peakCached    int64
 	changed       chan struct{}
+	events        chan memoryPressureEvent
+	logOnce       sync.Once
 }
 
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {
@@ -93,6 +108,7 @@ func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
 		automatic:     automatic,
 		cache:         make(map[int][][]byte),
 		changed:       make(chan struct{}),
+		events:        make(chan memoryPressureEvent, 4),
 	}
 }
 
@@ -252,17 +268,22 @@ func (b *memoryBudget) snapshot() memorySnapshot {
 		PressureSince:      b.pressureSince,
 		PressureEvents:     b.pressureCount,
 		BackpressureEvents: b.waitCount,
+		PeakUsedBytes:      b.peakUsed,
+		PeakCachedBytes:    b.peakCached,
 	}
 	b.access.Unlock()
 	return snapshot
 }
 
 func (b *memoryBudget) updatePressureLocked(now time.Time) {
+	b.updatePeaksLocked()
 	if b.pressure {
 		if b.used <= b.boosterResume {
+			duration := now.Sub(b.pressureSince)
 			b.pressure = false
 			b.pressureSince = time.Time{}
 			b.signalLocked()
+			b.emitEventLocked(false, duration)
 		}
 		return
 	}
@@ -279,6 +300,89 @@ func (b *memoryBudget) enterPressureLocked(now time.Time) {
 	b.pressureSince = now
 	b.pressureCount++
 	b.signalLocked()
+	b.emitEventLocked(true, 0)
+}
+
+func (b *memoryBudget) updatePeaksLocked() {
+	if b.used > b.peakUsed {
+		b.peakUsed = b.used
+	}
+	if b.cached > b.peakCached {
+		b.peakCached = b.cached
+	}
+}
+
+func (b *memoryBudget) emitEventLocked(entered bool, duration time.Duration) {
+	event := memoryPressureEvent{
+		entered:  entered,
+		duration: duration,
+		snapshot: memorySnapshot{
+			LimitBytes:         b.limit,
+			UsedBytes:          b.used,
+			CachedBytes:        b.cached,
+			BoosterLimitBytes:  b.boosterLimit,
+			BoosterResumeBytes: b.boosterResume,
+			Automatic:          b.automatic,
+			Pressure:           b.pressure,
+			PressureSince:      b.pressureSince,
+			PressureEvents:     b.pressureCount,
+			BackpressureEvents: b.waitCount,
+			PeakUsedBytes:      b.peakUsed,
+			PeakCachedBytes:    b.peakCached,
+		},
+	}
+	select {
+	case b.events <- event:
+	default:
+	}
+}
+
+func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogger, side string) {
+	if b == nil {
+		return
+	}
+	b.logOnce.Do(func() {
+		snapshot := b.snapshot()
+		source := "configured"
+		if snapshot.Automatic {
+			source = "automatic"
+		}
+		logger.InfoContext(
+			ctx,
+			"multipath memory budget: side=", side,
+			" limit=", byteformats.FormatMemoryBytes(uint64(snapshot.LimitBytes)),
+			" source=", source,
+			" high=", byteformats.FormatMemoryBytes(uint64(snapshot.BoosterLimitBytes)),
+			" resume=", byteformats.FormatMemoryBytes(uint64(snapshot.BoosterResumeBytes)),
+			" cache_limit=", byteformats.FormatMemoryBytes(uint64(b.cacheLimit)),
+		)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case event := <-b.events:
+					if event.entered {
+						logger.InfoContext(
+							ctx,
+							"multipath memory pressure entered: side=", side,
+							" used=", byteformats.FormatMemoryBytes(uint64(event.snapshot.UsedBytes)),
+							" high=", byteformats.FormatMemoryBytes(uint64(event.snapshot.BoosterLimitBytes)),
+							" limit=", byteformats.FormatMemoryBytes(uint64(event.snapshot.LimitBytes)),
+						)
+					} else {
+						logger.InfoContext(
+							ctx,
+							"multipath memory pressure cleared: side=", side,
+							" used=", byteformats.FormatMemoryBytes(uint64(event.snapshot.UsedBytes)),
+							" resume=", byteformats.FormatMemoryBytes(uint64(event.snapshot.BoosterResumeBytes)),
+							" duration=", event.duration.Round(time.Millisecond),
+						)
+					}
+				}
+			}
+		}()
+	})
 }
 
 func (b *memoryBudget) dropCacheLocked() {

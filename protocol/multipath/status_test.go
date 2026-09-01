@@ -75,7 +75,9 @@ func TestOutboundStatusDocument(t *testing.T) {
 	cfg.ActivationAfterBytes = 1
 	cfg.Memory = newMemoryBudget(8<<20, true)
 	left, leftApp := newCore(context.Background(), cfg)
-	right, rightApp := newCore(context.Background(), cfg)
+	rightConfig := cfg
+	rightConfig.SendStatus = true
+	right, rightApp := newCore(context.Background(), rightConfig)
 	defer left.Close()
 	defer right.Close()
 	leg0Left, leg0Right := net.Pipe()
@@ -115,8 +117,20 @@ func TestOutboundStatusDocument(t *testing.T) {
 		snapshot := left.statusSnapshot()
 		return snapshot.counters.legTX[0]+snapshot.counters.legTX[1] == uint64(len(payload))
 	})
+	right.fallbackB.Store(2048)
+	right.fallbackF.Store(2)
+	right.fallbackE.Store(1)
+	if !right.queueSenderStatus(time.Now(), true) {
+		t.Fatal("remote sender status was not queued")
+	}
+	waitForStatus(t, func() bool {
+		return left.peerSenderStatusSnapshot().status.FallbackBytes == 2048
+	})
 
 	document := status.buildDocument(time.Now().Add(time.Second))
+	if document.SchemaVersion != 2 {
+		t.Fatalf("unexpected status schema: %d", document.SchemaVersion)
+	}
 	if document.Node.Parameters.MemoryLimitBytes != 8<<20 || document.Node.Memory.LimitBytes != 8<<20 || !document.Node.Memory.Automatic {
 		t.Fatalf("unexpected memory status: %+v", document.Node.Memory)
 	}
@@ -128,6 +142,12 @@ func TestOutboundStatusDocument(t *testing.T) {
 	}
 	if document.Node.Logical.Current.TXBytesPS == 0 {
 		t.Fatal("logical TX rate was not sampled")
+	}
+	if document.Node.Logical.Peak.TXBytesPS == 0 || document.Node.Memory.PeakUsedBytes == 0 {
+		t.Fatalf("peak statistics were not sampled: logical=%+v memory=%+v", document.Node.Logical.Peak, document.Node.Memory)
+	}
+	if !document.Node.Logical.RemoteSender.Available || document.Node.Logical.RemoteSender.FallbackBytes != 2048 {
+		t.Fatalf("remote sender status missing: %+v", document.Node.Logical.RemoteSender)
 	}
 	if document.Node.Legs[0].Cumulative.TXBytes+document.Node.Legs[1].Cumulative.TXBytes != uint64(len(payload)) {
 		t.Fatal("leg traffic does not add up to logical traffic")

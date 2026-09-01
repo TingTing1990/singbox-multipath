@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	statusSchemaVersion = 1
+	statusSchemaVersion = 2
 	statusTopFlowCount  = 10
 
 	leg1PhaseWaiting int32 = iota
@@ -35,6 +35,64 @@ type coreTrafficCounters struct {
 	legRXF    [2]uint64
 }
 
+type senderTotals struct {
+	logicalTX          uint64
+	legTX              [2]uint64
+	legTXF             [2]uint64
+	fallbackBytes      uint64
+	fallbackFrames     uint64
+	fallbackEvents     uint64
+	replayTimeouts     uint64
+	backpressureEvents uint64
+	backpressureNanos  uint64
+	legFailures        [2]uint64
+}
+
+func (t *senderTotals) add(other senderTotals) {
+	t.logicalTX += other.logicalTX
+	t.fallbackBytes += other.fallbackBytes
+	t.fallbackFrames += other.fallbackFrames
+	t.fallbackEvents += other.fallbackEvents
+	t.replayTimeouts += other.replayTimeouts
+	t.backpressureEvents += other.backpressureEvents
+	t.backpressureNanos += other.backpressureNanos
+	for index := range t.legTX {
+		t.legTX[index] += other.legTX[index]
+		t.legTXF[index] += other.legTXF[index]
+		t.legFailures[index] += other.legFailures[index]
+	}
+}
+
+func (s coreStatusSnapshot) localSenderTotals() senderTotals {
+	return senderTotals{
+		logicalTX:          s.counters.logicalTX,
+		legTX:              s.counters.legTX,
+		legTXF:             s.counters.legTXF,
+		fallbackBytes:      s.fallbackBytes,
+		fallbackFrames:     s.fallbackFrames,
+		fallbackEvents:     s.fallbackEvents,
+		replayTimeouts:     s.replayTimeouts,
+		backpressureEvents: s.backpressureEvents,
+		backpressureNanos:  s.backpressureNanos,
+		legFailures:        s.legFailures,
+	}
+}
+
+func senderTotalsFromPeer(status senderStatus) senderTotals {
+	return senderTotals{
+		logicalTX:          status.LogicalTX,
+		legTX:              status.LegTX,
+		legTXF:             status.LegTXFrames,
+		fallbackBytes:      status.FallbackBytes,
+		fallbackFrames:     status.FallbackFrames,
+		fallbackEvents:     status.FallbackEvents,
+		replayTimeouts:     status.ReplayTimeouts,
+		backpressureEvents: status.BackpressureEvents,
+		backpressureNanos:  status.BackpressureNanos,
+		legFailures:        status.LegFailures,
+	}
+}
+
 func (c *coreTrafficCounters) add(other coreTrafficCounters) {
 	c.logicalTX += other.logicalTX
 	c.logicalRX += other.logicalRX
@@ -47,25 +105,51 @@ func (c *coreTrafficCounters) add(other coreTrafficCounters) {
 }
 
 type coreStatusSnapshot struct {
-	counters      coreTrafficCounters
-	active        bool
-	activation    activationInfo
-	activationAt  time.Time
-	legPresent    [2]bool
-	legBacklog    [2]int64
-	leg1Joins     uint64
-	replayBytes   int64
-	reorderBytes  int64
-	reorderFrames int64
-	failure       string
-	failureAt     time.Time
+	counters           coreTrafficCounters
+	active             bool
+	activation         activationInfo
+	activationAt       time.Time
+	legPresent         [2]bool
+	legBacklog         [2]int64
+	legWriting         [2]int64
+	legWriteBlock      [2]time.Duration
+	legPeak            [2]int64
+	leg1Joins          uint64
+	replayBytes        int64
+	replayPeak         int64
+	reorderBytes       int64
+	reorderFrames      int64
+	reorderPeak        int64
+	reorderFPeak       int64
+	fallbackBytes      uint64
+	fallbackFrames     uint64
+	fallbackEvents     uint64
+	replayTimeouts     uint64
+	backpressureEvents uint64
+	backpressureNanos  uint64
+	legFailures        [2]uint64
+	peerSender         peerSenderStatus
+	rtt                [2]legRTTSnapshot
+	failure            string
+	failureAt          time.Time
 }
 
 func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 	snapshot := coreStatusSnapshot{
-		active:        c.active.Load(),
-		reorderBytes:  c.reorderBytes.Load(),
-		reorderFrames: c.reorderCount.Load(),
+		active:             c.active.Load(),
+		reorderBytes:       c.reorderBytes.Load(),
+		reorderFrames:      c.reorderCount.Load(),
+		replayPeak:         c.replayPeak.Load(),
+		reorderPeak:        c.reorderPeak.Load(),
+		reorderFPeak:       c.reorderFPeak.Load(),
+		fallbackBytes:      c.fallbackB.Load(),
+		fallbackFrames:     c.fallbackF.Load(),
+		fallbackEvents:     c.fallbackE.Load(),
+		replayTimeouts:     c.replayTO.Load(),
+		backpressureEvents: c.backpressE.Load(),
+		backpressureNanos:  c.backpressNS.Load(),
+		peerSender:         c.peerSenderStatusSnapshot(),
+		rtt:                c.rttSnapshot(),
 		counters: coreTrafficCounters{
 			logicalTX: c.ingressBytes.Load(),
 			logicalRX: c.egressBytes.Load(),
@@ -76,7 +160,9 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 		snapshot.legPresent[index] = leg != nil
 		if leg != nil {
 			snapshot.legBacklog[index] = leg.backlogBytes()
+			snapshot.legWriting[index], snapshot.legWriteBlock[index] = leg.writingSnapshot(time.Now())
 		}
+		snapshot.legPeak[index] = c.legPeak[index].Load()
 		snapshot.counters.legTX[index] = c.legCounters[index].txBytes.Load()
 		snapshot.counters.legRX[index] = c.legCounters[index].rxBytes.Load()
 		snapshot.counters.legTXF[index] = c.legCounters[index].txFrames.Load()
@@ -87,6 +173,9 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 	snapshot.activationAt = c.activationAt
 	snapshot.leg1Joins = c.leg1Joins
 	c.activationMu.Unlock()
+	c.legFailureMu.Lock()
+	snapshot.legFailures = c.legFailures
+	c.legFailureMu.Unlock()
 	c.replayMu.Lock()
 	snapshot.replayBytes = c.replayBytes
 	c.replayMu.Unlock()
@@ -173,17 +262,25 @@ type outboundStatus struct {
 	access          sync.Mutex
 	sessions        map[string]*statusSession
 	closed          coreTrafficCounters
+	closedSender    senderTotals
+	closedRemote    senderTotals
 	closedLeg1Joins uint64
 	closedAttempts  uint64
 	connectionsMade uint64
 	legErrors       [2]statusErrorEvent
 	udpCounters     udpTrafficCounters
 
-	sampleAccess     sync.Mutex
-	lastSample       time.Time
-	previous         coreTrafficCounters
-	previousUDP      statusTraffic
-	previousSessions map[string]coreTrafficCounters
+	sampleAccess      sync.Mutex
+	lastSample        time.Time
+	previous          coreTrafficCounters
+	previousUDP       statusTraffic
+	previousSessions  map[string]coreTrafficCounters
+	peakLogical       statusPeakRate
+	peakLeg           [2]statusPeakRate
+	peakReplayLocal   int64
+	peakReplayRemote  int64
+	peakLegBacklog    [2]int64
+	peakRemoteBacklog [2]int64
 
 	stop      chan struct{}
 	done      chan struct{}
@@ -228,6 +325,10 @@ func (s *outboundStatus) removeSession(session *statusSession) {
 	if current := s.sessions[session.id]; current == session {
 		delete(s.sessions, session.id)
 		s.closed.add(finalSnapshot.counters)
+		s.closedSender.add(finalSnapshot.localSenderTotals())
+		if finalSnapshot.peerSender.status.Sequence > 0 {
+			s.closedRemote.add(senderTotalsFromPeer(finalSnapshot.peerSender.status))
+		}
 		s.closedLeg1Joins += finalSnapshot.leg1Joins
 		s.closedAttempts += session.leg1Attempts.Load()
 	}
@@ -309,6 +410,13 @@ type statusRate struct {
 	RXBytesPS uint64 `json:"rx_bytes_per_second"`
 }
 
+type statusPeakRate struct {
+	TXBytesPS uint64 `json:"tx_bytes_per_second"`
+	RXBytesPS uint64 `json:"rx_bytes_per_second"`
+	TXAt      string `json:"tx_at,omitempty"`
+	RXAt      string `json:"rx_at,omitempty"`
+}
+
 type statusFrames struct {
 	TX uint64 `json:"tx"`
 	RX uint64 `json:"rx"`
@@ -354,22 +462,50 @@ type statusMemory struct {
 	PressureSince      string `json:"pressure_since,omitempty"`
 	PressureEvents     uint64 `json:"pressure_events"`
 	BackpressureEvents uint64 `json:"backpressure_events"`
+	PeakUsedBytes      int64  `json:"peak_used_bytes"`
+	PeakCachedBytes    int64  `json:"peak_cached_bytes"`
+}
+
+type statusSenderDiagnostics struct {
+	Available                bool   `json:"available"`
+	Stale                    bool   `json:"stale"`
+	UpdatedAt                string `json:"updated_at,omitempty"`
+	StaleConnections         int    `json:"stale_connections"`
+	ReplayBytes              int64  `json:"replay_bytes"`
+	ReplayPeakBytes          int64  `json:"replay_peak_bytes"`
+	FallbackBytes            uint64 `json:"fallback_bytes"`
+	FallbackFrames           uint64 `json:"fallback_frames"`
+	FallbackEvents           uint64 `json:"fallback_events"`
+	Leg1TXBytes              uint64 `json:"leg1_tx_bytes"`
+	ReplayTimeouts           uint64 `json:"replay_timeouts"`
+	BackpressureEvents       uint64 `json:"backpressure_events"`
+	BackpressureDurationMS   uint64 `json:"backpressure_duration_ms"`
+	MemoryPressure           bool   `json:"memory_pressure"`
+	MemoryUsedBytes          uint64 `json:"memory_used_bytes"`
+	MemoryPeakUsedBytes      uint64 `json:"memory_peak_used_bytes"`
+	MemoryPressureEvents     uint64 `json:"memory_pressure_events"`
+	MemoryBackpressureEvents uint64 `json:"memory_backpressure_events"`
 }
 
 type statusLogical struct {
-	State                    string            `json:"state"`
-	Connections              int               `json:"connections"`
-	ConnectionsTotal         uint64            `json:"connections_total"`
-	PreferredOnlyConnections int               `json:"preferred_only_connections"`
-	TXAggregatingConnections int               `json:"tx_aggregating_connections"`
-	RXAggregatingConnections int               `json:"rx_aggregating_connections"`
-	BoosterDegraded          int               `json:"booster_degraded_connections"`
-	Current                  statusRate        `json:"current"`
-	Cumulative               statusTraffic     `json:"cumulative"`
-	ReplayBytes              int64             `json:"replay_bytes"`
-	ReorderBytes             int64             `json:"reorder_bytes"`
-	ReorderFrames            int64             `json:"reorder_frames"`
-	LastActivation           *statusActivation `json:"last_activation,omitempty"`
+	State                    string                  `json:"state"`
+	Connections              int                     `json:"connections"`
+	ConnectionsTotal         uint64                  `json:"connections_total"`
+	PreferredOnlyConnections int                     `json:"preferred_only_connections"`
+	TXAggregatingConnections int                     `json:"tx_aggregating_connections"`
+	RXAggregatingConnections int                     `json:"rx_aggregating_connections"`
+	BoosterDegraded          int                     `json:"booster_degraded_connections"`
+	Current                  statusRate              `json:"current"`
+	Peak                     statusPeakRate          `json:"peak"`
+	Cumulative               statusTraffic           `json:"cumulative"`
+	ReplayBytes              int64                   `json:"replay_bytes"`
+	ReorderBytes             int64                   `json:"reorder_bytes"`
+	ReorderFrames            int64                   `json:"reorder_frames"`
+	ReorderPeakBytes         int64                   `json:"reorder_peak_bytes"`
+	ReorderPeakFrames        int64                   `json:"reorder_peak_frames"`
+	LocalSender              statusSenderDiagnostics `json:"local_sender"`
+	RemoteSender             statusSenderDiagnostics `json:"remote_sender"`
+	LastActivation           *statusActivation       `json:"last_activation,omitempty"`
 }
 
 type statusFlow struct {
@@ -384,40 +520,59 @@ type statusFlow struct {
 }
 
 type statusLeg struct {
-	ID                      int           `json:"id"`
-	Tag                     string        `json:"tag"`
-	Type                    string        `json:"type"`
-	Role                    string        `json:"role"`
-	State                   string        `json:"state"`
-	Connections             int           `json:"connections"`
-	CarryingConnections     int           `json:"carrying_connections"`
-	StandbyConnections      int           `json:"standby_connections"`
-	ConnectingConnections   int           `json:"connecting_connections"`
-	RetryingConnections     int           `json:"retrying_connections"`
-	Current                 statusRate    `json:"current"`
-	Cumulative              statusTraffic `json:"cumulative"`
-	Frames                  statusFrames  `json:"frames"`
-	BacklogBytes            int64         `json:"backlog_bytes"`
-	QueueBytesPerConnection int64         `json:"queue_bytes_per_connection"`
-	ConfiguredBandwidthMbps uint32        `json:"configured_bandwidth_mbps"`
-	TXWeight                uint32        `json:"tx_weight"`
-	TXSharePercent          float64       `json:"tx_share_percent"`
-	JoinCount               uint64        `json:"join_count"`
-	AttemptCount            uint64        `json:"attempt_count"`
-	UDPSelected             bool          `json:"udp_selected"`
-	UDPCurrent              statusRate    `json:"udp_current"`
-	UDPCumulative           statusTraffic `json:"udp_cumulative"`
-	LastError               string        `json:"last_error,omitempty"`
-	LastErrorAt             string        `json:"last_error_at,omitempty"`
-	LastErrorCategory       string        `json:"last_error_category,omitempty"`
-	LastErrorStage          string        `json:"last_error_stage,omitempty"`
-	LastErrorDestination    string        `json:"last_error_destination,omitempty"`
-	LastErrorSessionID      string        `json:"last_error_session_id,omitempty"`
-	LastErrorAttempt        uint64        `json:"last_error_attempt,omitempty"`
-	ErrorCount              uint64        `json:"error_count"`
-	LastErrorTransient      bool          `json:"last_error_transient"`
-	LastErrorHarmless       bool          `json:"last_error_harmless"`
-	TopFlows                []statusFlow  `json:"top_flows"`
+	ID                      int            `json:"id"`
+	Tag                     string         `json:"tag"`
+	Type                    string         `json:"type"`
+	Role                    string         `json:"role"`
+	State                   string         `json:"state"`
+	Connections             int            `json:"connections"`
+	CarryingConnections     int            `json:"carrying_connections"`
+	StandbyConnections      int            `json:"standby_connections"`
+	ConnectingConnections   int            `json:"connecting_connections"`
+	RetryingConnections     int            `json:"retrying_connections"`
+	Current                 statusRate     `json:"current"`
+	Peak                    statusPeakRate `json:"peak"`
+	Cumulative              statusTraffic  `json:"cumulative"`
+	Frames                  statusFrames   `json:"frames"`
+	BacklogBytes            int64          `json:"backlog_bytes"`
+	WritingBytes            int64          `json:"writing_bytes"`
+	WriteBlockedMS          int64          `json:"write_blocked_ms"`
+	PeakBacklogBytes        int64          `json:"peak_backlog_bytes"`
+	RemoteBacklogBytes      int64          `json:"remote_backlog_bytes"`
+	RemoteWritingBytes      int64          `json:"remote_writing_bytes"`
+	RemoteWriteBlockedMS    int64          `json:"remote_write_blocked_ms"`
+	RemotePeakBacklogBytes  int64          `json:"remote_peak_backlog_bytes"`
+	QueueBytesPerConnection int64          `json:"queue_bytes_per_connection"`
+	ConfiguredBandwidthMbps uint32         `json:"configured_bandwidth_mbps"`
+	TXWeight                uint32         `json:"tx_weight"`
+	TXSharePercent          float64        `json:"tx_share_percent"`
+	JoinCount               uint64         `json:"join_count"`
+	AttemptCount            uint64         `json:"attempt_count"`
+	UDPSelected             bool           `json:"udp_selected"`
+	UDPCurrent              statusRate     `json:"udp_current"`
+	UDPCumulative           statusTraffic  `json:"udp_cumulative"`
+	LastError               string         `json:"last_error,omitempty"`
+	LastErrorAt             string         `json:"last_error_at,omitempty"`
+	LastErrorCategory       string         `json:"last_error_category,omitempty"`
+	LastErrorStage          string         `json:"last_error_stage,omitempty"`
+	LastErrorDestination    string         `json:"last_error_destination,omitempty"`
+	LastErrorSessionID      string         `json:"last_error_session_id,omitempty"`
+	LastErrorAttempt        uint64         `json:"last_error_attempt,omitempty"`
+	ErrorCount              uint64         `json:"error_count"`
+	RemoteFailureCount      uint64         `json:"remote_failure_count"`
+	RemoteLastFailureStage  string         `json:"remote_last_failure_stage,omitempty"`
+	RTTLatestMS             float64        `json:"rtt_latest_ms"`
+	RTTAverageMS            float64        `json:"rtt_average_ms"`
+	RTTEWMAMS               float64        `json:"rtt_ewma_ms"`
+	RTTMinMS                float64        `json:"rtt_min_ms"`
+	RTTMaxMS                float64        `json:"rtt_max_ms"`
+	RTTJitterMS             float64        `json:"rtt_jitter_ms"`
+	RTTSamples              uint64         `json:"rtt_samples"`
+	ProbeSent               uint64         `json:"probe_sent"`
+	ProbeTimeout            uint64         `json:"probe_timeout"`
+	LastErrorTransient      bool           `json:"last_error_transient"`
+	LastErrorHarmless       bool           `json:"last_error_harmless"`
+	TopFlows                []statusFlow   `json:"top_flows"`
 }
 
 type statusNode struct {
@@ -467,6 +622,30 @@ func trafficRate(current, previous coreTrafficCounters, elapsed time.Duration) (
 	return logical, legs
 }
 
+func senderRate(current, previous senderTotals, elapsed time.Duration) (uint64, [2]uint64) {
+	logical := counterRate(current.logicalTX, previous.logicalTX, elapsed)
+	var legs [2]uint64
+	for index := range legs {
+		legs[index] = counterRate(current.legTX[index], previous.legTX[index], elapsed)
+	}
+	return logical, legs
+}
+
+func updatePeakRate(peak *statusPeakRate, current statusRate, now time.Time) {
+	if current.TXBytesPS > peak.TXBytesPS {
+		peak.TXBytesPS = current.TXBytesPS
+		peak.TXAt = now.Format(time.RFC3339Nano)
+	}
+	if current.RXBytesPS > peak.RXBytesPS {
+		peak.RXBytesPS = current.RXBytesPS
+		peak.RXAt = now.Format(time.RFC3339Nano)
+	}
+}
+
+func durationMilliseconds(value time.Duration) float64 {
+	return float64(value) / float64(time.Millisecond)
+}
+
 func activationStatus(info activationInfo, at time.Time) *statusActivation {
 	if at.IsZero() {
 		return nil
@@ -496,6 +675,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		sessions = append(sessions, session)
 	}
 	totals := s.closed
+	localSenderTotals := s.closedSender
+	remoteSenderTotals := s.closedRemote
 	leg1Joins := s.closedLeg1Joins
 	leg1Attempts := s.closedAttempts
 	connectionsMade := s.connectionsMade
@@ -504,8 +685,13 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 
 	snapshots := make([]sampledSession, 0, len(sessions))
 	for _, session := range sessions {
+		session.core.scheduleProbes(now)
 		snapshot := session.core.statusSnapshot()
 		totals.add(snapshot.counters)
+		localSenderTotals.add(snapshot.localSenderTotals())
+		if snapshot.peerSender.status.Sequence > 0 {
+			remoteSenderTotals.add(senderTotalsFromPeer(snapshot.peerSender.status))
+		}
 		snapshots = append(snapshots, sampledSession{session: session, snapshot: snapshot})
 	}
 
@@ -565,6 +751,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		Pressure:           memorySnapshot.Pressure,
 		PressureEvents:     memorySnapshot.PressureEvents,
 		BackpressureEvents: memorySnapshot.BackpressureEvents,
+		PeakUsedBytes:      memorySnapshot.PeakUsedBytes,
+		PeakCachedBytes:    memorySnapshot.PeakCachedBytes,
 	}
 	if !memorySnapshot.PressureSince.IsZero() {
 		memory.PressureSince = memorySnapshot.PressureSince.Format(time.RFC3339Nano)
@@ -576,6 +764,31 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		Cumulative: statusTraffic{
 			TXBytes: totals.logicalTX + udpTotals.TXBytes,
 			RXBytes: totals.logicalRX + udpTotals.RXBytes,
+		},
+		LocalSender: statusSenderDiagnostics{
+			Available:                true,
+			FallbackBytes:            localSenderTotals.fallbackBytes,
+			FallbackFrames:           localSenderTotals.fallbackFrames,
+			FallbackEvents:           localSenderTotals.fallbackEvents,
+			Leg1TXBytes:              localSenderTotals.legTX[1],
+			ReplayTimeouts:           localSenderTotals.replayTimeouts,
+			BackpressureEvents:       localSenderTotals.backpressureEvents,
+			BackpressureDurationMS:   localSenderTotals.backpressureNanos / uint64(time.Millisecond),
+			MemoryPressure:           memorySnapshot.Pressure,
+			MemoryUsedBytes:          uint64(max(0, memorySnapshot.UsedBytes)),
+			MemoryPeakUsedBytes:      uint64(max(0, memorySnapshot.PeakUsedBytes)),
+			MemoryPressureEvents:     memorySnapshot.PressureEvents,
+			MemoryBackpressureEvents: memorySnapshot.BackpressureEvents,
+		},
+		RemoteSender: statusSenderDiagnostics{
+			Available:              remoteSenderTotals.logicalTX > 0,
+			FallbackBytes:          remoteSenderTotals.fallbackBytes,
+			FallbackFrames:         remoteSenderTotals.fallbackFrames,
+			FallbackEvents:         remoteSenderTotals.fallbackEvents,
+			Leg1TXBytes:            remoteSenderTotals.legTX[1],
+			ReplayTimeouts:         remoteSenderTotals.replayTimeouts,
+			BackpressureEvents:     remoteSenderTotals.backpressureEvents,
+			BackpressureDurationMS: remoteSenderTotals.backpressureNanos / uint64(time.Millisecond),
 		},
 	}
 	legs := []statusLeg{
@@ -639,11 +852,35 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	}
 
 	var latestActivation time.Time
+	var latestRemote time.Time
+	var latestRemoteFailure [2]time.Time
 	for _, item := range snapshots {
 		snapshot := item.snapshot
 		logical.ReplayBytes += snapshot.replayBytes
+		logical.LocalSender.ReplayBytes += snapshot.replayBytes
+		s.peakReplayLocal = max(s.peakReplayLocal, snapshot.replayPeak)
 		logical.ReorderBytes += snapshot.reorderBytes
 		logical.ReorderFrames += snapshot.reorderFrames
+		logical.ReorderPeakBytes = max(logical.ReorderPeakBytes, snapshot.reorderPeak)
+		logical.ReorderPeakFrames = max(logical.ReorderPeakFrames, snapshot.reorderFPeak)
+		remote := snapshot.peerSender
+		if remote.status.Sequence > 0 {
+			logical.RemoteSender.Available = true
+			logical.RemoteSender.ReplayBytes += int64(remote.status.ReplayBytes)
+			s.peakReplayRemote = max(s.peakReplayRemote, int64(remote.status.ReplayPeakBytes))
+			if now.Sub(remote.receivedAt) > 3*time.Second {
+				logical.RemoteSender.StaleConnections++
+			}
+			if remote.receivedAt.After(latestRemote) {
+				latestRemote = remote.receivedAt
+				logical.RemoteSender.UpdatedAt = remote.receivedAt.Format(time.RFC3339Nano)
+				logical.RemoteSender.MemoryPressure = remote.status.Flags&senderStatusFlagMemoryPressure != 0
+				logical.RemoteSender.MemoryUsedBytes = remote.status.MemoryUsed
+				logical.RemoteSender.MemoryPeakUsedBytes = remote.status.MemoryPeakUsed
+				logical.RemoteSender.MemoryPressureEvents = remote.status.MemoryPressureEvents
+				logical.RemoteSender.MemoryBackpressureEvents = remote.status.MemoryBackpressureEvents
+			}
+		}
 		if snapshot.active {
 			logical.TXAggregatingConnections++
 		} else {
@@ -662,6 +899,34 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		for legIndex := range legs {
 			leg := &legs[legIndex]
 			leg.BacklogBytes += snapshot.legBacklog[legIndex]
+			s.peakLegBacklog[legIndex] = max(s.peakLegBacklog[legIndex], snapshot.legPeak[legIndex])
+			leg.WritingBytes += snapshot.legWriting[legIndex]
+			leg.WriteBlockedMS = max(leg.WriteBlockedMS, snapshot.legWriteBlock[legIndex].Milliseconds())
+			if remote.status.Sequence > 0 {
+				leg.RemoteBacklogBytes += int64(remote.status.LegBacklog[legIndex])
+				leg.RemoteWritingBytes += int64(remote.status.LegWriting[legIndex])
+				leg.RemoteWriteBlockedMS = max(leg.RemoteWriteBlockedMS, int64(remote.status.LegWriteBlockedNanos[legIndex]/uint64(time.Millisecond)))
+				leg.RemoteFailureCount += remote.status.LegFailures[legIndex]
+				s.peakRemoteBacklog[legIndex] = max(s.peakRemoteBacklog[legIndex], int64(remote.status.LegPeakBacklog[legIndex]))
+				if int(remote.status.LastFailureLeg) == legIndex && remote.receivedAt.After(latestRemoteFailure[legIndex]) {
+					leg.RemoteLastFailureStage = string(senderStatusStage(remote.status.LastFailureStage))
+					latestRemoteFailure[legIndex] = remote.receivedAt
+				}
+			}
+			rtt := snapshot.rtt[legIndex]
+			if rtt.Samples > 0 {
+				leg.RTTLatestMS += durationMilliseconds(rtt.Latest) * float64(rtt.Samples)
+				leg.RTTAverageMS += durationMilliseconds(rtt.Total)
+				leg.RTTEWMAMS += durationMilliseconds(rtt.EWMA) * float64(rtt.Samples)
+				leg.RTTJitterMS += durationMilliseconds(rtt.Jitter) * float64(rtt.Samples)
+				if leg.RTTMinMS == 0 || durationMilliseconds(rtt.Minimum) < leg.RTTMinMS {
+					leg.RTTMinMS = durationMilliseconds(rtt.Minimum)
+				}
+				leg.RTTMaxMS = max(leg.RTTMaxMS, durationMilliseconds(rtt.Maximum))
+				leg.RTTSamples += rtt.Samples
+			}
+			leg.ProbeSent += rtt.ProbeSent
+			leg.ProbeTimeout += rtt.ProbeTimeout
 			flowRate := item.rates[legIndex]
 			if snapshot.legPresent[legIndex] {
 				leg.Connections++
@@ -695,6 +960,29 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			default:
 				legs[1].ConnectingConnections++
 			}
+		}
+	}
+	logical.RemoteSender.Stale = logical.RemoteSender.StaleConnections > 0
+	s.peakReplayLocal = max(s.peakReplayLocal, logical.LocalSender.ReplayBytes)
+	s.peakReplayRemote = max(s.peakReplayRemote, logical.RemoteSender.ReplayBytes)
+	logical.LocalSender.ReplayPeakBytes = s.peakReplayLocal
+	logical.RemoteSender.ReplayPeakBytes = s.peakReplayRemote
+	updatePeakRate(&s.peakLogical, logical.Current, now)
+	logical.Peak = s.peakLogical
+	for index := range legs {
+		leg := &legs[index]
+		updatePeakRate(&s.peakLeg[index], leg.Current, now)
+		leg.Peak = s.peakLeg[index]
+		s.peakLegBacklog[index] = max(s.peakLegBacklog[index], leg.BacklogBytes)
+		s.peakRemoteBacklog[index] = max(s.peakRemoteBacklog[index], leg.RemoteBacklogBytes)
+		leg.PeakBacklogBytes = s.peakLegBacklog[index]
+		leg.RemotePeakBacklogBytes = s.peakRemoteBacklog[index]
+		if leg.RTTSamples > 0 {
+			weight := float64(leg.RTTSamples)
+			leg.RTTLatestMS /= weight
+			leg.RTTAverageMS /= weight
+			leg.RTTEWMAMS /= weight
+			leg.RTTJitterMS /= weight
 		}
 	}
 

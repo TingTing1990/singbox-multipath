@@ -22,11 +22,12 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 type serverSession struct {
-	id          [16]byte
-	destination M.Socksaddr
-	chunkSize   uint32
-	core        *mpCore
-	appConn     net.Conn
+	id            [16]byte
+	destination   M.Socksaddr
+	chunkSize     uint32
+	requestStatus bool
+	core          *mpCore
+	appConn       net.Conn
 }
 
 type Inbound struct {
@@ -38,8 +39,9 @@ type Inbound struct {
 	cfg              coreConfig
 	handshakeTimeout time.Duration
 
-	access   sync.Mutex
-	sessions map[[16]byte]*serverSession
+	access     sync.Mutex
+	sessions   map[[16]byte]*serverSession
+	statusWake chan struct{}
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
@@ -122,6 +124,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		router:           router,
 		logger:           logger,
 		sessions:         make(map[[16]byte]*serverSession),
+		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
 		cfg: coreConfig{
 			ChunkSize:            chunkSize,
@@ -152,7 +155,12 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	return i.listener.Start()
+	if err := i.listener.Start(); err != nil {
+		return err
+	}
+	i.cfg.Memory.startLogging(i.ctx, i.logger, "server")
+	go i.senderStatusLoop()
+	return nil
 }
 
 func (i *Inbound) Close() error {
@@ -190,7 +198,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	i.access.Lock()
 	session := i.sessions[hello.Session]
 	if session != nil {
-		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize {
+		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize || session.requestStatus != hello.RequestStatus {
 			i.access.Unlock()
 			i.rejectHello(conn, onClose, helloRejectSessionMismatch, E.New("multipath session parameters mismatch"))
 			return
@@ -233,6 +241,10 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	cfg := i.cfg
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
+	if hello.RequestStatus {
+		cfg.OnStatusEvent = i.wakeSenderStatus
+		cfg.SendStatus = true
+	}
 	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
 		i.logger.InfoContext(
 			ctx,
@@ -248,11 +260,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		return
 	}
 	session = &serverSession{
-		id:          hello.Session,
-		destination: destination,
-		chunkSize:   uint32(cfg.ChunkSize),
-		core:        core,
-		appConn:     appConn,
+		id:            hello.Session,
+		destination:   destination,
+		chunkSize:     uint32(cfg.ChunkSize),
+		requestStatus: hello.RequestStatus,
+		core:          core,
+		appConn:       appConn,
 	}
 	if err = core.reserveLeg(hello.LegID); err != nil {
 		i.access.Unlock()
@@ -303,4 +316,45 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 		delete(i.sessions, id)
 	}
 	i.access.Unlock()
+}
+
+func (i *Inbound) wakeSenderStatus() {
+	select {
+	case i.statusWake <- struct{}{}:
+	default:
+	}
+}
+
+func (i *Inbound) sendSenderStatus(now time.Time, force bool) {
+	i.access.Lock()
+	sessions := make([]*serverSession, 0, len(i.sessions))
+	for _, session := range i.sessions {
+		sessions = append(sessions, session)
+	}
+	i.access.Unlock()
+	for _, session := range sessions {
+		session.core.queueSenderStatus(now, force)
+	}
+}
+
+func (i *Inbound) senderStatusLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-i.ctx.Done():
+			return
+		case now := <-ticker.C:
+			i.sendSenderStatus(now, false)
+		case <-i.statusWake:
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-i.ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				i.sendSenderStatus(time.Now(), true)
+			}
+		}
+	}
 }

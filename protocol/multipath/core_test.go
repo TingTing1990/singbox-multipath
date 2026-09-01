@@ -186,6 +186,47 @@ func TestCoreLeg1ActiveNotificationWaitsForLeg(t *testing.T) {
 	}
 }
 
+func TestCoreSenderStatusAndRTTProbe(t *testing.T) {
+	left, _ := newCore(context.Background(), testCoreConfig())
+	rightConfig := testCoreConfig()
+	rightConfig.SendStatus = true
+	right, _ := newCore(context.Background(), rightConfig)
+	defer left.Close()
+	defer right.Close()
+	leftWire, rightWire := net.Pipe()
+	connectTestLeg(t, left, right, 0, leftWire, rightWire)
+
+	right.ingressBytes.Store(4096)
+	right.fallbackB.Store(1024)
+	if !right.queueSenderStatus(time.Now(), true) {
+		t.Fatal("sender status was not queued")
+	}
+	waitForStatus(t, func() bool {
+		return left.peerSenderStatusSnapshot().status.Sequence > 0
+	})
+	remote := left.peerSenderStatusSnapshot().status
+	if remote.LogicalTX != 4096 || remote.FallbackBytes != 1024 {
+		t.Fatalf("unexpected remote sender status: %+v", remote)
+	}
+
+	left.scheduleProbes(time.Now())
+	waitForStatus(t, func() bool {
+		return left.rttSnapshot()[0].Samples > 0
+	})
+	rtt := left.rttSnapshot()[0]
+	if rtt.ProbeSent != 1 || rtt.Latest <= 0 || rtt.EWMA <= 0 {
+		t.Fatalf("unexpected RTT status: %+v", rtt)
+	}
+}
+
+func TestCoreSenderStatusDisabled(t *testing.T) {
+	core, _ := newCore(context.Background(), testCoreConfig())
+	defer core.Close()
+	if core.queueSenderStatus(time.Now(), true) {
+		t.Fatal("sender status was queued while disabled")
+	}
+}
+
 func TestActivationInfoString(t *testing.T) {
 	tests := []struct {
 		name     string

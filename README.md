@@ -59,6 +59,26 @@ inbound or outbound. With `memory_limit` omitted, the budget is
 3/4; leg 0 may use the hard limit. Below the high watermark, scheduling and queueing
 behavior is unchanged.
 
+### Runtime telemetry
+
+When the client enables `status_file`, protocol v5 requests a compact sender-status
+frame from the server on leg 0. It reports the server-side downlink queues, replay and fallback counters,
+write stalls, and memory pressure for the matching logical session. Status frames
+are coalesced and do not consume data sequence numbers, replay space, or the payload
+memory budget. The client marks remote status stale when updates stop rather than
+interpreting missing telemetry as zero.
+
+When `status_file` is enabled, the client also sends low-rate PING/PONG probes over
+each attached leg. Reported RTT is the effective application-layer round trip and
+therefore includes transport and proxy queueing. Probe timeouts and replay fallback
+ratios describe multipath-visible stalls; they are not raw IP or UDP packet-loss
+measurements. Traffic peaks are the highest one-second averages since process start,
+while memory peaks are updated directly by the allocator.
+
+At startup, each multipath inbound or outbound logs its resolved memory limit, high
+and resume watermarks, and cache limit. Crossing the high watermark and recovering
+below the resume watermark each emit one informational transition log.
+
 ### Client outbound example
 
 The following example uses a system WireGuard interface for the preferred leg and an
