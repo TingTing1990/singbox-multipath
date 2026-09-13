@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +19,9 @@ import (
 	"github.com/sagernet/sing/common/byteformats"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/protocol/socks"
 )
 
 const (
@@ -71,6 +80,132 @@ func TestMultipathTFOCombinations(t *testing.T) {
 						})
 					}
 				}
+			}
+		}
+	}
+}
+
+func TestMultipathDirectionalAggregation(t *testing.T) {
+	for _, clientEnabled := range []bool{false, true} {
+		for _, serverEnabled := range []bool{false, true} {
+			for _, fastOpen := range []bool{false, true} {
+				t.Run(fmt.Sprintf("client=%t/server=%t/tfo=%t", clientEnabled, serverEnabled, fastOpen), func(t *testing.T) {
+					listener, err := net.Listen("tcp", "127.0.0.1:0")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer listener.Close()
+					payload := bytes.Repeat([]byte("directional-aggregation"), 65536)
+					serverDone := make(chan error, 1)
+					go func() {
+						conn, acceptErr := listener.Accept()
+						if acceptErr != nil {
+							serverDone <- acceptErr
+							return
+						}
+						defer conn.Close()
+						_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+						warmup := make([]byte, 1)
+						if _, acceptErr = io.ReadFull(conn, warmup); acceptErr == nil {
+							_, acceptErr = conn.Write(warmup)
+						}
+						received := make([]byte, len(payload))
+						if acceptErr == nil {
+							_, acceptErr = io.ReadFull(conn, received)
+						}
+						if acceptErr == nil && !bytes.Equal(payload, received) {
+							acceptErr = fmt.Errorf("upload payload mismatch")
+						}
+						if acceptErr == nil {
+							_, acceptErr = conn.Write(payload)
+						}
+						serverDone <- acceptErr
+					}()
+					leg0 := multipathTestLeg{tag: "leg0", kind: multipathTestLegDirect, tfo: fastOpen}
+					leg1 := multipathTestLeg{tag: "leg1", kind: multipathTestLegProxy, tfo: fastOpen, proxyPort: otherClientPort}
+					options := multipathTFOTestOptions(fastOpen, leg0, leg1, shadowaead.List[0], mkBase64(t, 16))
+					inbound := options.Inbounds[1].Options.(*option.MultipathInboundOptions)
+					inbound.AggregationEnabled = common.Ptr(serverEnabled)
+					inbound.ActivationOnQueue = common.Ptr(false)
+					inbound.ActivationThresholdMbps = common.Ptr(uint32(0))
+					inbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
+					inbound.BandwidthMbps = []uint32{1, 1000}
+					outbound := options.Outbounds[len(options.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
+					outbound.AggregationEnabled = common.Ptr(clientEnabled)
+					outbound.ActivationOnQueue = common.Ptr(false)
+					outbound.ActivationThresholdMbps = common.Ptr(uint32(0))
+					outbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
+					outbound.BandwidthMbps = []uint32{1, 1000}
+					outbound.StatusFile = filepath.Join(t.TempDir(), "multipath.json")
+					startInstance(t, options)
+					dialer := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
+					conn, err := dialer.DialContext(context.Background(), "tcp", M.ParseSocksaddr(listener.Addr().String()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+					if _, err = conn.Write([]byte{1}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err = io.ReadFull(conn, make([]byte, 1)); err != nil {
+						t.Fatal(err)
+					}
+					var document struct {
+						Node struct {
+							Logical struct {
+								TXAggregating int `json:"tx_aggregating_connections"`
+							} `json:"logical"`
+							Legs []struct {
+								Connections int `json:"connections"`
+								Cumulative  struct {
+									TX uint64 `json:"tx_bytes"`
+									RX uint64 `json:"rx_bytes"`
+								} `json:"cumulative"`
+							} `json:"legs"`
+						} `json:"node"`
+					}
+					readStatus := func() bool {
+						data, readErr := os.ReadFile(outbound.StatusFile)
+						return readErr == nil && json.Unmarshal(data, &document) == nil && len(document.Node.Legs) == 2
+					}
+					deadline := time.Now().Add(5 * time.Second)
+					for !readStatus() || document.Node.Legs[1].Connections != 1 || (document.Node.Logical.TXAggregating > 0) != clientEnabled {
+						if time.Now().After(deadline) {
+							t.Fatal("leg1 did not attach or local activation state is incorrect")
+						}
+						time.Sleep(20 * time.Millisecond)
+					}
+					if _, err = conn.Write(payload); err != nil {
+						t.Fatal(err)
+					}
+					received := make([]byte, len(payload))
+					if _, err = io.ReadFull(conn, received); err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(payload, received) {
+						t.Fatal("download payload mismatch")
+					}
+					if err = <-serverDone; err != nil {
+						t.Fatal(err)
+					}
+					deadline = time.Now().Add(5 * time.Second)
+					for {
+						if readStatus() {
+							leg0, leg1 := document.Node.Legs[0], document.Node.Legs[1]
+							if leg0.Cumulative.TX+leg1.Cumulative.TX >= uint64(len(payload)+1) && leg0.Cumulative.RX+leg1.Cumulative.RX >= uint64(len(payload)+1) {
+								if (leg1.Cumulative.TX > 0) != clientEnabled || (leg1.Cumulative.RX > 0) != serverEnabled {
+									t.Fatalf("leg1 traffic does not match directional switches: TX=%d RX=%d", leg1.Cumulative.TX, leg1.Cumulative.RX)
+								}
+								break
+							}
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("final directional traffic was not recorded")
+						}
+						time.Sleep(20 * time.Millisecond)
+					}
+				})
 			}
 		}
 	}

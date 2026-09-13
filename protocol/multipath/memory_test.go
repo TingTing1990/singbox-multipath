@@ -114,6 +114,7 @@ func TestCoreMemoryPressureKeepsLeg0Available(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer core.Close()
+	core.activate(activationInfo{Reason: activationReasonBytes})
 
 	leg0Core, leg0Peer := net.Pipe()
 	defer leg0Peer.Close()

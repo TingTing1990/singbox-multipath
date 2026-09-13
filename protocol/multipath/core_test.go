@@ -61,14 +61,16 @@ func (c *delayedWriteConn) Write(buffer []byte) (int, error) {
 
 func testCoreConfig() coreConfig {
 	return coreConfig{
-		ChunkSize:        4 * 1024,
-		QueueFrames:      64,
-		QueueBytes:       256 * 1024,
-		BandwidthMbps:    []uint32{1, 16},
-		MaxReorderFrames: 4096,
-		MaxReorderBytes:  16 << 20,
-		ReplayBytes:      16 << 20,
-		ReplayTimeout:    time.Second,
+		AggregationEnabled: true,
+		ActivationOnQueue:  true,
+		ChunkSize:          4 * 1024,
+		QueueFrames:        64,
+		QueueBytes:         256 * 1024,
+		BandwidthMbps:      []uint32{1, 16},
+		MaxReorderFrames:   4096,
+		MaxReorderBytes:    16 << 20,
+		ReplayBytes:        16 << 20,
+		ReplayTimeout:      time.Second,
 	}
 }
 
@@ -300,6 +302,8 @@ func TestActivationAfterBytesMinRate(t *testing.T) {
 func TestCoreHalfClosePreservesTail(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())
+	left.activate(activationInfo{Reason: activationReasonBytes})
+	right.activate(activationInfo{Reason: activationReasonBytes})
 	defer left.Close()
 	defer right.Close()
 	leg0Left, leg0Right := net.Pipe()
@@ -332,6 +336,8 @@ func TestCoreHalfClosePreservesTail(t *testing.T) {
 func TestCoreBidirectionalHalfClose(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())
+	left.activate(activationInfo{Reason: activationReasonBytes})
+	right.activate(activationInfo{Reason: activationReasonBytes})
 	defer left.Close()
 	defer right.Close()
 	leg0Left, leg0Right := net.Pipe()
@@ -418,6 +424,8 @@ func TestCoreSmallFlowUsesOnlyLeg0(t *testing.T) {
 func TestCoreLeg1FailureFallsBackToLeg0(t *testing.T) {
 	left, leftApp := newCore(context.Background(), testCoreConfig())
 	right, rightApp := newCore(context.Background(), testCoreConfig())
+	left.activate(activationInfo{Reason: activationReasonBytes})
+	right.activate(activationInfo{Reason: activationReasonBytes})
 	defer left.Close()
 	defer right.Close()
 	leg0Left, leg0Right := net.Pipe()
@@ -476,6 +484,8 @@ func TestCoreLeg1StallFallsBackToLeg0(t *testing.T) {
 	cfg.ReplayTimeout = 100 * time.Millisecond
 	left, leftApp := newCore(context.Background(), cfg)
 	right, rightApp := newCore(context.Background(), cfg)
+	left.activate(activationInfo{Reason: activationReasonBytes})
+	right.activate(activationInfo{Reason: activationReasonBytes})
 	defer left.Close()
 	defer right.Close()
 	leg0Left, leg0Right := net.Pipe()

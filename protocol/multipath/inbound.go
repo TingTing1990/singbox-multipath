@@ -46,10 +46,7 @@ type Inbound struct {
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
 	activationAfterBytes := options.ActivationAfterBytes.Value()
-	threshold := options.ActivationThresholdMbps
-	if threshold == 0 && activationAfterBytes == 0 {
-		threshold = 150
-	}
+	threshold := resolveActivationThreshold(options.ActivationThresholdMbps, activationAfterBytes)
 	window := time.Duration(options.ActivationWindow)
 	if window <= 0 {
 		window = time.Second
@@ -128,10 +125,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
 		cfg: coreConfig{
+			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
+			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
 			ChunkSize:                      chunkSize,
 			QueueFrames:                    queueFrames,
 			QueueBytes:                     queueBytes,
-			ThresholdBytesPS:               uint64(threshold) * 1000 * 1000 / 8,
+			ThresholdBytesPS:               threshold,
 			ActivationAfterBytes:           activationAfterBytes,
 			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
 			ActivationWindow:               window,

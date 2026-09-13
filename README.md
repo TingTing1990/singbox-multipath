@@ -32,6 +32,29 @@ measured rate, and leg 0 queue pressure. Once active, new frames are assigned by
 leg's queued bytes divided by its `bandwidth_mbps` weight, so a backing-up leg becomes
 less attractive without delaying writes already queued on the other leg.
 
+`aggregation_enabled` controls only the local sending direction: client upload on
+an outbound, server download on an inbound. With it disabled, all locally sent
+application data stays on leg 0. Leg 1 can still attach and receive data when the
+peer enables aggregation, and the selected UDP outbound is unaffected.
+
+With aggregation enabled, the following triggers are independent alternatives
+(OR), evaluated separately for each connection and sending direction:
+
+- Queue: `activation_on_queue` is enabled and leg 0 backlog stays at least 80% of
+  its queue byte capacity for `activation_window`.
+- Rate: `activation_threshold_mbps` is greater than zero and the average local
+  ingress rate over `activation_window` reaches it.
+- Bytes: `activation_after_bytes` is greater than zero and the locally sent byte
+  count reaches it. If `activation_after_bytes_min_mbps` is non-zero, this trigger
+  also requires that average rate over a complete `activation_window`.
+
+The minimum byte-trigger rate does not gate the queue or rate triggers. Disabling
+all three triggers keeps local TX on leg 0; zero thresholds never imply immediate
+activation. Once activated, aggregation does not automatically deactivate when
+traffic drops. Explicit zero disables a numeric trigger. An omitted rate threshold
+retains the default of 150 Mbps when the byte trigger is disabled, or zero when a
+non-zero byte trigger is configured.
+
 The logical byte stream is split into globally sequenced frames. The receiver accepts
 frames from both legs, buffers only bounded out-of-order data, and writes contiguous
 frames to the application. Cumulative ACKs return on leg 0. A frame assigned to leg 1
@@ -116,6 +139,8 @@ already configured Hysteria2 outbound for the secondary leg:
       "server": "10.66.67.1",
       "server_port": 39000,
       "tcp_fast_open": true,
+      "aggregation_enabled": true,
+      "activation_on_queue": true,
       "activation_threshold_mbps": 120,
       "activation_after_bytes": "2MB",
       "activation_after_bytes_min_mbps": 120,
@@ -151,6 +176,8 @@ is completed before the logical connection is returned.
       "listen": "10.66.67.1",
       "listen_port": 39000,
       "tcp_fast_open": true,
+      "aggregation_enabled": true,
+      "activation_on_queue": true,
       "activation_threshold_mbps": 120,
       "activation_window": "1s",
       "chunk_size": 65536,
@@ -183,9 +210,11 @@ exceed the server value.
 
 | Field | Description | Accepted format / example |
 | --- | --- | --- |
-| `activation_threshold_mbps` | Activates leg 1 when locally sent traffic reaches this average rate during `activation_window`. Defaults to `150` when this and `activation_after_bytes` are both unset. | Non-negative integer Mbps, e.g. `120` |
-| `activation_after_bytes` | Optional total locally sent byte count that activates leg 1. It is an alternative trigger to the rate and queue triggers. | Non-negative integer or memory string, e.g. `2097152` or `"2MB"` |
-| `activation_after_bytes_min_mbps` | Optional recent-rate gate for `activation_after_bytes`. When non-zero, the byte trigger also requires the measured rate over a complete `activation_window` to reach this value. It does not change the throughput or leg 0 queue triggers. | Non-negative integer Mbps, e.g. `120` |
+| `aggregation_enabled` | Enables local TX aggregation. `false` keeps local application data on leg 0 without disabling peer aggregation or UDP. Default: `true`. | `true` or `false` |
+| `activation_on_queue` | Independent OR trigger for sustained leg 0 queue pressure (80% for `activation_window`). Default: `true`. | `true` or `false` |
+| `activation_threshold_mbps` | Independent OR rate trigger per connection over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |
+| `activation_after_bytes` | Independent OR byte-count trigger per connection and local sending direction. `0` or omitted disables it. | Non-negative integer or memory string, e.g. `2097152`, `"2MB"`, or `0` |
+| `activation_after_bytes_min_mbps` | Additional rate gate for the byte-count trigger over a complete `activation_window`. `0` or omitted removes the gate. Queue and rate triggers remain independent. | Non-negative integer Mbps, e.g. `120` or `0` |
 | `activation_window` | Rate sampling window and sustained high-queue trigger duration. Default: `1s`. | Duration, e.g. `"1s"` |
 | `chunk_size` | Maximum payload per multipath data frame, from 1 KiB to 1 MiB. Default: 64 KiB. | Non-negative integer bytes, e.g. `65536` |
 | `queue_frames` | Per-leg send queue capacity in frames, from 8 to 4096. `chunk_size * queue_frames` must not exceed 64 MiB. Default: 256. | Non-negative integer, e.g. `256` |

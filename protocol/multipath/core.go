@@ -38,23 +38,25 @@ var (
 )
 
 type coreConfig struct {
-	ChunkSize            int
-	QueueFrames          int
-	QueueBytes           int64
-	ThresholdBytesPS     uint64
-	ActivationAfterBytes uint64
+	AggregationEnabled             bool
+	ActivationOnQueue              bool
+	ChunkSize                      int
+	QueueFrames                    int
+	QueueBytes                     int64
+	ThresholdBytesPS               uint64
+	ActivationAfterBytes           uint64
 	ActivationAfterBytesMinBytesPS uint64
-	ActivationWindow     time.Duration
-	BandwidthMbps        []uint32
-	MaxReorderFrames     int
-	MaxReorderBytes      int64
-	ReplayBytes          int64
-	ReplayTimeout        time.Duration
-	Memory               *memoryBudget
-	OnLeg1Active         func(activationInfo, bool)
-	OnLegFailure         func(uint8, legFailureStage, error)
-	OnStatusEvent        func()
-	SendStatus           bool
+	ActivationWindow               time.Duration
+	BandwidthMbps                  []uint32
+	MaxReorderFrames               int
+	MaxReorderBytes                int64
+	ReplayBytes                    int64
+	ReplayTimeout                  time.Duration
+	Memory                         *memoryBudget
+	OnLeg1Active                   func(activationInfo, bool)
+	OnLegFailure                   func(uint8, legFailureStage, error)
+	OnStatusEvent                  func()
+	SendStatus                     bool
 }
 
 type legFailureStage string
@@ -70,7 +72,6 @@ const (
 type activationReason string
 
 const (
-	activationReasonImmediate  activationReason = "immediate"
 	activationReasonBytes      activationReason = "bytes"
 	activationReasonThroughput activationReason = "throughput"
 	activationReasonLeg0Queue  activationReason = "leg0_queue"
@@ -505,9 +506,6 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		buffers:      make(map[*byte][]byte),
 	}
 	appConn.onClose = func() { c.fail(io.EOF) }
-	if cfg.ThresholdBytesPS == 0 && cfg.ActivationAfterBytes == 0 {
-		c.activate(activationInfo{Reason: activationReasonImmediate})
-	}
 	c.startWorkers(c.txLoop, c.rxLoop, c.activationLoop, c.ackLoop, c.replayLoop)
 	return c, appConn, nil
 }
@@ -836,8 +834,20 @@ func (c *mpCore) sendFIN() error {
 	return leg.queueControl(c.done, wireFrame{typ: frameTypeFIN, seq: c.txSeq.Load()})
 }
 
+// An omitted rate keeps the original default; explicit zero always disables it.
+func resolveActivationThreshold(threshold *uint32, afterBytes uint64) uint64 {
+	if threshold != nil {
+		return uint64(*threshold) * 1_000_000 / 8
+	}
+	if afterBytes == 0 {
+		return 150 * 1_000_000 / 8
+	}
+	return 0
+}
+
 func (c *mpCore) activationLoop() {
-	if c.active.Load() {
+	if !c.cfg.AggregationEnabled || c.active.Load() ||
+		(!c.cfg.ActivationOnQueue && c.cfg.ThresholdBytesPS == 0 && c.cfg.ActivationAfterBytes == 0) {
 		return
 	}
 	interval := c.cfg.ActivationWindow / 10
@@ -872,7 +882,7 @@ func (c *mpCore) activationLoop() {
 				if elapsed > 0 {
 					rate = uint64(float64(delta) / elapsed.Seconds())
 				}
-				if rate >= c.cfg.ThresholdBytesPS {
+				if c.cfg.ThresholdBytesPS > 0 && rate >= c.cfg.ThresholdBytesPS {
 					c.activate(activationInfo{
 						Reason:           activationReasonThroughput,
 						WindowBytes:      delta,
@@ -884,6 +894,9 @@ func (c *mpCore) activationLoop() {
 				}
 				windowStart = now
 				windowBase = bytesNow
+			}
+			if !c.cfg.ActivationOnQueue {
+				continue
 			}
 			primary := c.getLeg(0)
 			if primary == nil {
@@ -937,6 +950,9 @@ func activationAfterBytes(cfg coreConfig, bytesNow, windowBase uint64, elapsed t
 }
 
 func (c *mpCore) activate(info activationInfo) {
+	if !c.cfg.AggregationEnabled {
+		return
+	}
 	c.activateOnce.Do(func() {
 		c.activationMu.Lock()
 		c.activation = info

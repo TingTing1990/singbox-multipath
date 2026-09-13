@@ -15,7 +15,9 @@ type MultipathOutboundOptions struct {
 	Server                      string                   `json:"server"`
 	ServerPort                  uint16                   `json:"server_port"`
 	TCPFastOpen                 bool                     `json:"tcp_fast_open,omitempty"`
-	ActivationThresholdMbps     uint32                   `json:"activation_threshold_mbps,omitempty"`
+	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
+	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
+	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`
 	ActivationAfterBytes        *byteformats.MemoryBytes `json:"activation_after_bytes,omitempty"`
 	ActivationAfterBytesMinMbps uint32                   `json:"activation_after_bytes_min_mbps,omitempty"`
 	ActivationWindow            badoption.Duration       `json:"activation_window,omitempty"`
@@ -32,7 +34,9 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
-	ActivationThresholdMbps     uint32                   `json:"activation_threshold_mbps,omitempty"`
+	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
+	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
+	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`
 	ActivationAfterBytes        *byteformats.MemoryBytes `json:"activation_after_bytes,omitempty"`
 	ActivationAfterBytesMinMbps uint32                   `json:"activation_after_bytes_min_mbps,omitempty"`
 	ActivationWindow            badoption.Duration       `json:"activation_window,omitempty"`

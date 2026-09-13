@@ -438,6 +438,8 @@ type statusActivation struct {
 }
 
 type statusParameters struct {
+	AggregationEnabled          bool   `json:"aggregation_enabled"`
+	ActivationOnQueue           bool   `json:"activation_on_queue"`
 	ActivationThresholdMbps     uint64 `json:"activation_threshold_mbps"`
 	ActivationAfterBytes        uint64 `json:"activation_after_bytes"`
 	ActivationAfterBytesMinMbps uint64 `json:"activation_after_bytes_min_mbps"`
@@ -731,6 +733,8 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 
 	memorySnapshot := s.config.cfg.Memory.snapshot()
 	parameters := statusParameters{
+		AggregationEnabled:          s.config.cfg.AggregationEnabled,
+		ActivationOnQueue:           s.config.cfg.ActivationOnQueue,
 		ActivationThresholdMbps:     s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
 		ActivationAfterBytes:        s.config.cfg.ActivationAfterBytes,
 		ActivationAfterBytesMinMbps: s.config.cfg.ActivationAfterBytesMinBytesPS * 8 / 1_000_000,
