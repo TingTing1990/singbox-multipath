@@ -178,6 +178,7 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		cancel()
 		return nil, errCoreClosed
 	}
+	c.legCounters[id].joins.Add(1)
 	c.legsMu.Unlock()
 	c.stateMu.Unlock()
 	wakeFlow(c.pumpWake)

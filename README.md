@@ -178,10 +178,21 @@ interpreting missing telemetry as zero.
 Active paths send low-rate PING/PONG probes independently of `status_file` for
 observability. Recovery timing uses DATA receipt samples, not probe success alone.
 An idle unused secondary is not probed just because it is attached. Reported RTT is the effective application-layer round trip and
-therefore includes transport and proxy queueing. Probe timeouts and replay fallback
-ratios describe multipath-visible stalls; they are not raw IP or UDP packet-loss
+therefore includes transport and proxy queueing. Probe timeouts and reinjection/stall
+counters describe multipath-visible events; they are not raw IP or UDP packet-loss
 measurements. Traffic peaks are the highest one-second averages since process start,
 while memory peaks are updated directly by the allocator.
+
+Leg joins count successfully attached transports independently of local TX
+activation. Joins, attempts and reported remote failures retain closed-session
+totals; probe statistics cover active connections only. A lazy primary transport
+can be attached before its deferred handshake finishes. Remote failure totals
+include only events actually reported by the peer.
+
+Remote scheduler rate estimates are not one-second throughput or physical link
+capacity. DATA-feedback RTT follows the selected data leg outward and leg0 for
+the return feedback. Stall detection need not result in reinjection, and sender
+backpressure duration is accumulated across connections, not a single pause.
 
 At startup, each multipath inbound or outbound logs its resolved memory limit, high
 and resume watermarks, and cache limit. Crossing the high watermark and recovering

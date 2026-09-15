@@ -1,6 +1,16 @@
 # Multipath beta5 development validation
 
-Date: 2026-09-16. **Not a release: the full performance suite still has two failures.**
+Historical development checkpoint: 2026-09-16, before commit `cd94d40a6`.
+The source fingerprints, development artifacts and performance results below
+describe that checkpoint, at which the full performance suite had two failures.
+
+The `v1.14.0-multipath-beta5` release adds statistics-only corrections on top of
+`cd94d40a6`: attachment counts independent of local TX activation and cumulative
+reported remote failures. Scheduling, path estimates, wire v8 and the data path
+are unchanged. Five race repetitions of the new counter tests, the correctness
+race suite (excluding `TestPerformanceHealthyLinks`), vet and the direct/proxy
+TFO integration suite passed again. The historical performance failures below
+were neither changed nor rerun by this statistics-only release.
 
 ## Reproducible state
 
@@ -9,7 +19,8 @@ Date: 2026-09-16. **Not a release: the full performance suite still has two fail
   `multipath-beta5`, based on `ad10690649980a512f384db5f3278d541028f822`.
 - HomeProxy worktree: `/home/wusiyu/work/luci-app-homeproxy-multipath-beta5`, branch
   `multipath-beta5`, based on `2435b0f`.
-- Changes are uncommitted. No beta5 tag, push, or production deployment occurred.
+- At this historical checkpoint, changes were uncommitted and no beta5 tag,
+  push, or production deployment had occurred.
   Original worktrees and their pre-existing untracked artifacts were preserved.
 - Wire protocol: v8, with no old-version compatibility. Status JSON: schema 3.
   `bandwidth_mbps` has no runtime effect. It is accepted for migration, ignored,

@@ -29,6 +29,7 @@ const (
 type coreTrafficCounters struct {
 	logicalTX uint64
 	logicalRX uint64
+	legJoins  [2]uint64
 	legTX     [2]uint64
 	legRX     [2]uint64
 	legTXF    [2]uint64
@@ -97,6 +98,7 @@ func (c *coreTrafficCounters) add(other coreTrafficCounters) {
 	c.logicalTX += other.logicalTX
 	c.logicalRX += other.logicalRX
 	for index := range c.legTX {
+		c.legJoins[index] += other.legJoins[index]
 		c.legTX[index] += other.legTX[index]
 		c.legRX[index] += other.legRX[index]
 		c.legTXF[index] += other.legTXF[index]
@@ -114,7 +116,6 @@ type coreStatusSnapshot struct {
 	legWriting         [2]int64
 	legWriteBlock      [2]time.Duration
 	legPeak            [2]int64
-	leg1Joins          uint64
 	replayBytes        int64
 	replayPeak         int64
 	reorderBytes       int64
@@ -156,6 +157,7 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 		},
 	}
 	for index := range snapshot.legPresent {
+		snapshot.counters.legJoins[index] = c.legCounters[index].joins.Load()
 		leg := c.getLeg(uint8(index))
 		snapshot.legPresent[index] = leg != nil
 		if leg != nil {
@@ -171,7 +173,6 @@ func (c *mpCore) statusSnapshot() coreStatusSnapshot {
 	c.activationMu.Lock()
 	snapshot.activation = c.activation
 	snapshot.activationAt = c.activationAt
-	snapshot.leg1Joins = c.leg1Joins
 	c.activationMu.Unlock()
 	c.legFailureMu.Lock()
 	snapshot.legFailures = c.legFailures
@@ -264,7 +265,6 @@ type outboundStatus struct {
 	closed          coreTrafficCounters
 	closedSender    senderTotals
 	closedRemote    senderTotals
-	closedLeg1Joins uint64
 	closedAttempts  uint64
 	connectionsMade uint64
 	legErrors       [2]statusErrorEvent
@@ -329,7 +329,6 @@ func (s *outboundStatus) removeSession(session *statusSession) {
 		if finalSnapshot.peerSender.status.Sequence > 0 {
 			s.closedRemote.add(senderTotalsFromPeer(finalSnapshot.peerSender.status))
 		}
-		s.closedLeg1Joins += finalSnapshot.leg1Joins
 		s.closedAttempts += session.leg1Attempts.Load()
 	}
 	s.access.Unlock()
@@ -683,7 +682,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 	totals := s.closed
 	localSenderTotals := s.closedSender
 	remoteSenderTotals := s.closedRemote
-	leg1Joins := s.closedLeg1Joins
 	leg1Attempts := s.closedAttempts
 	connectionsMade := s.connectionsMade
 	legErrors := s.legErrors
@@ -790,7 +788,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			MemoryBackpressureEvents: memorySnapshot.BackpressureEvents,
 		},
 		RemoteSender: statusSenderDiagnostics{
-			Available:              remoteSenderTotals.logicalTX > 0,
+			Available:              remoteSenderTotals.logicalTX > 0 || remoteSenderTotals.legFailures[0] > 0 || remoteSenderTotals.legFailures[1] > 0,
 			FallbackBytes:          remoteSenderTotals.fallbackBytes,
 			FallbackFrames:         remoteSenderTotals.fallbackFrames,
 			FallbackEvents:         remoteSenderTotals.fallbackEvents,
@@ -807,8 +805,9 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			Cumulative:              statusTraffic{TXBytes: totals.legTX[0], RXBytes: totals.legRX[0]},
 			Frames:                  statusFrames{TX: totals.legTXF[0], RX: totals.legRXF[0]},
 			QueueBytesPerConnection: s.config.cfg.QueueBytes,
-			JoinCount:               connectionsMade,
+			JoinCount:               totals.legJoins[0],
 			AttemptCount:            connectionsMade,
+			RemoteFailureCount:      remoteSenderTotals.legFailures[0],
 			TopFlows:                []statusFlow{},
 		},
 		{
@@ -817,8 +816,9 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			Cumulative:              statusTraffic{TXBytes: totals.legTX[1], RXBytes: totals.legRX[1]},
 			Frames:                  statusFrames{TX: totals.legTXF[1], RX: totals.legRXF[1]},
 			QueueBytesPerConnection: s.config.cfg.QueueBytes,
-			JoinCount:               leg1Joins,
+			JoinCount:               totals.legJoins[1],
 			AttemptCount:            leg1Attempts,
+			RemoteFailureCount:      remoteSenderTotals.legFailures[1],
 			TopFlows:                []statusFlow{},
 		},
 	}
@@ -907,7 +907,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				leg.RemoteBacklogBytes += int64(remote.status.LegBacklog[legIndex])
 				leg.RemoteWritingBytes += int64(remote.status.LegWriting[legIndex])
 				leg.RemoteWriteBlockedMS = max(leg.RemoteWriteBlockedMS, int64(remote.status.LegWriteBlockedNanos[legIndex]/uint64(time.Millisecond)))
-				leg.RemoteFailureCount += remote.status.LegFailures[legIndex]
 				s.peakRemoteBacklog[legIndex] = max(s.peakRemoteBacklog[legIndex], int64(remote.status.LegPeakBacklog[legIndex]))
 				if int(remote.status.LastFailureLeg) == legIndex && remote.receivedAt.After(latestRemoteFailure[legIndex]) {
 					leg.RemoteLastFailureStage = string(senderStatusStage(remote.status.LastFailureStage))
@@ -952,7 +951,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 				BacklogBytes: snapshot.legBacklog[legIndex],
 			})
 		}
-		legs[1].JoinCount += snapshot.leg1Joins
 		legs[1].AttemptCount += item.session.leg1Attempts.Load()
 		if !snapshot.legPresent[1] {
 			switch item.session.leg1Phase.Load() {

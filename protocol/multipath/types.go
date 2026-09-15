@@ -108,6 +108,7 @@ func (i activationInfo) String() string {
 }
 
 type mpLegCounters struct {
+	joins    atomic.Uint64 // Successfully attached transports, independent of TX activation.
 	txBytes  atomic.Uint64
 	rxBytes  atomic.Uint64
 	txFrames atomic.Uint64

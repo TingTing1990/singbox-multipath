@@ -1,13 +1,16 @@
 # Multipath beta5 开发验证记录
 
-日期：2026-09-16。**尚未发布：完整性能测试仍有两项失败。**
+历史开发检查点：2026-09-16，位于提交 `cd94d40a6` 之前。
+下文源码指纹、开发产物和性能结果描述的是当时的状态；当时完整性能测试有两项失败。
+
+`v1.14.0-multipath-beta5` 在 `cd94d40a6` 基础上仅修正统计：路径挂接次数不再依赖本侧发送聚合激活，已报告的远端失败次数纳入关闭连接的累计值。调度、路径估计、v8 线协议和数据传输逻辑均不变。新增计数测试的五轮 race、正确性 race 回归（排除 `TestPerformanceHealthyLinks`）、vet 和 direct／代理子路径 TFO 集成测试再次通过。本次仅修正统计，未修改或重跑下文记录的历史性能失败项。
 
 ## 可复现的版本状态
 
 - 主机：`nec`。
 - sing-box 工作区：`/home/wusiyu/work/sing-box-multipath-beta5`，分支 `multipath-beta5`，基于提交 `ad10690649980a512f384db5f3278d541028f822`。
 - HomeProxy 工作区：`/home/wusiyu/work/luci-app-homeproxy-multipath-beta5`，分支 `multipath-beta5`，基于提交 `2435b0f`。
-- 改动尚未提交；没有创建 beta5 tag、推送或部署到生产环境。原工作区及其中原有的未跟踪产物均保留。
+- 在该历史检查点，改动尚未提交，也未创建 beta5 tag、推送或部署到生产环境。原工作区及其中原有的未跟踪产物均保留。
 - 线协议为 v8，不兼容旧版本；状态 JSON 为 schema 3。`bandwidth_mbps` 不再影响运行时行为；为便于迁移，允许该字段存在，但忽略其值，并在每个节点初始化时打印一次警告。其他未知字段仍会被拒绝。
 - Go 版本：现有 toolbox 环境中的 1.25.5。
 - 源码指纹：对 `protocol/multipath` 下所有 Go 文件的 `sha256sum` 结果按文件路径排序，再对汇总结果计算 SHA-256：

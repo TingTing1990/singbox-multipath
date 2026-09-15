@@ -191,9 +191,7 @@ func TestOutboundStatusPreservesClosedSessionCounters(t *testing.T) {
 	id[0] = 1
 	session := status.addSession(id, "1.1.1.1:443", core, leg1PhaseReady)
 	session.leg1Attempts.Store(3)
-	core.activationMu.Lock()
-	core.leg1Joins = 2
-	core.activationMu.Unlock()
+	core.legCounters[1].joins.Store(2)
 	if err := appConn.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -235,6 +233,96 @@ func TestOutboundStatusWriterLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("status file still exists after close: %v", err)
+	}
+}
+
+func TestOutboundStatusCountsAttachmentsWithoutTXActivation(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.AggregationEnabled = false
+	left, _ := newCore(context.Background(), cfg)
+	right, _ := newCore(context.Background(), cfg)
+	defer left.Close()
+	defer right.Close()
+	status := newOutboundStatus("", outboundStatusConfig{cfg: cfg})
+	session := status.addSession([16]byte{1}, "example.org:443", left, leg1PhaseReady)
+	primaryLeft, primaryRight := net.Pipe()
+	connectTestLeg(t, left, right, 0, primaryLeft, primaryRight)
+	secondaryLeft, secondaryRight := net.Pipe()
+	connectTestLeg(t, left, right, 1, secondaryLeft, secondaryRight)
+	session.leg1Attempts.Store(1)
+	document := status.buildDocument(time.Now())
+	if left.active.Load() || document.Node.Legs[0].JoinCount != 1 || document.Node.Legs[1].JoinCount != 1 {
+		t.Fatalf("attachments must not depend on local TX activation: %+v", document.Node.Legs)
+	}
+	duplicate, peer := net.Pipe()
+	_, err := left.addLeg(1, duplicate, nil)
+	duplicate.Close()
+	peer.Close()
+	if err == nil || left.statusSnapshot().counters.legJoins[1] != 1 {
+		t.Fatal("failed attachment changed the join counter")
+	}
+	oldLeft, oldRight := left.getLeg(1), right.getLeg(1)
+	left.legFailed(oldLeft, legFailureReadData, io.ErrUnexpectedEOF)
+	closed := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	waitForStatus(t, func() bool {
+		return right.getLeg(1) == nil && closed(oldLeft.readerDone) && closed(oldLeft.writerDone) && closed(oldRight.readerDone) && closed(oldRight.writerDone)
+	})
+	secondaryLeft, secondaryRight = net.Pipe()
+	connectTestLeg(t, left, right, 1, secondaryLeft, secondaryRight)
+	session.leg1Attempts.Add(1)
+	document = status.buildDocument(time.Now())
+	if document.Node.Legs[1].JoinCount != 2 || document.Node.Legs[1].AttemptCount != 2 || left.active.Load() {
+		t.Fatalf("reattachment was not counted independently: %+v", document.Node.Legs[1])
+	}
+	left.Close()
+	waitForStatus(t, func() bool {
+		status.access.Lock()
+		defer status.access.Unlock()
+		return len(status.sessions) == 0
+	})
+	document = status.buildDocument(time.Now())
+	if document.Node.Legs[0].JoinCount != 1 || document.Node.Legs[1].JoinCount != 2 {
+		t.Fatalf("closed attachment counters were lost: %+v", document.Node.Legs)
+	}
+}
+
+func TestOutboundStatusRemoteFailuresRemainCumulative(t *testing.T) {
+	cfg := testCoreConfig()
+	core, _ := newCore(context.Background(), cfg)
+	defer core.Close()
+	status := newOutboundStatus("", outboundStatusConfig{cfg: cfg})
+	status.addSession([16]byte{1}, "example.org:443", core, leg1PhaseReady)
+	core.handlePeerSenderStatus(senderStatus{Sequence: 1, LegFailures: [2]uint64{2, 3}}, time.Now())
+	for range 2 {
+		document := status.buildDocument(time.Now())
+		if document.Node.Legs[0].RemoteFailureCount != 2 || document.Node.Legs[1].RemoteFailureCount != 3 {
+			t.Fatalf("active remote failures were double counted: %+v", document.Node.Legs)
+		}
+	}
+	core.Close()
+	waitForStatus(t, func() bool {
+		status.access.Lock()
+		defer status.access.Unlock()
+		return len(status.sessions) == 0
+	})
+	document := status.buildDocument(time.Now())
+	if !document.Node.Logical.RemoteSender.Available || document.Node.Legs[0].RemoteFailureCount != 2 || document.Node.Legs[1].RemoteFailureCount != 3 {
+		t.Fatalf("closed remote failures were lost: %+v", document.Node.Legs)
+	}
+	other, _ := newCore(context.Background(), cfg)
+	defer other.Close()
+	status.addSession([16]byte{2}, "example.org:443", other, leg1PhaseReady)
+	other.handlePeerSenderStatus(senderStatus{Sequence: 1, LegFailures: [2]uint64{1, 4}}, time.Now())
+	document = status.buildDocument(time.Now())
+	if document.Node.Legs[0].RemoteFailureCount != 3 || document.Node.Legs[1].RemoteFailureCount != 7 {
+		t.Fatalf("active and closed remote failures were not summed: %+v", document.Node.Legs)
 	}
 }
 
