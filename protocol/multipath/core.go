@@ -151,7 +151,7 @@ type wireFrame struct {
 
 type replayEntry struct {
 	frame          wireFrame
-	queuedAt       time.Time
+	startedAt      time.Time
 	fallbackQueued bool
 }
 
@@ -306,33 +306,34 @@ func (c *logicalConn) SetWriteDeadline(deadline time.Time) error {
 }
 
 type mpLeg struct {
-	id               uint8
-	ctx              context.Context
-	cancel           context.CancelFunc
-	conn             net.Conn
-	readPreamble     func(net.Conn) error
-	send             chan wireFrame
-	recovery         chan wireFrame
-	queueMu          sync.Mutex
-	flowWake         chan struct{}
-	flowMu           sync.Mutex
-	flowFrames       [2]wireFrame
-	flowPending      [2]bool
-	ready            atomic.Bool
-	control          chan wireFrame
-	telemetry        chan struct{}
-	telemetryMu      sync.Mutex
-	telemetryFrame   wireFrame
-	telemetryPending bool
-	shutdown         chan legShutdownRequest
-	onClose          func(error)
-	done             chan struct{}
-	writerDone       chan struct{}
-	readerDone       chan struct{}
-	closeOne         sync.Once
-	queuedBytes      atomic.Int64
-	writingBytes     atomic.Int64
-	writeStarted     atomic.Int64
+	id                    uint8
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	conn                  net.Conn
+	readPreamble          func(net.Conn) error
+	send                  chan wireFrame
+	recovery              chan wireFrame
+	queueMu               sync.Mutex
+	flowWake              chan struct{}
+	flowMu                sync.Mutex
+	flowFrames            [2]wireFrame
+	flowPending           [2]bool
+	ready                 atomic.Bool
+	control               chan wireFrame
+	telemetry             chan struct{}
+	telemetryMu           sync.Mutex
+	telemetryFrame        wireFrame
+	telemetryPending      bool
+	shutdown              chan legShutdownRequest
+	onClose               func(error)
+	done                  chan struct{}
+	writerDone            chan struct{}
+	readerDone            chan struct{}
+	closeOne              sync.Once
+	queuedBytes           atomic.Int64
+	writingBytes          atomic.Int64
+	writeStarted          atomic.Int64
+	transportWriteStarted atomic.Int64
 }
 
 func (l *mpLeg) Done() <-chan struct{} {
@@ -581,6 +582,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	if !memory.reserveSession(sessionBytes + initialCredit) {
 		return nil, nil, errMemoryLimit
 	}
+	memory.sessions.Add(1)
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	appConn, txPipe, rxPipe := newLogicalPipe()
 	c := &mpCore{
@@ -603,6 +605,11 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		txReserve:    make(chan []byte, 1),
 	}
 	c.flow = newFlowControl(cfg)
+	// A bounded memory-backed startup grant prevents the first response from
+	// waiting a window RTT after a single chunk. Larger windows are on demand.
+	startup := min(c.flow.rxCapacity, memory.receiveShareSlots(c.receiveSlotBytes()), uint64(max(1, min(c.cfg.QueueFrames*2, (32<<20)/cfg.ChunkSize))))
+	c.flow.rxLimit += memory.reserveStartup(startup-1, c.receiveSlotBytes())
+	c.flow.rxWanted = c.flow.rxLimit
 	c.txReserve <- memory.takeReservedBuffer(cfg.ChunkSize)
 	appConn.onClose = c.closeApplication
 	appConn.onCloseRead = func() error {
@@ -761,6 +768,7 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	}
 	c.releaseReceiveWindow()
 	c.memory.releaseSession(c.sessionBytes)
+	c.memory.sessions.Add(-1)
 	close(c.released)
 }
 
@@ -859,6 +867,19 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		readerDone:   make(chan struct{}),
 	}
 	leg.ready.Store(readPreamble == nil)
+	if id == 0 {
+		c.flow.rxMu.Lock()
+		initial := wireFrame{typ: frameTypeWindow, flow: flowMessage{Limit: c.flow.rxLimit}}
+		if early, ok := conn.(*clientFastOpenConn); ok {
+			// Keep hello, startup credit and first DATA in one physical write;
+			// do not start a lazy child just to advertise credit.
+			encoded := encodeFlow(initial)
+			early.initialWindow = encoded[:]
+		} else if readPreamble == nil {
+			leg.queueFlow(initial)
+		}
+		c.flow.rxMu.Unlock()
+	}
 	c.legs[id] = leg
 	if !c.startWorkers(func() { c.legWriteLoop(leg) }, func() { c.legReadLoop(leg) }) {
 		delete(c.legs, id)
@@ -870,6 +891,7 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 	if id == 1 {
 		c.flow.txMu.Lock()
 		c.flow.stallSince = time.Time{}
+		c.flow.peerDeliveryRTT = 0
 		c.flow.txMu.Unlock()
 		c.notifyLeg1Active()
 	}
@@ -1200,7 +1222,7 @@ func (c *mpCore) chooseLeg(frameLength int) *mpLeg {
 		return c.getLeg(0)
 	}
 	c.flow.txMu.Lock()
-	paused := time.Now().Before(c.flow.pauseUntil)
+	paused := c.flow.recovering
 	c.flow.txMu.Unlock()
 	legs := c.availableLegs()
 	var best *mpLeg
@@ -1228,7 +1250,7 @@ func (c *mpCore) tryQueueNewFrame(leg *mpLeg, frame wireFrame) bool {
 	if leg.id == 1 {
 		c.flow.txMu.Lock()
 		defer c.flow.txMu.Unlock()
-		paused := time.Now().Before(c.flow.pauseUntil)
+		paused := c.flow.recovering
 		if frame.seq == 0 || frame.primaryOnly || paused || !c.memory.boosterAllowed() {
 			return false
 		}
@@ -1268,16 +1290,6 @@ func (c *mpCore) enqueue(frame wireFrame) error {
 			finishBlocked()
 			return errCoreClosed
 		default:
-		}
-		if !c.memory.boosterAllowed() && c.hasReplay() {
-			markBlocked()
-			select {
-			case <-c.done:
-				finishBlocked()
-				return errCoreClosed
-			case <-ticker.C:
-			}
-			continue
 		}
 		leg := c.chooseLeg(len(frame.data))
 		if c.tryQueueNewFrame(leg, frame) {
@@ -1396,16 +1408,22 @@ func (c *mpCore) writeDataFrame(leg *mpLeg, frame wireFrame) bool {
 		return true
 	}
 	if leg.id == 1 {
-		c.flow.txMu.Lock()
-		paused := time.Now().Before(c.flow.pauseUntil)
-		c.flow.txMu.Unlock()
-		if paused {
+		c.replayMu.Lock()
+		entry := c.replay[frame.seq]
+		reassigned := entry == nil || entry.fallbackQueued
+		if !reassigned {
+			entry.startedAt = time.Now()
+		}
+		c.replayMu.Unlock()
+		if reassigned {
 			return true
-		} // The replay owner retains skipped booster frames.
+		}
 	}
 	leg.writingBytes.Add(length)
 	leg.writeStarted.Store(time.Now().UnixNano())
+	leg.transportWriteStarted.Store(time.Now().UnixNano())
 	err := writeWireFrame(leg.conn, frame)
+	leg.transportWriteStarted.Store(0)
 	leg.writeStarted.Store(0)
 	leg.writingBytes.Add(-length)
 	if err != nil {
@@ -1422,7 +1440,9 @@ func (c *mpCore) writeControlFrame(leg *mpLeg, frame wireFrame) error {
 	if frame.typ == frameTypePing {
 		c.markProbeSent(leg.id, frame.seq, time.Now())
 	}
+	leg.transportWriteStarted.Store(time.Now().UnixNano())
 	err := writeWireFrame(leg.conn, frame)
+	leg.transportWriteStarted.Store(0)
 	if err != nil && frame.typ == frameTypePing {
 		c.cancelProbe(leg.id, frame.seq)
 	}
@@ -1598,17 +1618,10 @@ func (c *mpCore) trackReplay(frame *wireFrame) bool {
 	}
 	frame.replay = true
 	c.retainBuffer(frame.data)
-	c.replay[frame.seq] = &replayEntry{frame: *frame, queuedAt: time.Now()}
+	c.replay[frame.seq] = &replayEntry{frame: *frame}
 	c.replayBytes += length
 	updateAtomicPeak(&c.replayPeak, c.replayBytes)
 	return true
-}
-
-func (c *mpCore) hasReplay() bool {
-	c.replayMu.Lock()
-	hasReplay := len(c.replay) > 0
-	c.replayMu.Unlock()
-	return hasReplay
 }
 
 func (c *mpCore) untrackReplay(seq uint64) {
@@ -1663,51 +1676,56 @@ func (c *mpCore) replayLoop() {
 			return
 		case now := <-ticker.C:
 			timeout := c.recoveryTimeout()
-			stalled := false
-			c.replayMu.Lock()
-			for _, entry := range c.replay {
-				if !entry.fallbackQueued && now.Sub(entry.queuedAt) >= timeout {
-					stalled = true
-					break
-				}
-			}
-			c.replayMu.Unlock()
 			c.flow.txMu.Lock()
 			c.replayMu.Lock()
 			hasPending := len(c.replay) != 0
+			// Queue residence, or ACK delay behind a leg0 gap, is not leg1 loss.
+			entry := c.replay[c.ackedNext.Load()]
+			eligible := entry != nil && !entry.fallbackQueued && entry.frame.seq >= c.flow.peerLeg1Next
+			var started time.Time
+			if entry != nil {
+				started = entry.startedAt
+			}
 			c.replayMu.Unlock()
 			leg1 := c.getLeg(1)
-			if !hasPending && (leg1 == nil || leg1.writingBytes.Load() == 0) {
+			if entry != nil && started.IsZero() && leg1 != nil {
+				// A probe may be stuck ahead of the first DATA write. Queue age
+				// alone is not a timeout, but a blocked transport write is.
+				if blocked := leg1.transportWriteStarted.Load(); blocked != 0 {
+					started = time.Unix(0, blocked)
+				}
+			}
+			if !hasPending && (leg1 == nil || leg1.writingBytes.Load() == 0 && leg1.transportWriteStarted.Load() == 0) {
 				// No outstanding data and no retained partial write: an idle leg
 				// is not stalled merely because no new delivery counter arrives.
 				c.flow.stallSince = time.Time{}
+				c.flow.recovering = false
 			}
-			gap := c.flow.peerGap
-			if gap.Flags&flowFlagGap != 0 && gap.Flags&flowFlagPressure != 0 && time.Duration(gap.GapAge) >= timeout/2 {
-				c.replayMu.Lock()
-				entry := c.replay[gap.Next]
-				stalled = stalled || entry != nil && !entry.fallbackQueued && now.Sub(entry.queuedAt) >= timeout/2
-				c.replayMu.Unlock()
+			if !started.IsZero() && c.flow.peerProgressAt.After(started) {
+				started = c.flow.peerProgressAt
 			}
-			if stalled {
-				c.flow.pauseUntil = now.Add(max(time.Second, 2*timeout))
-				if c.flow.stallSince.IsZero() {
-					c.flow.stallSince = now
-				}
+			stalled := eligible && !started.IsZero() && now.Sub(started) >= timeout
+			beginRecovery := stalled && !c.flow.recovering
+			if beginRecovery {
+				c.flow.recovering = true
+				c.flow.stallSince = now
 			}
-			persistent := !c.flow.stallSince.IsZero() && now.Sub(c.flow.stallSince) >= max(2*time.Second, 5*c.cfg.ReplayTimeout)
+			recovering := c.flow.recovering
+			persistent := recovering && !c.flow.stallSince.IsZero() && now.Sub(c.flow.stallSince) >= max(2*time.Second, 5*timeout)
 			c.flow.txMu.Unlock()
 			if persistent {
 				if leg := c.getLeg(1); leg != nil {
 					c.legFailed(leg, legFailureReplay, errLeg1Stalled)
 				}
 			}
-			if stalled {
+			if beginRecovery {
 				c.replayTO.Add(1)
 				if c.cfg.OnStatusEvent != nil {
 					c.cfg.OnStatusEvent()
 				}
-				c.reinjectLeg1()
+			}
+			if recovering && !persistent {
+				c.recoverBatch()
 			}
 		}
 	}
@@ -1715,15 +1733,83 @@ func (c *mpCore) replayLoop() {
 
 func (c *mpCore) recoveryTimeout() time.Duration {
 	timeout := c.cfg.ReplayTimeout
+	c.flow.txMu.Lock()
+	// Receipt timing also includes data already buffered by the child. Small
+	// probes alone underestimate this during a rapidly growing send backlog.
+	timeout = max(timeout, 2*c.flow.peerDeliveryRTT)
+	c.flow.txMu.Unlock()
 	stats := c.rttSnapshot()
 	if stats[1].Samples > 0 {
 		estimate := max(200*time.Millisecond, stats[1].EWMA+4*stats[1].Jitter)
 		if stats[0].Samples > 0 {
 			estimate = max(estimate, stats[0].EWMA+4*stats[0].Jitter)
 		}
-		timeout = min(timeout, estimate)
+		timeout = max(timeout, estimate)
 	}
 	return max(100*time.Millisecond, timeout)
+}
+
+// Recover a bounded prefix without waiting for queue space. A real leg failure
+// still uses reinjectLeg1, but a delayed ACK must not move the entire backlog.
+func (c *mpCore) recoverBatch() {
+	c.replayMu.Lock()
+	sequences := make([]uint64, 0, len(c.replay))
+	for seq, entry := range c.replay {
+		if !entry.fallbackQueued {
+			sequences = append(sequences, seq)
+		}
+	}
+	c.replayMu.Unlock()
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	limit := max(1, min(16, (1<<20)/c.cfg.ChunkSize))
+	queued := 0
+	for _, seq := range sequences {
+		if queued >= limit {
+			break
+		}
+		leg := c.getLeg(0)
+		if leg == nil {
+			return
+		}
+		c.replayMu.Lock()
+		entry := c.replay[seq]
+		if entry == nil || entry.fallbackQueued {
+			c.replayMu.Unlock()
+			continue
+		}
+		frame := entry.frame
+		c.retainBuffer(frame.data)
+		entry.fallbackQueued = true
+		leg.queueMu.Lock()
+		ok := false
+		select {
+		case <-leg.done:
+		default:
+			leg.queuedBytes.Add(int64(len(frame.data)))
+			select {
+			case leg.recovery <- frame:
+				ok = true
+			default:
+				leg.queuedBytes.Add(-int64(len(frame.data)))
+			}
+		}
+		leg.queueMu.Unlock()
+		if !ok {
+			entry.fallbackQueued = false
+		}
+		c.replayMu.Unlock()
+		if !ok {
+			c.putBuffer(frame.data)
+			break
+		}
+		queued++
+		c.fallbackB.Add(uint64(len(frame.data)))
+		c.fallbackF.Add(1)
+		updateAtomicPeak(&c.legPeak[0], leg.backlogBytes())
+	}
+	if queued > 0 {
+		c.fallbackE.Add(1)
+	}
 }
 
 func (c *mpCore) reinjectLeg1() {

@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionSixHello(t *testing.T) {
+func TestProtocolVersionSevenHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		ChunkSize:   64 * 1024,
@@ -215,12 +215,12 @@ func TestProtocolVersionSixHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMP6" || encoded[4] != 6 {
+	if string(encoded[:4]) != "SMP7" || encoded[4] != 7 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV6Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV7Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -229,12 +229,12 @@ func TestWriteHelloResponseRejectsInvalidV6Values(t *testing.T) {
 		{Status: 2, ChunkSize: 64 * 1024},
 	} {
 		if err := writeHelloResponse(client, response); err == nil {
-			t.Fatalf("accepted invalid v6 hello response: %+v", response)
+			t.Fatalf("accepted invalid v7 hello response: %+v", response)
 		}
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV6Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidV7Values(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -243,6 +243,7 @@ func TestReadHelloResponseRejectsInvalidV6Values(t *testing.T) {
 	}{
 		{"v4 response", 4, helloStatusOK, 64 * 1024},
 		{"v5 response", 5, helloStatusOK, 64 * 1024},
+		{"v6 response", 6, helloStatusOK, 64 * 1024},
 		{"unknown status", helloVersion, 2, 64 * 1024},
 		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
 		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
@@ -262,7 +263,7 @@ func TestReadHelloResponseRejectsInvalidV6Values(t *testing.T) {
 				writeDone <- writeAll(server, header[:])
 			}()
 			if _, err := readHelloResponse(client); err == nil {
-				t.Fatal("accepted invalid v6 hello response")
+				t.Fatal("accepted invalid v7 hello response")
 			}
 			if err := <-writeDone; err != nil {
 				t.Fatal(err)
@@ -272,7 +273,7 @@ func TestReadHelloResponseRejectsInvalidV6Values(t *testing.T) {
 }
 
 func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
-	for _, version := range []byte{4, 5} {
+	for _, version := range []byte{4, 5, 6} {
 		header, err := encodeHelloHeader(helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"})
 		if err != nil {
 			t.Fatal(err)

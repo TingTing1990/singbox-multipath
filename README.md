@@ -17,7 +17,7 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v6**. Older protocol versions are
+Both endpoints must use multipath protocol **v7**. Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -83,24 +83,48 @@ budgeted reader scratch space and a reusable leg0-only TX buffer. Leg 0 can ther
 deliver a missing frame even if leg 1 is stuck partway through the original frame.
 After 250 ms without new TX data,
 the sender returns unused credit using an epoch change, retaining one immediately
-usable slot. Stale window updates cannot restore returned credit.
+usable slot. Stale window updates cannot restore returned credit, but their
+receipt ACKs, FIN acknowledgement and leg 1 progress remain valid. Returning
+credit therefore does not interrupt acknowledgement processing while the return
+request is still queued in a child transport.
+
+Startup credit is advertised before the first DATA frame. With early write,
+hello, startup credit and first DATA share one physical write; advertising credit
+does not start a lazy child connection on its own. The startup grant is at most
+`min(2 * queue_frames * chunk_size, 32 MiB)`, subject to local receive limits and
+the shared budget. Speculative grants stop once local budget usage reaches 1/8
+of `memory_limit`; every admitted session still retains its guaranteed first slot.
+Further window growth is demand-driven. Its per-session target shares half of the
+booster budget, excluding the buffer cache, between live sessions. Already granted
+credit is never revoked unilaterally. This leaves budget for TX and session
+overhead while allowing a few busy connections to use large receive windows.
 
 The two legs have independent writers. Control/window updates have priority on leg
-0, followed by a dedicated recovery queue, then ordinary data. If leg 1 data remains
-unacknowledged, its retained frames are re-injected on leg 0 in sequence order and
-new booster assignments pause. Recovery does not wait for the original writer to
+0, followed by a dedicated recovery queue, then ordinary data. The receiver also
+reports the highest complete leg 1 DATA sequence independently of the cumulative
+ACK. A leg 0 gap therefore does not make already received leg 1 data look lost.
+Only the cumulative ACK releases replay storage.
+
+When the earliest unreceived frame belongs to stalled leg 1, recovery re-injects
+retained frames on leg 0 in sequence order, at most 16 frames / 1 MiB per 20 ms
+pass (at least one frame), without waiting for recovery-queue space. New booster
+assignments pause until delivery progress resumes; already queued originals are
+not dropped unless that specific frame has been reassigned. A hard transport
+failure still schedules all remaining retained frames for recovery immediately.
+Recovery does not wait for the original writer to
 finish, and it does not immediately close leg 1. Queue, original-write, and replay
 references keep a shared payload alive until every user has released it; late
 duplicates are discarded by sequence number.
 
-`leg1_replay_timeout` defaults to **1 second**, measured from leg 1 queue admission.
-With RTT samples, recovery can start earlier using a smoothed-RTT/jitter estimate
-(normally no less than 200 ms, or the explicitly configured shorter timeout).
-A reported receive-window gap under pressure can trigger recovery after half that
-interval. Booster assignments pause for at least one second after recovery. A leg
-with no subsequently observed delivery progress is detached only after
-`max(2s, 5 * leg1_replay_timeout)`; the client then retries the leg.
-The stall timer clears once no unacknowledged data or partial data write remains;
+`leg1_replay_timeout` defaults to **1 second** and is a lower bound on the recovery
+interval, not a queue-residence deadline. The timer starts when an original DATA
+write starts, or when a control write blocks queued DATA, and restarts on observed
+leg 1 delivery progress. RTT/jitter estimates and twice the smoothed DATA
+write-to-receipt time may lengthen this interval; they never shorten the configured
+value. This accounts for buffering inside child transports as well as the network.
+A leg with no subsequently observed delivery progress is detached only after
+`max(2s, 5 * effective recovery interval)` from recovery starting; the client then
+retries the leg. The stall timer clears once no unacknowledged data or blocked write remains;
 an idle leg is not detached merely because its delivery counters stop increasing.
 
 This preserves the logical connection through booster stalls, disconnections, and
@@ -140,7 +164,7 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v6 requests a compact sender-status
+When the client enables `status_file`, protocol v7 requests a compact sender-status
 frame from the server on leg 0. It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
 are coalesced and do not consume data sequence numbers, replay space, or the payload
@@ -322,7 +346,7 @@ All fields below are available on both sides.
 | `max_reorder_frames` | **Local RX**, independently configured; constrains window credit advertised to peer TX. Client value controls download; server value controls upload. | Maximum receive-window slots per connection, including in-order data awaiting application consumption. Credit exhaustion pauses new sends instead of closing the session. Default: `2048`; range on both sides: 64 to 65536. | Non-negative integer, e.g. `2048` or `8192` |
 | `max_reorder_bytes` | **Local RX** per connection; constrains window credit advertised to peer TX. | Client value controls download; server value controls upload. Maximum receive-window payload allocation, charged in full negotiated chunks even for short frames. Default: 64 MiB; maximum: 512 MiB. The frame limit and shared memory budget can further restrict the window. | Non-negative integer bytes, e.g. `67108864` |
 | `leg1_replay_bytes` | **Local TX** retained leg 1 payload per connection; not negotiated. | Client history recovers upload; server history recovers download. Released by cumulative ACKs from the peer on leg 0. Default: 64 MiB; maximum: 512 MiB. This is not the peer's receive window. | Non-negative integer bytes, e.g. `67108864` |
-| `leg1_replay_timeout` | **Local TX** recovery timeout for leg 1 data; not negotiated. | Measured from queue admission. Unacknowledged data is replayed on leg 0 without immediately closing leg 1; RTT estimates and pressured-gap feedback can trigger earlier recovery. Persistent lack of booster delivery progress detaches the leg after `max(2s, 5 * timeout)`. Not a bound on total recovery time. Default: `1s`; range: `100ms` to `5m`. | Duration, e.g. `"1s"` |
+| `leg1_replay_timeout` | **Local TX** recovery timeout for leg 1 data; not negotiated. | Minimum no-progress interval after an original write starts, not queue residence. RTT and DATA receipt timing may extend it. A missing leg 1 frame starts bounded replay on leg 0 without immediately closing leg 1; resumed delivery stops recovery. Persistent stalls detach the leg after `max(2s, 5 * effective interval)` from recovery starting. Not a bound on total recovery time. Default: `1s`; range: `100ms` to `5m`. | Duration, e.g. `"1s"` |
 | `memory_limit` | **Local TX and RX**, shared across all sessions of one inbound or outbound; independently resolved on each side. RX credit reflects available local budget. | Budget for payloads, promised receive credit, reader scratch and estimated session overhead, not whole-process RSS or child transport buffers. Default: `min(512 MiB, MemAvailable * 0.5)`. Booster/window growth backpressure starts at 7/8 and clears at 3/4. Does not replace per-session receive limits. | Non-negative integer or memory string, e.g. `268435456` or `"256MB"` |
 | `handshake_timeout` | **Local connection setup**, covering hello reads/writes rather than application TX/RX; not negotiated. | Client limits the hello exchange and each secondary dial-plus-handshake attempt; the initial preferred-child dial uses its own context/child settings. Server applies a deadline while handling each accepted leg's hello. Default: `10s`; range: `1s` to `1m`. | Duration, e.g. `"10s"` |
 

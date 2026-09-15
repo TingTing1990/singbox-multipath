@@ -17,6 +17,42 @@ func TestAutomaticMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestMemoryStartupCreditAndSessionShares(t *testing.T) {
+	cfg := testCoreConfig()
+	cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
+	budget := newMemoryBudget(512<<20, false)
+	cfg.Memory = budget
+	var cores []*mpCore
+	defer func() {
+		for _, core := range cores {
+			core.Close()
+		}
+		for _, core := range cores {
+			<-core.released
+		}
+		if budget.sessions.Load() != 0 {
+			t.Error("session share leaked")
+		}
+	}()
+	for range 32 {
+		core, _, err := newCoreWithError(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cores = append(cores, core)
+	}
+	if budget.sessions.Load() != 32 {
+		t.Fatal("incorrect live session count")
+	}
+	if budget.snapshot().Pressure {
+		t.Fatal("idle startup grants exhausted the budget")
+	}
+	slot := cores[0].receiveSlotBytes()
+	if int64(budget.receiveShareSlots(slot))*slot*32 > (budget.boosterLimit-budget.cacheLimit)/2 {
+		t.Fatal("receive growth targets exceed shared allocation")
+	}
+}
+
 func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 	budget := newMemoryBudget(1024, false)
 	first, err := budget.acquire(context.Background(), 800, memoryClassPrimary)

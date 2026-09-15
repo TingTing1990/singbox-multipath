@@ -20,6 +20,7 @@ type initialFrameWriter interface {
 type clientFastOpenConn struct {
 	net.Conn
 	hello             []byte
+	initialWindow     []byte // Set before the core starts either leg worker.
 	handshakeDeadline time.Time
 	startOnce         sync.Once
 	startDone         chan struct{}
@@ -76,8 +77,9 @@ func (c *clientFastOpenConn) writeInitial(payload []byte) error {
 		}
 		deadlineSet = false
 	}
-	initial := make([]byte, 0, len(c.hello)+len(payload))
+	initial := make([]byte, 0, len(c.hello)+len(c.initialWindow)+len(payload))
 	initial = append(initial, c.hello...)
+	initial = append(initial, c.initialWindow...)
 	initial = append(initial, payload...)
 	if err := writeAll(c.Conn, initial); err != nil {
 		return err

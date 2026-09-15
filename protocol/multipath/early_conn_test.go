@@ -272,7 +272,7 @@ func TestEarlyLogicalConnSendsPayloadWithHello(t *testing.T) {
 		}
 		var frame wireFrame
 		if readErr == nil {
-			frame, readErr = readWireFrame(serverWire, serverCore)
+			frame, readErr = readStartupDataFrame(serverWire, serverCore)
 		}
 		if readErr == nil && (frame.typ != frameTypeData || frame.seq != 0 || !bytes.Equal(frame.data, payload)) {
 			readErr = errors.New("unexpected early data frame")
@@ -336,7 +336,7 @@ func TestEarlyLogicalConnRejectClosesConnection(t *testing.T) {
 		}
 		var frame wireFrame
 		if readErr == nil {
-			frame, readErr = readWireFrame(serverWire, serverCore)
+			frame, readErr = readStartupDataFrame(serverWire, serverCore)
 		}
 		if len(frame.data) > 0 {
 			serverCore.putBuffer(frame.data)
@@ -364,6 +364,18 @@ func TestEarlyLogicalConnRejectClosesConnection(t *testing.T) {
 	if _, err = earlyConn.Write([]byte("must fail")); err == nil {
 		t.Fatal("write succeeded after the early-write handshake was rejected")
 	}
+}
+
+func readStartupDataFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
+	window, err := readWireFrame(conn, core)
+	if err != nil {
+		return wireFrame{}, err
+	}
+	if window.typ != frameTypeWindow || window.flow.Next != 0 || window.flow.Limit < 1 {
+		core.putBuffer(window.data)
+		return wireFrame{}, errors.New("missing initial receive window")
+	}
+	return readWireFrame(conn, core)
 }
 
 func TestClientHandshakeDeadlineUsesContext(t *testing.T) {

@@ -294,7 +294,7 @@ func TestFlowIdleCreditReturnAndReactivation(t *testing.T) {
 }
 
 func TestFlowMessageCodec(t *testing.T) {
-	message := flowMessage{Epoch: 3, Next: 5, Limit: 64, GapAge: 12345, Leg1Bytes: 67890, Flags: flowFlagGap | flowFlagPressure}
+	message := flowMessage{Epoch: 3, Next: 5, Limit: 64, GapAge: 12345, Leg1Next: 67890, Flags: flowFlagGap | flowFlagPressure}
 	for _, typ := range []byte{frameTypeWindow, frameTypeWindowRequest} {
 		a, b := net.Pipe()
 		go func() { defer a.Close(); _ = writeWireFrame(a, wireFrame{typ: typ, flow: message}) }()
@@ -320,7 +320,7 @@ func TestRecoveryTimeoutDefaultsAndBounds(t *testing.T) {
 	core.probeRTT[0] = legRTTSnapshot{Samples: 1, EWMA: 65 * time.Millisecond}
 	core.probeRTT[1] = legRTTSnapshot{Samples: 1, EWMA: 80 * time.Millisecond, Jitter: 10 * time.Millisecond}
 	core.probeMu.Unlock()
-	if got := core.recoveryTimeout(); got != 200*time.Millisecond {
+	if got := core.recoveryTimeout(); got != time.Second {
 		t.Fatalf("adaptive timeout %s", got)
 	}
 }
@@ -389,15 +389,39 @@ func TestFlowSharedBudgetPreservesEveryLeg0(t *testing.T) {
 func TestFlowCreditReturnValidation(t *testing.T) {
 	core, _ := newCore(context.Background(), flowTestConfig())
 	defer core.Close()
+	limit := core.flow.rxLimit
 	for _, message := range []flowMessage{
-		{Next: 2, Limit: 3}, // No corresponding credit was granted.
+		{Next: limit + 1, Limit: limit + 2}, // No corresponding credit was granted.
 		{Next: 1, Limit: 0},
-		{Epoch: 1, Next: 1, Limit: 2}, // Cannot "return" credit by expanding it.
+		{Epoch: 1, Next: limit, Limit: limit + 1}, // Cannot "return" credit by expanding it.
 		{Flags: flowFlagGap, Limit: 1},
 	} {
 		if core.handleWindowRequest(message) == nil {
 			t.Fatalf("accepted invalid request: %+v", message)
 		}
+	}
+}
+
+func TestFlowOldEpochStillAcknowledgesDelivery(t *testing.T) {
+	core, _ := newCore(context.Background(), flowTestConfig())
+	defer core.Close()
+	core.txSeq.Store(2)
+	core.localFIN.Store(true)
+	core.flow.txMu.Lock()
+	core.flow.txEpoch, core.flow.txLimit = 1, 3
+	core.flow.recovering = true
+	core.flow.txMu.Unlock()
+	err := core.handleWindow(flowMessage{Epoch: 0, Next: 2, Limit: 256, Leg1Next: 2, Flags: flowFlagFINAck})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.flow.txMu.Lock()
+	defer core.flow.txMu.Unlock()
+	if core.flow.txLimit != 3 {
+		t.Fatal("old epoch restored returned credit")
+	}
+	if core.ackedNext.Load() != 2 || !core.ackedFIN.Load() || core.flow.peerLeg1Next != 2 || core.flow.recovering {
+		t.Fatal("old epoch discarded valid receipt, FIN acknowledgement or leg1 progress")
 	}
 }
 

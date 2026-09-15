@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -51,7 +52,8 @@ type memoryPressureEvent struct {
 }
 
 type memoryBudget struct {
-	access sync.Mutex
+	access   sync.Mutex
+	sessions atomic.Int64
 
 	limit         int64
 	boosterLimit  int64
@@ -70,6 +72,29 @@ type memoryBudget struct {
 	changed       chan struct{}
 	events        chan memoryPressureEvent
 	logOnce       sync.Once
+}
+
+// A growth target, not a revocation of already granted credit. Share half of the
+// booster budget between live sessions so unused lookahead cannot consume the
+// entire budget; the other half remains available for TX and session overhead.
+func (b *memoryBudget) receiveShareSlots(slotBytes int64) uint64 {
+	share := (b.boosterLimit - b.cacheLimit) / 2 / max(1, b.sessions.Load())
+	return uint64(max(1, share/slotBytes))
+}
+
+// Speculative startup credit must leave room for real traffic, even when many
+// idle connections are constructed before any peer can return unused credit.
+func (b *memoryBudget) reserveStartup(slots uint64, slotBytes int64) uint64 {
+	b.access.Lock()
+	defer b.access.Unlock()
+	available := b.limit/8 - b.used
+	if available < slotBytes || b.pressure {
+		return 0
+	}
+	granted := min(slots, uint64(available/slotBytes))
+	b.used += int64(granted) * slotBytes
+	b.updatePressureLocked(time.Now())
+	return granted
 }
 
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {

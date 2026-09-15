@@ -122,7 +122,17 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 		serverWire.Close()
 	})
 
+	var initialWindow wireFrame
 	readFrame := func() error {
+		var err error
+		initialWindow, err = readWireFrame(serverWire, serverCore)
+		if err != nil {
+			return err
+		}
+		if initialWindow.typ != frameTypeWindow || initialWindow.flow.Next != 0 || initialWindow.flow.Limit < 1 {
+			serverCore.putBuffer(initialWindow.data)
+			return errors.New("missing startup credit before first DATA")
+		}
 		frame, err := readWireFrame(serverWire, serverCore)
 		if err != nil {
 			return err
@@ -207,12 +217,13 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 		t.Fatal(err)
 	}
 	writes, deadlines := clientConn.snapshot()
-	initial := append(hello, frame...)
+	window := encodeFlow(initialWindow)
+	initial := append(append(hello, window[:]...), frame...)
 	if !bytes.HasPrefix(bytes.Join(writes, nil), initial) {
 		t.Fatal("physical writes do not start with the hello and first data frame")
 	}
-	// Window/control frames may follow the first DATA, but must not split or
-	// precede the hello + first DATA write used for TCP Fast Open.
+	// Startup credit must share the same first physical write as hello + DATA,
+	// never start the lazy child separately or add a handshake round trip.
 	if multipathTFO && (len(writes) == 0 || !bytes.Equal(writes[0], initial)) {
 		t.Fatalf("multipath TFO did not combine the hello and first frame: %d writes", len(writes))
 	}

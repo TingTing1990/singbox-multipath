@@ -40,6 +40,14 @@ func TestCoreCloseWritesSessionCloseOnEveryLeg(t *testing.T) {
 		if _, err := io.ReadFull(peerConn, frameType[:]); err != nil {
 			t.Fatalf("leg%d did not receive session-close: %v", legID, err)
 		}
+		if legID == 0 && frameType[0] == frameTypeWindow {
+			if _, err := readFlow(peerConn); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(peerConn, frameType[:]); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if frameType[0] != frameTypeSessionClose {
 			t.Fatalf("leg%d received frame type %d instead of session-close", legID, frameType[0])
 		}

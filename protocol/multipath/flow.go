@@ -22,14 +22,18 @@ const (
 // of one-byte frames cannot exceed the receiver's allocation or metadata budget.
 // Epoch changes return unused credit only after the sender has stopped using it.
 type flowMessage struct {
-	Epoch, Next, Limit, GapAge, Leg1Bytes uint64
-	Flags                                 byte
+	// Leg1Next is one past the highest complete leg1 DATA sequence. Unlike
+	// Next, it is not held behind an earlier frame on leg0. It does not free
+	// replay ownership or receive credit. Only cumulative Next releases replay;
+	// receive credit separately follows application consumption.
+	Epoch, Next, Limit, GapAge, Leg1Next uint64
+	Flags                                byte
 }
 
 func encodeFlow(frame wireFrame) [1 + flowPayloadSize]byte {
 	var data [1 + flowPayloadSize]byte
 	data[0], data[1] = frame.typ, frame.flow.Flags
-	for i, value := range []uint64{frame.flow.Epoch, frame.flow.Next, frame.flow.Limit, frame.flow.GapAge, frame.flow.Leg1Bytes} {
+	for i, value := range []uint64{frame.flow.Epoch, frame.flow.Next, frame.flow.Limit, frame.flow.GapAge, frame.flow.Leg1Next} {
 		binary.BigEndian.PutUint64(data[2+i*8:10+i*8], value)
 	}
 	return data
@@ -44,7 +48,7 @@ func readFlow(conn net.Conn) (flowMessage, error) {
 		return flowMessage{}, errors.New("invalid multipath flow flags")
 	}
 	message := flowMessage{Flags: data[0]}
-	for i, value := range []*uint64{&message.Epoch, &message.Next, &message.Limit, &message.GapAge, &message.Leg1Bytes} {
+	for i, value := range []*uint64{&message.Epoch, &message.Next, &message.Limit, &message.GapAge, &message.Leg1Next} {
 		*value = binary.BigEndian.Uint64(data[1+i*8 : 9+i*8])
 	}
 	return message, nil
@@ -53,7 +57,7 @@ func readFlow(conn net.Conn) (flowMessage, error) {
 type flowControl struct {
 	rxMu                                               sync.Mutex
 	rxEpoch, rxLimit, rxWanted, rxConsumed, rxReceived uint64
-	rxLeg1Bytes                                        uint64
+	rxLeg1Next                                         uint64
 	rxCapacity                                         uint64
 	rxPending                                          map[uint64]wireFrame
 	rxFIN                                              *uint64
@@ -66,9 +70,10 @@ type flowControl struct {
 	txLast                     time.Time
 	txWaiting, txDirty         bool
 	txWake                     chan struct{}
-	peerGap                    flowMessage
-	peerLeg1Bytes              uint64
-	stallSince, pauseUntil     time.Time
+	peerLeg1Next               uint64
+	peerDeliveryRTT            time.Duration
+	stallSince, peerProgressAt time.Time
+	recovering                 bool
 	wake                       chan struct{}
 }
 
@@ -125,7 +130,7 @@ func (c *mpCore) reserveTXSequence() (uint64, error) {
 			f.txMu.Unlock()
 			return 0, errors.New("multipath sequence space exhausted")
 		}
-		if next+goal > f.txWanted {
+		if next > 0 && next+goal > f.txWanted {
 			f.txWanted = next + goal
 			f.txDirty = true
 			wakeFlow(f.wake)
@@ -182,23 +187,40 @@ func (c *mpCore) handleWindowRequest(message flowMessage) error {
 
 func (c *mpCore) handleWindow(message flowMessage) error {
 	f := c.flow
-	if message.Next > c.txSeq.Load() || message.Next > message.Limit {
+	if message.Next > c.txSeq.Load() || message.Next > message.Limit || message.Leg1Next > c.txSeq.Load() {
 		return errors.New("invalid multipath receive window")
 	}
 	if message.Flags&flowFlagFINAck != 0 && (!c.localFIN.Load() || message.Next != c.txSeq.Load()) {
 		return errors.New("invalid multipath FIN acknowledgement")
 	}
 	f.txMu.Lock()
-	if message.Epoch != f.txEpoch {
-		f.txMu.Unlock()
-		return nil
+	// An epoch protects credit, not receipts. A credit-return request can be
+	// queued behind DATA in the child transport; ignoring old-epoch ACKs in
+	// that interval falsely stalls a healthy leg and retains its entire replay.
+	if message.Epoch == f.txEpoch {
+		f.txLimit = max(f.txLimit, message.Limit)
 	}
-	f.txLimit = max(f.txLimit, message.Limit)
-	if message.Leg1Bytes > f.peerLeg1Bytes {
-		f.peerLeg1Bytes = message.Leg1Bytes
+	if f.txLast.IsZero() && f.txLimit > 1 {
+		// Return unused startup credit even on a receive-only connection.
+		f.txLast = time.Now()
+	}
+	if message.Leg1Next > f.peerLeg1Next {
+		c.replayMu.Lock()
+		entry := c.replay[message.Leg1Next-1]
+		if entry != nil && !entry.startedAt.IsZero() {
+			sample := time.Since(entry.startedAt)
+			if f.peerDeliveryRTT == 0 {
+				f.peerDeliveryRTT = sample
+			} else {
+				f.peerDeliveryRTT = (7*f.peerDeliveryRTT + sample) / 8
+			}
+		}
+		c.replayMu.Unlock()
+		f.peerLeg1Next = message.Leg1Next
 		f.stallSince = time.Time{}
+		f.peerProgressAt = time.Now()
+		f.recovering = false
 	}
-	f.peerGap = message
 	f.txMu.Unlock()
 	c.handleACK(message.Next)
 	if message.Flags&flowFlagFINAck != 0 {
@@ -225,7 +247,7 @@ func (c *mpCore) receiveFrame(frame wireFrame, legID uint8) error {
 	f := c.flow
 	f.rxMu.Lock()
 	if legID == 1 && frame.typ == frameTypeData {
-		f.rxLeg1Bytes += uint64(len(frame.data))
+		f.rxLeg1Next = max(f.rxLeg1Next, frame.seq+1)
 	}
 	if frame.typ == frameTypeFIN {
 		defer f.rxMu.Unlock()
@@ -253,8 +275,10 @@ func (c *mpCore) receiveFrame(frame wireFrame, legID uint8) error {
 		return nil
 	}
 	if _, exists := f.rxPending[frame.seq]; exists {
+		f.rxDirty = true
 		f.rxMu.Unlock()
 		c.putBuffer(frame.data)
+		wakeFlow(f.wake)
 		return nil
 	}
 	if frame.seq >= f.rxLimit || (f.rxFIN != nil && frame.seq >= *f.rxFIN) {
@@ -363,11 +387,8 @@ func (c *mpCore) flowLoop() {
 		if leg == nil || !leg.ready.Load() {
 			continue
 		}
-		// Preserve hello + first DATA as the first early write. Flow requests
-		// and probes may follow it, but must never start a lazy child themselves.
-		if c.legCounters[0].txFrames.Load() == 0 && c.rxExpected.Load() == 0 && !c.receivedFIN.Load() {
-			continue
-		}
+		// ready excludes lazy legs until their first hello reply. Established
+		// legs can return unused startup credit even before application data.
 		now := time.Now()
 		f.txMu.Lock()
 		next := c.txSeq.Load()
@@ -383,21 +404,22 @@ func (c *mpCore) flowLoop() {
 		f.txMu.Unlock()
 
 		f.rxMu.Lock()
-		target := min(f.rxWanted, f.rxConsumed+f.rxCapacity)
+		capacity := min(f.rxCapacity, c.memory.receiveShareSlots(c.receiveSlotBytes()))
+		target := min(f.rxWanted, f.rxConsumed+capacity)
 		if target > f.rxLimit {
 			granted := c.memory.reserveReceive(target-f.rxLimit, c.receiveSlotBytes())
 			f.rxLimit += granted
 			f.rxDirty = f.rxDirty || granted > 0
 		}
 		if f.rxDirty || !f.rxGapSince.IsZero() {
-			message := flowMessage{Epoch: f.rxEpoch, Next: f.rxReceived, Limit: f.rxLimit, Leg1Bytes: f.rxLeg1Bytes}
+			message := flowMessage{Epoch: f.rxEpoch, Next: f.rxReceived, Limit: f.rxLimit, Leg1Next: f.rxLeg1Next}
 			if f.rxFIN != nil && f.rxReceived == *f.rxFIN {
 				message.Flags |= flowFlagFINAck
 			}
 			if !f.rxGapSince.IsZero() {
 				message.Flags |= flowFlagGap
 				message.GapAge = uint64(max(0, now.Sub(f.rxGapSince)))
-				if f.rxLimit-f.rxConsumed >= f.rxCapacity || !c.memory.boosterAllowed() {
+				if uint64(len(f.rxPending)) >= f.rxCapacity || !c.memory.boosterAllowed() {
 					message.Flags |= flowFlagPressure
 				}
 			}
