@@ -145,6 +145,8 @@ func TestCoreLeg1ActiveNotification(t *testing.T) {
 	}
 
 	core.legFailed(firstLeg, legFailureReadData, net.ErrClosed)
+	<-firstLeg.readerDone
+	<-firstLeg.writerDone
 	secondCoreConn, secondPeerConn := net.Pipe()
 	defer secondPeerConn.Close()
 	if _, err = core.addLeg(1, secondCoreConn, nil); err != nil {
@@ -460,7 +462,7 @@ func TestCoreLeg1FailureFallsBackToLeg0(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("booster leg did not receive replay-tracked data")
+			t.Fatalf("booster leg did not receive replay-tracked data: left=%s right=%s tx=%d rx=%d", left.failure, right.failure, left.txSeq.Load(), right.rxExpected.Load())
 		}
 		time.Sleep(time.Millisecond)
 	}

@@ -2,6 +2,8 @@ package multipath
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -92,7 +94,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
 	if replayTimeout <= 0 {
-		replayTimeout = 5 * time.Second
+		replayTimeout = time.Second
 	}
 	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
 		return nil, E.New("invalid leg1_replay_timeout")
@@ -101,7 +103,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if memoryErr != nil {
 		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames}) + int64(chunkSize)
+	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize}) + int64(chunkSize) + receiveFrameOverhead
 	if memoryLimit < minimumMemory {
 		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
 	}
@@ -242,6 +244,9 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	cfg := i.cfg
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
+	cfg.OnProtocolError = func(err error) {
+		i.logger.ErrorContext(ctx, "multipath protocol error for ", destination, ": ", err)
+	}
 	if hello.RequestStatus {
 		cfg.OnStatusEvent = i.wakeSenderStatus
 		cfg.SendStatus = true
@@ -296,11 +301,14 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	metadata.Destination = destination
 	i.logger.InfoContext(ctx, "multipath session established to ", destination, " on leg ", hello.LegID)
 	logicalOnClose := N.OnceClose(func(closeErr error) {
-		core.fail(closeErr)
-		i.removeSession(hello.Session, session)
+		if closeErr == nil || errors.Is(closeErr, io.EOF) {
+			_ = appConn.Close()
+		} else {
+			core.fail(closeErr)
+		}
 	})
 	go func() {
-		<-core.Done()
+		<-core.released
 		i.removeSession(hello.Session, session)
 	}()
 	i.router.RouteConnectionEx(ctx, appConn, metadata, logicalOnClose)

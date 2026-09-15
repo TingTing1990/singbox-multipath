@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionFiveHello(t *testing.T) {
+func TestProtocolVersionSixHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		ChunkSize:   64 * 1024,
@@ -215,12 +215,12 @@ func TestProtocolVersionFiveHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMP5" || encoded[4] != 5 {
+	if string(encoded[:4]) != "SMP6" || encoded[4] != 6 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV5Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV6Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -229,12 +229,12 @@ func TestWriteHelloResponseRejectsInvalidV5Values(t *testing.T) {
 		{Status: 2, ChunkSize: 64 * 1024},
 	} {
 		if err := writeHelloResponse(client, response); err == nil {
-			t.Fatalf("accepted invalid v5 hello response: %+v", response)
+			t.Fatalf("accepted invalid v6 hello response: %+v", response)
 		}
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV5Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidV6Values(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -242,6 +242,7 @@ func TestReadHelloResponseRejectsInvalidV5Values(t *testing.T) {
 		value   uint32
 	}{
 		{"v4 response", 4, helloStatusOK, 64 * 1024},
+		{"v5 response", 5, helloStatusOK, 64 * 1024},
 		{"unknown status", helloVersion, 2, 64 * 1024},
 		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
 		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
@@ -261,7 +262,7 @@ func TestReadHelloResponseRejectsInvalidV5Values(t *testing.T) {
 				writeDone <- writeAll(server, header[:])
 			}()
 			if _, err := readHelloResponse(client); err == nil {
-				t.Fatal("accepted invalid v5 hello response")
+				t.Fatal("accepted invalid v6 hello response")
 			}
 			if err := <-writeDone; err != nil {
 				t.Fatal(err)
@@ -270,29 +271,25 @@ func TestReadHelloResponseRejectsInvalidV5Values(t *testing.T) {
 	}
 }
 
-func TestReadHelloRejectsProtocolVersionFour(t *testing.T) {
-	header, err := encodeHelloHeader(helloMessage{
-		LegID:       0,
-		ChunkSize:   64 * 1024,
-		Destination: "example.com:443",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	copy(header[0:4], []byte("SMP4"))
-	header[4] = 4
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	writeDone := make(chan error, 1)
-	go func() {
-		writeDone <- writeAll(client, header[:])
-	}()
-	if _, err = readHello(server); err == nil {
-		t.Fatal("accepted a v3 multipath hello")
-	}
-	if err = <-writeDone; err != nil {
-		t.Fatal(err)
+func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
+	for _, version := range []byte{4, 5} {
+		header, err := encodeHelloHeader(helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		header[3], header[4] = '0'+version, version
+		client, server := net.Pipe()
+		writeDone := make(chan error, 1)
+		go func() { writeDone <- writeAll(client, header[:]) }()
+		_, err = readHello(server)
+		if err == nil {
+			t.Fatalf("accepted protocol version %d", version)
+		}
+		if err = <-writeDone; err != nil {
+			t.Fatal(err)
+		}
+		client.Close()
+		server.Close()
 	}
 }
 

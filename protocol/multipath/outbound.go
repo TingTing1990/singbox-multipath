@@ -96,6 +96,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if queueBytes > maxQueueBytes {
 		return nil, E.New("chunk_size * queue_frames exceeds 64 MiB")
 	}
+	maxReorderFrames := int(options.MaxReorderFrames)
+	if maxReorderFrames == 0 {
+		maxReorderFrames = 2048
+	}
+	if maxReorderFrames < 64 || maxReorderFrames > 65536 {
+		return nil, E.New("invalid max_reorder_frames")
+	}
 	maxReorderBufferBytes := int64(options.MaxReorderBytes)
 	if maxReorderBufferBytes == 0 {
 		maxReorderBufferBytes = 64 << 20
@@ -112,7 +119,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
 	if replayTimeout <= 0 {
-		replayTimeout = 5 * time.Second
+		replayTimeout = time.Second
 	}
 	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
 		return nil, E.New("invalid leg1_replay_timeout")
@@ -121,7 +128,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if memoryErr != nil {
 		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames}) + int64(chunkSize)
+	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize}) + int64(chunkSize) + receiveFrameOverhead
 	if memoryLimit < minimumMemory {
 		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
 	}
@@ -159,7 +166,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
 			ActivationWindow:               window,
 			BandwidthMbps:                  weights,
-			MaxReorderFrames:               2048,
+			MaxReorderFrames:               maxReorderFrames,
 			MaxReorderBytes:                maxReorderBufferBytes,
 			ReplayBytes:                    replayBytes,
 			ReplayTimeout:                  replayTimeout,
@@ -335,6 +342,9 @@ func (o *Outbound) dialTCPFastOpen(ctx context.Context, destination M.Socksaddr)
 
 func (o *Outbound) connectionCoreConfig(ctx context.Context, destination M.Socksaddr, sessionID [16]byte) coreConfig {
 	cfg := o.cfg
+	cfg.OnProtocolError = func(err error) {
+		o.logger.ErrorContext(ctx, "multipath protocol error for ", destination, ": ", err)
+	}
 	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
 		o.logger.InfoContext(
 			ctx,

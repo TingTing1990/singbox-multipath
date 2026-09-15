@@ -11,17 +11,20 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sagernet/sing/common/pipe"
 )
 
 const (
-	frameTypeData         byte = 1
-	frameTypeACK          byte = 2
-	frameTypeFIN          byte = 3
-	frameTypeReset        byte = 4
-	frameTypeSessionClose byte = 5
-	frameTypeSenderStatus byte = 6
-	frameTypePing         byte = 7
-	frameTypePong         byte = 8
+	frameTypeData          byte = 1
+	frameTypeFIN           byte = 3
+	frameTypeReset         byte = 4
+	frameTypeSessionClose  byte = 5
+	frameTypeSenderStatus  byte = 6
+	frameTypePing          byte = 7
+	frameTypePong          byte = 8
+	frameTypeWindow        byte = 9
+	frameTypeWindowRequest byte = 10
 
 	dataFrameHeaderSize      = 13 // type(1) + seq(8) + len(4)
 	controlFrameHeaderSize   = 9  // type(1) + seq(8)
@@ -56,6 +59,7 @@ type coreConfig struct {
 	OnLeg1Active                   func(activationInfo, bool)
 	OnLegFailure                   func(uint8, legFailureStage, error)
 	OnStatusEvent                  func()
+	OnProtocolError                func(error)
 	SendStatus                     bool
 }
 
@@ -135,18 +139,27 @@ func (i activationInfo) String() string {
 }
 
 type wireFrame struct {
-	typ    byte
-	seq    uint64
-	data   []byte
-	replay bool
-	status senderStatus
+	typ         byte
+	seq         uint64
+	data        []byte
+	replay      bool
+	status      senderStatus
+	flow        flowMessage
+	reordered   bool
+	primaryOnly bool
 }
 
 type replayEntry struct {
 	frame          wireFrame
-	sentAt         time.Time
+	queuedAt       time.Time
 	fallbackQueued bool
-	acked          bool
+}
+
+type ownedBuffer struct {
+	data           []byte
+	refs           int
+	receive        bool
+	primaryReserve bool
 }
 
 type mpLegCounters struct {
@@ -166,31 +179,85 @@ type legShutdownRequest struct {
 // lets sing-box half-close one direction without tearing down queued data in
 // the other direction.
 type logicalConn struct {
-	readConn  net.Conn
-	writeConn net.Conn
-	onClose   func()
-	closeOne  sync.Once
+	readConn                          net.Conn
+	writeConn                         net.Conn
+	onClose                           func() error
+	onCloseRead                       func() error
+	closeOne                          sync.Once
+	writeCloseOne                     sync.Once
+	writeClosed                       chan struct{}
+	writeDeadline                     pipe.Deadline
+	errorMu                           sync.RWMutex
+	readError, writeError             error
+	readClosedByApp, writeClosedByApp atomic.Bool
 }
 
 func newLogicalPipe() (*logicalConn, net.Conn, net.Conn) {
 	appWrite, coreRead := net.Pipe()
 	coreWrite, appRead := net.Pipe()
-	return &logicalConn{readConn: appRead, writeConn: appWrite}, coreRead, coreWrite
+	return &logicalConn{readConn: appRead, writeConn: appWrite, writeClosed: make(chan struct{}), writeDeadline: pipe.MakeDeadline()}, coreRead, coreWrite
 }
 
 func (c *logicalConn) Read(buffer []byte) (int, error) {
-	return c.readConn.Read(buffer)
+	n, err := c.readConn.Read(buffer)
+	if err != nil {
+		if c.readClosedByApp.Load() {
+			return n, net.ErrClosed
+		}
+		c.errorMu.RLock()
+		if c.readError != nil {
+			err = c.readError
+		}
+		c.errorMu.RUnlock()
+	}
+	return n, err
 }
 
 func (c *logicalConn) Write(buffer []byte) (int, error) {
-	return c.writeConn.Write(buffer)
+	n, err := c.writeConn.Write(buffer)
+	if err != nil {
+		if c.writeClosedByApp.Load() {
+			return n, net.ErrClosed
+		}
+		c.errorMu.RLock()
+		if c.writeError != nil {
+			err = c.writeError
+		}
+		c.errorMu.RUnlock()
+	}
+	return n, err
+}
+
+// Record the transport error before closing either pipe, so a blocked Read
+// cannot mistake an aborted stream for a clean FIN. Complete RX may still drain.
+func (c *logicalConn) setTerminalError(err error, drainReceive bool) {
+	readErr, writeErr := err, err
+	if errors.Is(err, io.EOF) {
+		readErr, writeErr = io.ErrUnexpectedEOF, net.ErrClosed
+	}
+	c.errorMu.Lock()
+	if !drainReceive {
+		c.readError = readErr
+	}
+	c.writeError = writeErr
+	c.errorMu.Unlock()
 }
 
 func (c *logicalConn) CloseRead() error {
+	c.readClosedByApp.Store(true)
+	if c.onCloseRead != nil {
+		return c.onCloseRead()
+	}
 	return c.readConn.Close()
 }
 
 func (c *logicalConn) CloseWrite() error {
+	c.writeClosedByApp.Store(true)
+	return c.closeWriteInternal()
+}
+
+func (c *logicalConn) closeWriteInternal() error {
+	c.writeCloseOne.Do(func() { close(c.writeClosed); c.writeDeadline.Set(time.Time{}) })
 	return c.writeConn.Close()
 }
 
@@ -199,16 +266,18 @@ func (c *logicalConn) closeInternal() (error, bool) {
 	closed := false
 	c.closeOne.Do(func() {
 		closed = true
-		closeErr = errors.Join(c.readConn.Close(), c.writeConn.Close())
+		closeErr = errors.Join(c.readConn.Close(), c.closeWriteInternal())
 	})
 	return closeErr, closed
 }
 
 func (c *logicalConn) Close() error {
-	closeErr, closed := c.closeInternal()
-	if closed && c.onClose != nil {
-		c.onClose()
+	c.readClosedByApp.Store(true)
+	c.writeClosedByApp.Store(true)
+	if c.onClose != nil {
+		return c.onClose()
 	}
+	closeErr, _ := c.closeInternal()
 	return closeErr
 }
 
@@ -221,7 +290,7 @@ func (c *logicalConn) RemoteAddr() net.Addr {
 }
 
 func (c *logicalConn) SetDeadline(deadline time.Time) error {
-	return errors.Join(c.readConn.SetReadDeadline(deadline), c.writeConn.SetWriteDeadline(deadline))
+	return errors.Join(c.SetReadDeadline(deadline), c.SetWriteDeadline(deadline))
 }
 
 func (c *logicalConn) SetReadDeadline(deadline time.Time) error {
@@ -229,7 +298,11 @@ func (c *logicalConn) SetReadDeadline(deadline time.Time) error {
 }
 
 func (c *logicalConn) SetWriteDeadline(deadline time.Time) error {
-	return c.writeConn.SetWriteDeadline(deadline)
+	if err := c.writeConn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	c.writeDeadline.Set(deadline)
+	return nil
 }
 
 type mpLeg struct {
@@ -239,6 +312,13 @@ type mpLeg struct {
 	conn             net.Conn
 	readPreamble     func(net.Conn) error
 	send             chan wireFrame
+	recovery         chan wireFrame
+	queueMu          sync.Mutex
+	flowWake         chan struct{}
+	flowMu           sync.Mutex
+	flowFrames       [2]wireFrame
+	flowPending      [2]bool
+	ready            atomic.Bool
 	control          chan wireFrame
 	telemetry        chan struct{}
 	telemetryMu      sync.Mutex
@@ -248,6 +328,7 @@ type mpLeg struct {
 	onClose          func(error)
 	done             chan struct{}
 	writerDone       chan struct{}
+	readerDone       chan struct{}
 	closeOne         sync.Once
 	queuedBytes      atomic.Int64
 	writingBytes     atomic.Int64
@@ -260,7 +341,9 @@ func (l *mpLeg) Done() <-chan struct{} {
 
 func (l *mpLeg) close(err error) {
 	l.closeOne.Do(func() {
+		l.queueMu.Lock()
 		close(l.done)
+		l.queueMu.Unlock()
 		l.cancel()
 		_ = l.conn.Close()
 		if l.onClose != nil {
@@ -304,6 +387,13 @@ func (l *mpLeg) reserveQueue(length int64, limit int64) bool {
 }
 
 func (l *mpLeg) tryQueue(frame wireFrame, limit int64) bool {
+	l.queueMu.Lock()
+	defer l.queueMu.Unlock()
+	select {
+	case <-l.done:
+		return false
+	default:
+	}
 	length := int64(len(frame.data))
 	if !l.reserveQueue(length, limit) {
 		return false
@@ -369,76 +459,81 @@ func (l *mpLeg) takeTelemetry() (wireFrame, bool) {
 }
 
 type mpCore struct {
-	cfg           coreConfig
-	ctx           context.Context
-	cancel        context.CancelFunc
-	appConn       *logicalConn
-	txPipe        net.Conn
-	rxPipe        net.Conn
-	legsMu        sync.RWMutex
-	legs          map[uint8]*mpLeg
-	reserved      map[uint8]bool
-	incoming      chan wireFrame
-	done          chan struct{}
-	closeOne      sync.Once
-	txSeq         atomic.Uint64
-	ingressBytes  atomic.Uint64
-	egressBytes   atomic.Uint64
-	legCounters   [2]mpLegCounters
-	active        atomic.Bool
-	activeCh      chan struct{}
-	activateOnce  sync.Once
-	activationMu  sync.Mutex
-	activation    activationInfo
-	activationAt  time.Time
-	notifiedLeg1  *mpLeg
-	leg1Joins     uint64
-	localFIN      atomic.Bool
-	remoteFIN     atomic.Bool
-	ackNext       atomic.Uint64
-	ackedNext     atomic.Uint64
-	rxExpected    atomic.Uint64
-	ackWake       chan struct{}
-	replayMu      sync.Mutex
-	replay        map[uint64]*replayEntry
-	replayBytes   int64
-	reorderBytes  atomic.Int64
-	reorderCount  atomic.Int64
-	replayPeak    atomic.Int64
-	reorderPeak   atomic.Int64
-	reorderFPeak  atomic.Int64
-	legPeak       [2]atomic.Int64
-	fallbackB     atomic.Uint64
-	fallbackF     atomic.Uint64
-	fallbackE     atomic.Uint64
-	replayTO      atomic.Uint64
-	backpressE    atomic.Uint64
-	backpressNS   atomic.Uint64
-	legFailureMu  sync.Mutex
-	legFailures   [2]uint64
-	lastFailLeg   uint8
-	lastFailStage legFailureStage
-	failureMu     sync.Mutex
-	failure       string
-	failureAt     time.Time
-	memory        *memoryBudget
-	sessionBytes  int64
-	bufferMu      sync.Mutex
-	buffers       map[*byte][]byte
-	peerStatusMu  sync.Mutex
-	peerStatus    peerSenderStatus
-	statusMu      sync.Mutex
-	statusSeq     uint64
-	lastStatus    senderStatus
-	lastStatusAt  time.Time
-	probeMu       sync.Mutex
-	probeNext     uint64
-	probePending  [2]pendingProbe
-	probeLast     [2]time.Time
-	probeRTT      [2]legRTTSnapshot
-	workerMu      sync.Mutex
-	workerGroup   sync.WaitGroup
-	workerClosed  bool
+	cfg             coreConfig
+	ctx             context.Context
+	cancel          context.CancelFunc
+	appConn         *logicalConn
+	txPipe          net.Conn
+	rxPipe          net.Conn
+	legsMu          sync.RWMutex
+	legs            map[uint8]*mpLeg
+	reserved        map[uint8]bool
+	retiring        map[uint8]*mpLeg
+	done            chan struct{}
+	released        chan struct{}
+	closeOne        sync.Once
+	txSeq           atomic.Uint64
+	ingressBytes    atomic.Uint64
+	egressBytes     atomic.Uint64
+	legCounters     [2]mpLegCounters
+	active          atomic.Bool
+	activeCh        chan struct{}
+	activateOnce    sync.Once
+	activationMu    sync.Mutex
+	activation      activationInfo
+	activationAt    time.Time
+	notifiedLeg1    *mpLeg
+	leg1Joins       uint64
+	localFIN        atomic.Bool
+	remoteFIN       atomic.Bool
+	receivedFIN     atomic.Bool
+	ackedFIN        atomic.Bool
+	localClosing    atomic.Bool
+	localReadClosed atomic.Bool
+	ackedNext       atomic.Uint64
+	rxExpected      atomic.Uint64
+	replayMu        sync.Mutex
+	replay          map[uint64]*replayEntry
+	replayBytes     int64
+	reorderBytes    atomic.Int64
+	reorderCount    atomic.Int64
+	replayPeak      atomic.Int64
+	reorderPeak     atomic.Int64
+	reorderFPeak    atomic.Int64
+	legPeak         [2]atomic.Int64
+	fallbackB       atomic.Uint64
+	fallbackF       atomic.Uint64
+	fallbackE       atomic.Uint64
+	replayTO        atomic.Uint64
+	backpressE      atomic.Uint64
+	backpressNS     atomic.Uint64
+	legFailureMu    sync.Mutex
+	legFailures     [2]uint64
+	lastFailLeg     uint8
+	lastFailStage   legFailureStage
+	failureMu       sync.Mutex
+	failure         string
+	failureAt       time.Time
+	memory          *memoryBudget
+	sessionBytes    int64
+	bufferMu        sync.Mutex
+	buffers         map[*byte]*ownedBuffer
+	flow            *flowControl
+	txReserve       chan []byte
+	peerStatusMu    sync.Mutex
+	peerStatus      peerSenderStatus
+	statusMu        sync.Mutex
+	statusSeq       uint64
+	lastStatus      senderStatus
+	lastStatusAt    time.Time
+	probeMu         sync.Mutex
+	probeNext       uint64
+	probePending    [2]pendingProbe
+	probeLast       [2]time.Time
+	probeRTT        [2]legRTTSnapshot
+	workerMu        sync.Mutex
+	workerGroup     sync.WaitGroup
+	workerClosed    bool
 }
 
 func newCore(parent context.Context, cfg coreConfig) (*mpCore, net.Conn) {
@@ -472,7 +567,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		cfg.ReplayBytes = 64 << 20
 	}
 	if cfg.ReplayTimeout <= 0 {
-		cfg.ReplayTimeout = 5 * time.Second
+		cfg.ReplayTimeout = time.Second
 	}
 	if parent == nil {
 		parent = context.Background()
@@ -482,7 +577,8 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		memory = newMemoryBudget(1<<62, false)
 	}
 	sessionBytes := sessionMemoryReservation(cfg)
-	if !memory.reserveSession(sessionBytes) {
+	initialCredit := int64(cfg.ChunkSize) + receiveFrameOverhead
+	if !memory.reserveSession(sessionBytes + initialCredit) {
 		return nil, nil, errMemoryLimit
 	}
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
@@ -496,17 +592,24 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 		rxPipe:       rxPipe,
 		legs:         make(map[uint8]*mpLeg),
 		reserved:     make(map[uint8]bool),
-		incoming:     make(chan wireFrame, cfg.QueueFrames*2),
+		retiring:     make(map[uint8]*mpLeg),
 		done:         make(chan struct{}),
+		released:     make(chan struct{}),
 		activeCh:     make(chan struct{}),
-		ackWake:      make(chan struct{}, 1),
 		replay:       make(map[uint64]*replayEntry),
 		memory:       memory,
 		sessionBytes: sessionBytes,
-		buffers:      make(map[*byte][]byte),
+		buffers:      make(map[*byte]*ownedBuffer),
+		txReserve:    make(chan []byte, 1),
 	}
-	appConn.onClose = func() { c.fail(io.EOF) }
-	c.startWorkers(c.txLoop, c.rxLoop, c.activationLoop, c.ackLoop, c.replayLoop)
+	c.flow = newFlowControl(cfg)
+	c.txReserve <- memory.takeReservedBuffer(cfg.ChunkSize)
+	appConn.onClose = c.closeApplication
+	appConn.onCloseRead = func() error {
+		c.localReadClosed.Store(true)
+		return appConn.readConn.Close()
+	}
+	c.startWorkers(c.txLoop, c.rxLoop, c.activationLoop, c.flowLoop, c.replayLoop)
 	return c, appConn, nil
 }
 
@@ -545,8 +648,32 @@ func (c *mpCore) Done() <-chan struct{} {
 }
 
 func (c *mpCore) Close() error {
-	c.fail(io.EOF)
+	c.fail(net.ErrClosed)
+	// Service shutdown and explicit core disposal must also interrupt a peer
+	// close that is waiting for the local application to drain buffered data.
+	_, _ = c.appConn.closeInternal()
 	return nil
+}
+
+// Application Close follows TCP semantics: reject further local I/O, but let
+// already accepted TX drain in the background. Only a receipt ACK covering FIN
+// permits session-close to overtake neither queued data nor delayed booster data.
+func (c *mpCore) closeApplication() error {
+	c.localClosing.Store(true)
+	c.localReadClosed.Store(true)
+	err, _ := c.appConn.closeInternal()
+	if c.getLeg(0) == nil {
+		c.fail(io.EOF)
+	} else {
+		c.finishApplicationClose()
+	}
+	return err
+}
+
+func (c *mpCore) finishApplicationClose() {
+	if c.localClosing.Load() && c.ackedFIN.Load() {
+		c.terminate(io.EOF, frameTypeSessionClose)
+	}
 }
 
 func (c *mpCore) isDone() bool {
@@ -563,19 +690,27 @@ func (c *mpCore) fail(err error) {
 }
 
 func (c *mpCore) peerSessionClosed(err error) {
-	c.terminate(err, 0)
+	c.terminateWithReceiveDrain(err, 0, errors.Is(err, io.EOF) && c.receiveComplete())
 }
 
 func (c *mpCore) terminate(err error, terminalFrameType byte) {
+	c.terminateWithReceiveDrain(err, terminalFrameType, false)
+}
+
+func (c *mpCore) terminateWithReceiveDrain(err error, terminalFrameType byte, drainReceive bool) {
 	if err == nil {
 		err = errCoreClosed
 	}
 	c.closeOne.Do(func() {
 		c.stopWorkerAdmission()
+		c.appConn.setTerminalError(err, drainReceive)
 		c.failureMu.Lock()
 		c.failure = err.Error()
 		c.failureAt = time.Now()
 		c.failureMu.Unlock()
+		if terminalFrameType == frameTypeReset && c.cfg.OnProtocolError != nil {
+			c.cfg.OnProtocolError(err)
+		}
 		var finalStatus *senderStatus
 		if c.cfg.SendStatus {
 			status := c.nextSenderStatus(time.Now())
@@ -595,10 +730,18 @@ func (c *mpCore) terminate(err error, terminalFrameType byte) {
 			leg.requestShutdown(err, terminalFrameType, legStatus)
 		}
 		c.cancel()
-		close(c.done)
 		_ = c.txPipe.Close()
-		_ = c.rxPipe.Close()
-		_, _ = c.appConn.closeInternal()
+		if drainReceive {
+			// Receipt ACKs promise ownership, not application consumption. Keep
+			// the read half alive until rxLoop delivers all bytes preceding FIN.
+			_ = c.appConn.closeWriteInternal()
+		} else {
+			_ = c.rxPipe.Close()
+			_, _ = c.appConn.closeInternal()
+		}
+		// Done promises that subsequent application writes are rejected.
+		// Publish it only after closing TX; complete RX may continue draining.
+		close(c.done)
 		c.replayMu.Lock()
 		c.replay = make(map[uint64]*replayEntry)
 		c.replayBytes = 0
@@ -611,7 +754,14 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	closeLegsAfterDrain(legs, err)
 	c.workerGroup.Wait()
 	c.releaseAllBuffers()
+	select {
+	case buffer := <-c.txReserve:
+		c.memory.putReservedBuffer(buffer)
+	default:
+	}
+	c.releaseReceiveWindow()
 	c.memory.releaseSession(c.sessionBytes)
+	close(c.released)
 }
 
 func (c *mpCore) protocolFail(err error) {
@@ -644,6 +794,19 @@ func (c *mpCore) reserveLeg(id uint8) error {
 	defer c.legsMu.Unlock()
 	if c.isDone() {
 		return errCoreClosed
+	}
+	if previous := c.retiring[id]; previous != nil {
+		select {
+		case <-previous.readerDone:
+		default:
+			return errors.New("previous multipath reader is draining")
+		}
+		select {
+		case <-previous.writerDone:
+		default:
+			return errors.New("previous multipath writer is draining")
+		}
+		delete(c.retiring, id)
 	}
 	if c.legs[id] != nil || c.reserved[id] {
 		return errors.New("duplicate multipath leg")
@@ -685,13 +848,17 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		conn:         conn,
 		readPreamble: readPreamble,
 		send:         make(chan wireFrame, c.cfg.QueueFrames),
+		recovery:     make(chan wireFrame, c.cfg.QueueFrames),
+		flowWake:     make(chan struct{}, 1),
 		control:      make(chan wireFrame, 32),
 		telemetry:    make(chan struct{}, 1),
 		shutdown:     make(chan legShutdownRequest, 1),
 		onClose:      onClose,
 		done:         make(chan struct{}),
 		writerDone:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
+	leg.ready.Store(readPreamble == nil)
 	c.legs[id] = leg
 	if !c.startWorkers(func() { c.legWriteLoop(leg) }, func() { c.legReadLoop(leg) }) {
 		delete(c.legs, id)
@@ -701,6 +868,9 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 	}
 	c.legsMu.Unlock()
 	if id == 1 {
+		c.flow.txMu.Lock()
+		c.flow.stallSince = time.Time{}
+		c.flow.txMu.Unlock()
 		c.notifyLeg1Active()
 	}
 	return leg, nil
@@ -748,7 +918,7 @@ func (c *mpCore) getBuffer(ctx context.Context, class memoryClass) ([]byte, erro
 	}
 	key := &buffer[0]
 	c.bufferMu.Lock()
-	c.buffers[key] = buffer
+	c.buffers[key] = &ownedBuffer{data: buffer, refs: 1}
 	c.bufferMu.Unlock()
 	return buffer, nil
 }
@@ -762,40 +932,72 @@ func (c *mpCore) putBuffer(buffer []byte) {
 	c.bufferMu.Lock()
 	owned, loaded := c.buffers[key]
 	if loaded {
-		delete(c.buffers, key)
+		owned.refs--
+		if owned.refs == 0 {
+			delete(c.buffers, key)
+		} else {
+			loaded = false
+		}
 	}
 	c.bufferMu.Unlock()
 	if loaded {
-		c.memory.release(owned)
+		if owned.primaryReserve {
+			c.txReserve <- owned.data
+		} else if owned.receive {
+			c.memory.putReservedBuffer(owned.data)
+		} else {
+			c.memory.release(owned.data)
+		}
 	}
+}
+
+func (c *mpCore) retainBuffer(buffer []byte) {
+	c.bufferMu.Lock()
+	if owned := c.buffers[&buffer[:cap(buffer)][0]]; owned != nil {
+		owned.refs++
+	}
+	c.bufferMu.Unlock()
 }
 
 func (c *mpCore) releaseAllBuffers() {
 	c.bufferMu.Lock()
-	buffers := make([][]byte, 0, len(c.buffers))
+	buffers := make([]*ownedBuffer, 0, len(c.buffers))
 	for _, buffer := range c.buffers {
 		buffers = append(buffers, buffer)
 	}
-	c.buffers = make(map[*byte][]byte)
+	c.buffers = make(map[*byte]*ownedBuffer)
 	c.bufferMu.Unlock()
 	for _, buffer := range buffers {
-		c.memory.release(buffer)
+		if buffer.receive || buffer.primaryReserve {
+			c.memory.putReservedBuffer(buffer.data)
+		} else {
+			c.memory.release(buffer.data)
+		}
 	}
 }
 
 func (c *mpCore) txLoop() {
 	for {
-		buffer, bufferErr := c.getBuffer(c.ctx, memoryClassPrimary)
+		buffer, primaryOnly, bufferErr := c.getTXBuffer()
 		if bufferErr != nil {
 			return
 		}
 		n, err := c.txPipe.Read(buffer[:c.cfg.ChunkSize])
 		if n > 0 {
 			c.ingressBytes.Add(uint64(n))
+			sequence, sequenceErr := c.reserveTXSequence()
+			if sequenceErr != nil {
+				c.putBuffer(buffer)
+				if !c.isDone() {
+					c.protocolFail(sequenceErr)
+				}
+				return
+			}
 			frame := wireFrame{
-				typ:  frameTypeData,
-				seq:  c.txSeq.Add(1) - 1,
-				data: buffer[:n],
+				typ:         frameTypeData,
+				seq:         sequence,
+				data:        buffer[:n],
+				primaryOnly: primaryOnly,
 			}
 			if enqueueErr := c.enqueue(frame); enqueueErr != nil {
 				c.putBuffer(buffer)
@@ -994,14 +1196,17 @@ func (c *mpCore) weightFor(id uint8) uint32 {
 }
 
 func (c *mpCore) chooseLeg(frameLength int) *mpLeg {
-	if !c.active.Load() {
+	if !c.active.Load() || c.txSeq.Load() <= 1 {
 		return c.getLeg(0)
 	}
+	c.flow.txMu.Lock()
+	paused := time.Now().Before(c.flow.pauseUntil)
+	c.flow.txMu.Unlock()
 	legs := c.availableLegs()
 	var best *mpLeg
 	var bestNum, bestDen uint64
 	for _, leg := range legs {
-		if leg.id == 1 && !c.memory.boosterAllowed() {
+		if leg.id == 1 && (paused || !c.memory.boosterAllowed()) {
 			continue
 		}
 		weight := uint64(c.weightFor(leg.id))
@@ -1021,6 +1226,12 @@ func (c *mpCore) tryQueueNewFrame(leg *mpLeg, frame wireFrame) bool {
 	}
 	queuedFrame := frame
 	if leg.id == 1 {
+		c.flow.txMu.Lock()
+		defer c.flow.txMu.Unlock()
+		paused := time.Now().Before(c.flow.pauseUntil)
+		if frame.seq == 0 || frame.primaryOnly || paused || !c.memory.boosterAllowed() {
+			return false
+		}
 		if !c.trackReplay(&queuedFrame) {
 			return false
 		}
@@ -1030,7 +1241,7 @@ func (c *mpCore) tryQueueNewFrame(leg *mpLeg, frame wireFrame) bool {
 		return true
 	}
 	if queuedFrame.replay {
-		c.untrackReplay(queuedFrame.seq, false)
+		c.untrackReplay(queuedFrame.seq)
 	}
 	return false
 }
@@ -1093,6 +1304,20 @@ func (c *mpCore) enqueue(frame wireFrame) error {
 
 func (c *mpCore) legWriteLoop(leg *mpLeg) {
 	defer close(leg.writerDone)
+	defer func() {
+		for {
+			select {
+			case frame := <-leg.send:
+				leg.queuedBytes.Add(-int64(len(frame.data)))
+				c.putBuffer(frame.data)
+			case frame := <-leg.recovery:
+				leg.queuedBytes.Add(-int64(len(frame.data)))
+				c.putBuffer(frame.data)
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case request := <-leg.shutdown:
@@ -1109,13 +1334,17 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 			continue
 		default:
 		}
+		if flow, pending := leg.takeFlow(); pending {
+			if err := writeWireFrame(leg.conn, flow); err != nil {
+				c.legFailed(leg, legFailureWriteControl, err)
+				return
+			}
+			continue
+		}
 		select {
-		case <-leg.telemetry:
-			if telemetry, loaded := leg.takeTelemetry(); loaded {
-				if err := writeWireFrame(leg.conn, telemetry); err != nil {
-					c.legFailed(leg, legFailureWriteControl, err)
-					return
-				}
+		case frame := <-leg.recovery:
+			if !c.writeDataFrame(leg, frame) {
+				return
 			}
 			continue
 		default:
@@ -1139,39 +1368,54 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 				c.legFailed(leg, legFailureWriteControl, err)
 				return
 			}
+		case <-leg.flowWake:
 		case <-leg.telemetry:
-			if telemetry, loaded := leg.takeTelemetry(); loaded {
-				if err := writeWireFrame(leg.conn, telemetry); err != nil {
+			if frame, pending := leg.takeTelemetry(); pending {
+				if err := writeWireFrame(leg.conn, frame); err != nil {
 					c.legFailed(leg, legFailureWriteControl, err)
 					return
 				}
 			}
-		case frame := <-leg.send:
-			length := int64(len(frame.data))
-			leg.queuedBytes.Add(-length)
-			leg.writingBytes.Add(length)
-			leg.writeStarted.Store(time.Now().UnixNano())
-			if leg.id == 1 {
-				c.markReplaySent(frame.seq)
-			}
-			err := writeWireFrame(leg.conn, frame)
-			leg.writeStarted.Store(0)
-			leg.writingBytes.Add(-length)
-			if err != nil {
-				c.legFailed(leg, legFailureWriteData, err)
+		case frame := <-leg.recovery:
+			if !c.writeDataFrame(leg, frame) {
 				return
 			}
-			c.legCounters[leg.id].txBytes.Add(uint64(length))
-			c.legCounters[leg.id].txFrames.Add(1)
-			if leg.id == 0 {
-				if frame.replay {
-					c.completeFallback(frame.seq)
-				} else {
-					c.putBuffer(frame.data)
-				}
+		case frame := <-leg.send:
+			if !c.writeDataFrame(leg, frame) {
+				return
 			}
 		}
 	}
+}
+
+func (c *mpCore) writeDataFrame(leg *mpLeg, frame wireFrame) bool {
+	length := int64(len(frame.data))
+	leg.queuedBytes.Add(-length)
+	defer c.putBuffer(frame.data) // Queue ownership is independent of replay ownership.
+	if frame.replay && frame.seq < c.ackedNext.Load() {
+		return true
+	}
+	if leg.id == 1 {
+		c.flow.txMu.Lock()
+		paused := time.Now().Before(c.flow.pauseUntil)
+		c.flow.txMu.Unlock()
+		if paused {
+			return true
+		} // The replay owner retains skipped booster frames.
+	}
+	leg.writingBytes.Add(length)
+	leg.writeStarted.Store(time.Now().UnixNano())
+	err := writeWireFrame(leg.conn, frame)
+	leg.writeStarted.Store(0)
+	leg.writingBytes.Add(-length)
+	if err != nil {
+		c.legFailed(leg, legFailureWriteData, err)
+		return false
+	}
+	c.legCounters[leg.id].txBytes.Add(uint64(length))
+	c.legCounters[leg.id].txFrames.Add(1)
+	wakeFlow(c.flow.wake)
+	return true
 }
 
 func (c *mpCore) writeControlFrame(leg *mpLeg, frame wireFrame) error {
@@ -1196,6 +1440,7 @@ func (c *mpCore) finishLegShutdown(leg *mpLeg, request legShutdownRequest) {
 }
 
 func (c *mpCore) legReadLoop(leg *mpLeg) {
+	defer close(leg.readerDone)
 	if leg.readPreamble != nil {
 		if err := leg.readPreamble(leg.conn); err != nil {
 			if !c.isDone() {
@@ -1204,6 +1449,8 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			return
 		}
 	}
+	leg.ready.Store(true)
+	wakeFlow(c.flow.wake)
 	for {
 		frame, err := readWireFrameForLeg(leg.ctx, leg.conn, c, leg.id)
 		if err != nil {
@@ -1213,12 +1460,20 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			return
 		}
 		switch frame.typ {
-		case frameTypeACK:
+		case frameTypeWindow, frameTypeWindowRequest:
 			if leg.id != 0 {
-				c.protocolFail(errors.New("multipath ACK received on booster leg"))
+				c.protocolFail(errors.New("multipath flow control received on booster leg"))
 				return
 			}
-			c.handleACK(frame.seq)
+			if frame.typ == frameTypeWindow {
+				err = c.handleWindow(frame.flow)
+			} else {
+				err = c.handleWindowRequest(frame.flow)
+			}
+			if err != nil {
+				c.protocolFail(err)
+				return
+			}
 		case frameTypePing:
 			leg.tryQueueControl(wireFrame{typ: frameTypePong, seq: frame.seq})
 		case frameTypePong:
@@ -1240,12 +1495,8 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 				c.legCounters[leg.id].rxBytes.Add(uint64(len(frame.data)))
 				c.legCounters[leg.id].rxFrames.Add(1)
 			}
-			select {
-			case c.incoming <- frame:
-			case <-c.done:
-				if len(frame.data) > 0 {
-					c.putBuffer(frame.data)
-				}
+			if err = c.receiveFrame(frame, leg.id); err != nil {
+				c.protocolFail(err)
 				return
 			}
 		default:
@@ -1263,6 +1514,7 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		return
 	}
 	delete(c.legs, leg.id)
+	c.retiring[leg.id] = leg
 	c.legsMu.Unlock()
 	leg.close(err)
 	c.cancelLegProbe(leg.id)
@@ -1278,163 +1530,59 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		c.cfg.OnLegFailure(leg.id, stage, err)
 	}
 	if leg.id == 0 {
-		c.fail(err)
+		// A peer close can surface as a write error before its session-close
+		// is read. Transport failure cannot invalidate already complete RX.
+		if c.receiveComplete() {
+			c.terminateWithReceiveDrain(err, 0, true)
+		} else {
+			c.fail(err)
+		}
 		return
 	}
-	c.startWorkers(func() {
-		<-leg.writerDone
-		if !c.isDone() {
-			c.reinjectLeg1()
-		}
-	})
+	c.startWorkers(c.reinjectLeg1)
 }
 
 func (c *mpCore) rxLoop() {
-	expected := uint64(0)
-	c.rxExpected.Store(expected)
-	pending := make(map[uint64]wireFrame)
-	var pendingBytes int64
-	var finSeq *uint64
-	cleanup := func() {
-		for _, frame := range pending {
-			c.putBuffer(frame.data)
-		}
-		c.reorderBytes.Store(0)
-		c.reorderCount.Store(0)
-	}
-	defer cleanup()
+	f := c.flow
+	defer func() { c.reorderBytes.Store(0); c.reorderCount.Store(0) }()
+	defer c.rxPipe.Close()
 	for {
-		select {
-		case <-c.done:
+		f.rxMu.Lock()
+		frame, ready := f.rxPending[f.rxConsumed]
+		if ready {
+			delete(f.rxPending, f.rxConsumed)
+		}
+		finished := f.rxFIN != nil && f.rxConsumed == *f.rxFIN
+		f.rxMu.Unlock()
+		if finished {
+			c.remoteFIN.Store(true)
+			_ = c.rxPipe.Close()
 			return
-		case frame := <-c.incoming:
-			switch frame.typ {
-			case frameTypeFIN:
-				if finSeq != nil && *finSeq != frame.seq {
-					c.protocolFail(errors.New("conflicting multipath FIN sequence"))
-					return
-				}
-				if frame.seq < expected {
-					continue
-				}
-				if frame.seq-expected > uint64(c.cfg.MaxReorderFrames) {
-					c.protocolFail(errors.New("multipath FIN sequence gap exceeded"))
-					return
-				}
-				for sequence := range pending {
-					if sequence >= frame.seq {
-						c.protocolFail(errors.New("multipath buffered data after FIN"))
-						return
-					}
-				}
-				value := frame.seq
-				finSeq = &value
-			case frameTypeData:
-				if finSeq != nil && frame.seq >= *finSeq {
-					c.putBuffer(frame.data)
-					c.protocolFail(errors.New("multipath data after FIN"))
-					return
-				}
-				if frame.seq < expected {
-					c.putBuffer(frame.data)
-					continue
-				}
-				if frame.seq > expected {
-					if frame.seq-expected > uint64(c.cfg.MaxReorderFrames) {
-						c.putBuffer(frame.data)
-						c.protocolFail(errors.New("multipath sequence gap exceeded"))
-						return
-					}
-					if _, exists := pending[frame.seq]; exists {
-						c.putBuffer(frame.data)
-						continue
-					}
-					if len(pending) >= c.cfg.MaxReorderFrames || pendingBytes+int64(len(frame.data)) > c.cfg.MaxReorderBytes {
-						c.putBuffer(frame.data)
-						c.protocolFail(errors.New("multipath reorder buffer exceeded"))
-						return
-					}
-					pending[frame.seq] = frame
-					pendingBytes += int64(len(frame.data))
-					reorderBytes := c.reorderBytes.Add(int64(len(frame.data)))
-					reorderFrames := c.reorderCount.Add(1)
-					updateAtomicPeak(&c.reorderPeak, reorderBytes)
-					updateAtomicPeak(&c.reorderFPeak, reorderFrames)
-					continue
-				}
-				for {
-					if err := writeAll(c.rxPipe, frame.data); err != nil {
-						c.putBuffer(frame.data)
-						if !c.isDone() {
-							c.fail(err)
-						}
-						return
-					}
-					c.egressBytes.Add(uint64(len(frame.data)))
-					c.putBuffer(frame.data)
-					expected++
-					c.rxExpected.Store(expected)
-					c.requestACK(expected)
-					next, exists := pending[expected]
-					if !exists {
-						break
-					}
-					delete(pending, expected)
-					pendingBytes -= int64(len(next.data))
-					c.reorderBytes.Add(-int64(len(next.data)))
-					c.reorderCount.Add(-1)
-					frame = next
-				}
-			}
-			if finSeq != nil && expected == *finSeq {
-				c.remoteFIN.Store(true)
-				_ = c.rxPipe.Close()
+		}
+		if !ready {
+			select {
+			case <-c.done:
 				return
+			case <-f.rxWake:
 			}
-		}
-	}
-}
-
-func (c *mpCore) requestACK(next uint64) {
-	for {
-		current := c.ackNext.Load()
-		if next <= current || c.ackNext.CompareAndSwap(current, next) {
-			break
-		}
-	}
-	select {
-	case c.ackWake <- struct{}{}:
-	default:
-	}
-}
-
-func (c *mpCore) ackLoop() {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	lastSent := uint64(0)
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-c.ackWake:
-		case <-ticker.C:
-		}
-		next := c.ackNext.Load()
-		if next == 0 || next == lastSent {
 			continue
 		}
-		leg := c.getLeg(0)
-		if leg == nil {
-			c.fail(errors.New("multipath control leg is unavailable"))
-			return
-		}
-		if err := leg.queueControl(c.done, wireFrame{typ: frameTypeACK, seq: next}); err != nil {
+		if err := writeAll(c.rxPipe, frame.data); err != nil {
+			c.putBuffer(frame.data)
+			if c.localReadClosed.Load() && !c.isDone() {
+				// A locally closed application abandons RX, not its buffered TX.
+				// Continue consuming credit so the peer can process our final ACK.
+				c.consumeFrame()
+				continue
+			}
 			if !c.isDone() {
 				c.fail(err)
 			}
 			return
 		}
-		lastSent = next
+		c.egressBytes.Add(uint64(len(frame.data)))
+		c.putBuffer(frame.data)
+		c.consumeFrame()
 	}
 }
 
@@ -1449,7 +1597,8 @@ func (c *mpCore) trackReplay(frame *wireFrame) bool {
 		return false
 	}
 	frame.replay = true
-	c.replay[frame.seq] = &replayEntry{frame: *frame}
+	c.retainBuffer(frame.data)
+	c.replay[frame.seq] = &replayEntry{frame: *frame, queuedAt: time.Now()}
 	c.replayBytes += length
 	updateAtomicPeak(&c.replayPeak, c.replayBytes)
 	return true
@@ -1462,28 +1611,18 @@ func (c *mpCore) hasReplay() bool {
 	return hasReplay
 }
 
-func (c *mpCore) untrackReplay(seq uint64, release bool) {
+func (c *mpCore) untrackReplay(seq uint64) {
 	var buffer []byte
 	c.replayMu.Lock()
 	if entry := c.replay[seq]; entry != nil {
 		delete(c.replay, seq)
 		c.replayBytes -= int64(len(entry.frame.data))
-		if release {
-			buffer = entry.frame.data
-		}
+		buffer = entry.frame.data
 	}
 	c.replayMu.Unlock()
 	if buffer != nil {
 		c.putBuffer(buffer)
 	}
-}
-
-func (c *mpCore) markReplaySent(seq uint64) {
-	c.replayMu.Lock()
-	if entry := c.replay[seq]; entry != nil && entry.sentAt.IsZero() {
-		entry.sentAt = time.Now()
-	}
-	c.replayMu.Unlock()
 }
 
 func (c *mpCore) handleACK(next uint64) {
@@ -1503,16 +1642,11 @@ func (c *mpCore) handleACK(next uint64) {
 	var buffers [][]byte
 	c.replayMu.Lock()
 	for seq, entry := range c.replay {
-		if seq >= next {
-			continue
+		if seq < next {
+			delete(c.replay, seq)
+			c.replayBytes -= int64(len(entry.frame.data))
+			buffers = append(buffers, entry.frame.data)
 		}
-		if entry.fallbackQueued {
-			entry.acked = true
-			continue
-		}
-		delete(c.replay, seq)
-		c.replayBytes -= int64(len(entry.frame.data))
-		buffers = append(buffers, entry.frame.data)
 	}
 	c.replayMu.Unlock()
 	for _, buffer := range buffers {
@@ -1520,45 +1654,76 @@ func (c *mpCore) handleACK(next uint64) {
 	}
 }
 
-func (c *mpCore) completeFallback(seq uint64) {
-	c.untrackReplay(seq, true)
-}
-
 func (c *mpCore) replayLoop() {
-	interval := c.cfg.ReplayTimeout / 4
-	if interval < 50*time.Millisecond {
-		interval = 50 * time.Millisecond
-	}
-	if interval > 500*time.Millisecond {
-		interval = 500 * time.Millisecond
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-c.done:
 			return
 		case now := <-ticker.C:
+			timeout := c.recoveryTimeout()
 			stalled := false
 			c.replayMu.Lock()
 			for _, entry := range c.replay {
-				if !entry.fallbackQueued && !entry.sentAt.IsZero() && now.Sub(entry.sentAt) >= c.cfg.ReplayTimeout {
+				if !entry.fallbackQueued && now.Sub(entry.queuedAt) >= timeout {
 					stalled = true
 					break
 				}
 			}
 			c.replayMu.Unlock()
+			c.flow.txMu.Lock()
+			c.replayMu.Lock()
+			hasPending := len(c.replay) != 0
+			c.replayMu.Unlock()
+			leg1 := c.getLeg(1)
+			if !hasPending && (leg1 == nil || leg1.writingBytes.Load() == 0) {
+				// No outstanding data and no retained partial write: an idle leg
+				// is not stalled merely because no new delivery counter arrives.
+				c.flow.stallSince = time.Time{}
+			}
+			gap := c.flow.peerGap
+			if gap.Flags&flowFlagGap != 0 && gap.Flags&flowFlagPressure != 0 && time.Duration(gap.GapAge) >= timeout/2 {
+				c.replayMu.Lock()
+				entry := c.replay[gap.Next]
+				stalled = stalled || entry != nil && !entry.fallbackQueued && now.Sub(entry.queuedAt) >= timeout/2
+				c.replayMu.Unlock()
+			}
+			if stalled {
+				c.flow.pauseUntil = now.Add(max(time.Second, 2*timeout))
+				if c.flow.stallSince.IsZero() {
+					c.flow.stallSince = now
+				}
+			}
+			persistent := !c.flow.stallSince.IsZero() && now.Sub(c.flow.stallSince) >= max(2*time.Second, 5*c.cfg.ReplayTimeout)
+			c.flow.txMu.Unlock()
+			if persistent {
+				if leg := c.getLeg(1); leg != nil {
+					c.legFailed(leg, legFailureReplay, errLeg1Stalled)
+				}
+			}
 			if stalled {
 				c.replayTO.Add(1)
 				if c.cfg.OnStatusEvent != nil {
 					c.cfg.OnStatusEvent()
 				}
-				if leg := c.getLeg(1); leg != nil {
-					c.legFailed(leg, legFailureReplay, errLeg1Stalled)
-				}
+				c.reinjectLeg1()
 			}
 		}
 	}
+}
+
+func (c *mpCore) recoveryTimeout() time.Duration {
+	timeout := c.cfg.ReplayTimeout
+	stats := c.rttSnapshot()
+	if stats[1].Samples > 0 {
+		estimate := max(200*time.Millisecond, stats[1].EWMA+4*stats[1].Jitter)
+		if stats[0].Samples > 0 {
+			estimate = max(estimate, stats[0].EWMA+4*stats[0].Jitter)
+		}
+		timeout = min(timeout, estimate)
+	}
+	return max(100*time.Millisecond, timeout)
 }
 
 func (c *mpCore) reinjectLeg1() {
@@ -1572,43 +1737,63 @@ func (c *mpCore) reinjectLeg1() {
 	}
 	c.replayMu.Unlock()
 	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
-	if len(sequences) > 0 {
-		c.fallbackE.Add(1)
+	if len(sequences) == 0 {
+		return
 	}
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
+	c.fallbackE.Add(1)
 	for _, seq := range sequences {
-		for {
-			if c.isDone() {
-				return
-			}
-			c.replayMu.Lock()
-			entry := c.replay[seq]
-			var frame wireFrame
-			if entry != nil {
-				frame = entry.frame
-				frame.replay = true
-			}
+		c.replayMu.Lock()
+		entry := c.replay[seq]
+		if entry == nil {
 			c.replayMu.Unlock()
-			if entry == nil {
-				break
-			}
-			leg0 := c.getLeg(0)
-			if leg0 == nil {
+			continue
+		}
+		frame := entry.frame
+		c.retainBuffer(frame.data)
+		c.replayMu.Unlock()
+		leg0 := c.getLeg(0)
+		if leg0 == nil {
+			c.putBuffer(frame.data)
+			if !c.isDone() {
 				c.fail(errors.New("multipath control leg unavailable during fallback"))
-				return
 			}
-			if leg0.tryQueue(frame, c.cfg.QueueBytes) {
-				updateAtomicPeak(&c.legPeak[0], leg0.backlogBytes())
-				c.fallbackB.Add(uint64(len(frame.data)))
-				c.fallbackF.Add(1)
-				break
-			}
-			select {
-			case <-c.done:
-				return
-			case <-ticker.C:
-			}
+			return
+		}
+		if !c.queueRecovery(leg0, frame) {
+			c.putBuffer(frame.data)
+			return
+		}
+		c.fallbackB.Add(uint64(len(frame.data)))
+		c.fallbackF.Add(1)
+	}
+}
+
+func (c *mpCore) queueRecovery(leg *mpLeg, frame wireFrame) bool {
+	for {
+		leg.queueMu.Lock()
+		select {
+		case <-leg.done:
+			leg.queueMu.Unlock()
+			return false
+		default:
+		}
+		length := int64(len(frame.data))
+		leg.queuedBytes.Add(length)
+		select {
+		case leg.recovery <- frame:
+			leg.queueMu.Unlock()
+			updateAtomicPeak(&c.legPeak[0], leg.backlogBytes())
+			return true
+		default:
+			leg.queuedBytes.Add(-length)
+			leg.queueMu.Unlock()
+		}
+		select {
+		case <-c.done:
+			return false
+		case <-leg.done:
+			return false
+		case <-time.After(time.Millisecond):
 		}
 	}
 }
@@ -1629,6 +1814,9 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 		}
 	}
 	switch frame.typ {
+	case frameTypeWindow, frameTypeWindowRequest:
+		data := encodeFlow(frame)
+		return writeAll(conn, data[:])
 	case frameTypeData:
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {
 			return errors.New("invalid multipath data frame")
@@ -1640,7 +1828,7 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 		buffers := net.Buffers{header[:], frame.data}
 		_, err := buffers.WriteTo(conn)
 		return err
-	case frameTypeACK, frameTypeFIN, frameTypePing, frameTypePong:
+	case frameTypeFIN, frameTypePing, frameTypePong:
 		var header [controlFrameHeaderSize]byte
 		header[0] = frame.typ
 		binary.BigEndian.PutUint64(header[1:9], frame.seq)
@@ -1666,6 +1854,10 @@ func readWireFrameForLeg(ctx context.Context, conn net.Conn, core *mpCore, legID
 	}
 	frame.typ = frameType[0]
 	switch frame.typ {
+	case frameTypeWindow, frameTypeWindowRequest:
+		message, err := readFlow(conn)
+		frame.flow = message
+		return frame, err
 	case frameTypeData:
 		var header [dataFrameHeaderSize - 1]byte
 		if _, err := io.ReadFull(conn, header[:]); err != nil {
@@ -1676,22 +1868,18 @@ func readWireFrameForLeg(ctx context.Context, conn net.Conn, core *mpCore, legID
 		if length <= 0 || length > core.cfg.ChunkSize || length > maxFramePayload {
 			return wireFrame{}, errors.New("invalid multipath frame length")
 		}
-		class := memoryClassPrimary
-		if legID == 1 && frame.seq != core.rxExpected.Load() {
-			class = memoryClassBooster
-		}
-		buffer, err := core.getBuffer(ctx, class)
-		if err != nil {
-			return wireFrame{}, err
-		}
+		buffer := core.memory.takeReservedBuffer(core.cfg.ChunkSize)
 		buffer = buffer[:length]
 		if _, err := io.ReadFull(conn, buffer); err != nil {
-			core.putBuffer(buffer)
+			core.memory.putReservedBuffer(buffer)
 			return wireFrame{}, err
 		}
+		core.bufferMu.Lock()
+		core.buffers[&buffer[0]] = &ownedBuffer{data: buffer[:cap(buffer)], refs: 1, receive: true}
+		core.bufferMu.Unlock()
 		frame.data = buffer
 		return frame, nil
-	case frameTypeACK, frameTypeFIN, frameTypePing, frameTypePong:
+	case frameTypeFIN, frameTypePing, frameTypePong:
 		var sequence [8]byte
 		if _, err := io.ReadFull(conn, sequence[:]); err != nil {
 			return wireFrame{}, err

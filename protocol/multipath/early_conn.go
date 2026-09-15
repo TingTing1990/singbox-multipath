@@ -136,6 +136,9 @@ func (c *clientFastOpenConn) Close() error {
 
 func encodeWireFrame(frame wireFrame) ([]byte, error) {
 	switch frame.typ {
+	case frameTypeWindow, frameTypeWindowRequest:
+		encoded := encodeFlow(frame)
+		return encoded[:], nil
 	case frameTypeData:
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {
 			return nil, errors.New("invalid multipath data frame")
@@ -146,7 +149,7 @@ func encodeWireFrame(frame wireFrame) ([]byte, error) {
 		binary.BigEndian.PutUint32(encoded[9:13], uint32(len(frame.data)))
 		copy(encoded[dataFrameHeaderSize:], frame.data)
 		return encoded, nil
-	case frameTypeACK, frameTypeFIN:
+	case frameTypeFIN:
 		encoded := make([]byte, controlFrameHeaderSize)
 		encoded[0] = frame.typ
 		binary.BigEndian.PutUint64(encoded[1:9], frame.seq)
@@ -166,8 +169,9 @@ var (
 
 type earlyLogicalConn struct {
 	net.Conn
-	core    *mpCore
-	primary *clientFastOpenConn
+	core      *mpCore
+	primary   *clientFastOpenConn
+	helloOnce sync.Once
 }
 
 func (c *earlyLogicalConn) NeedHandshakeForWrite() bool {
@@ -176,21 +180,46 @@ func (c *earlyLogicalConn) NeedHandshakeForWrite() bool {
 
 func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 	if len(payload) == 0 && c.primary.NeedHandshakeForWrite() {
-		err := c.primary.writeHelloOnly()
-		if err != nil {
-			c.core.fail(err)
+		// The empty early-write kick must be interruptible just like DATA.
+		select {
+		case <-c.core.appConn.writeClosed:
+			return 0, net.ErrClosed
+		case <-c.core.appConn.writeDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		default:
 		}
-		return 0, err
+		c.helloOnce.Do(func() {
+			c.core.startWorkers(func() {
+				if err := c.primary.writeHelloOnly(); err != nil {
+					c.core.fail(err)
+				}
+			})
+		})
+		return 0, c.waitInitialWrite()
 	}
 	pending := c.primary.NeedHandshakeForWrite()
 	n, err := c.Conn.Write(payload)
 	if err == nil && pending {
-		if startErr := c.primary.waitStarted(); startErr != nil {
-			c.core.fail(startErr)
+		if startErr := c.waitInitialWrite(); startErr != nil {
 			return n, startErr
 		}
 	}
 	return n, err
+}
+
+func (c *earlyLogicalConn) waitInitialWrite() error {
+	select {
+	case <-c.primary.startDone:
+		return c.primary.startErr
+	case <-c.core.appConn.writeClosed:
+		return net.ErrClosed
+	case <-c.core.appConn.writeDeadline.Wait():
+		// Bytes already accepted into the logical stream remain queued, as
+		// with a partially successful TCP Write. A timeout does not reset it.
+		return os.ErrDeadlineExceeded
+	case <-c.core.done:
+		return net.ErrClosed
+	}
 }
 
 func (c *earlyLogicalConn) CloseRead() error {

@@ -6,6 +6,7 @@ import (
 	"math"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/byteformats"
@@ -16,7 +17,7 @@ const (
 	automaticMemoryLimitFallback = 256 << 20
 	memoryCacheLimitCap          = 16 << 20
 	sessionMemoryBase            = 128 << 10
-	wireFrameMemoryEstimate      = 64
+	wireFrameMemoryEstimate      = int64(unsafe.Sizeof(wireFrame{}))
 )
 
 var errMemoryLimit = errors.New("multipath memory limit reached")
@@ -94,8 +95,8 @@ func automaticMemoryLimit(available uint64) int64 {
 }
 
 func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
-	boosterLimit := limit * 7 / 8
-	boosterResume := limit * 3 / 4
+	boosterLimit := limit/8*7 + limit%8*7/8
+	boosterResume := limit/4*3 + limit%4*3/4
 	cacheLimit := limit / 16
 	if cacheLimit > memoryCacheLimitCap {
 		cacheLimit = memoryCacheLimitCap
@@ -115,7 +116,87 @@ func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
 func sessionMemoryReservation(cfg coreConfig) int64 {
 	// Covers goroutine stacks, maps, and the incoming plus two per-leg channel
 	// backing arrays. Payload buffers are charged separately at allocation time.
-	return sessionMemoryBase + int64(cfg.QueueFrames)*4*wireFrameMemoryEstimate
+	// Two readers and a leg0-only TX buffer guarantee progress independently
+	// of general payload allocations, even during partial booster reads.
+	return sessionMemoryBase + int64(cfg.QueueFrames)*5*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
+}
+
+func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if buffers := b.cache[size]; len(buffers) > 0 {
+		buffer := buffers[len(buffers)-1]
+		if len(buffers) == 1 {
+			delete(b.cache, size)
+		} else {
+			b.cache[size] = buffers[:len(buffers)-1]
+		}
+		b.cached -= int64(size)
+		return buffer[:size], nil
+	}
+	if b.used+int64(size) > b.limit && b.cached > 0 {
+		b.dropCacheLocked()
+	}
+	if b.used+int64(size) <= b.limit {
+		b.used += int64(size)
+		b.updatePressureLocked(time.Now())
+		return make([]byte, size), nil
+	}
+	return nil, b.changed
+}
+
+// reserveReceive grants only memory-backed credit. Unused grants count against
+// the same budget as payloads, and are returned by the peer's idle-credit epoch.
+func (b *memoryBudget) reserveReceive(slots uint64, slotBytes int64) uint64 {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.cached > 0 && b.boosterLimit-b.used < int64(slots)*slotBytes {
+		b.dropCacheLocked()
+	}
+	b.updatePressureLocked(time.Now())
+	available := b.boosterLimit - b.used
+	if available < slotBytes || b.pressure {
+		return 0
+	}
+	granted := min(slots, uint64(available/slotBytes))
+	b.used += int64(granted) * slotBytes
+	b.updatePressureLocked(time.Now())
+	return granted
+}
+
+// The caller has already charged a receive credit or a reader scratch slot.
+func (b *memoryBudget) takeReservedBuffer(size int) []byte {
+	b.access.Lock()
+	if buffers := b.cache[size]; len(buffers) > 0 {
+		buffer := buffers[len(buffers)-1]
+		if len(buffers) == 1 {
+			delete(b.cache, size)
+		} else {
+			b.cache[size] = buffers[:len(buffers)-1]
+		}
+		b.cached -= int64(size)
+		b.used -= int64(size)
+		b.updatePressureLocked(time.Now())
+		b.access.Unlock()
+		return buffer[:size]
+	}
+	b.access.Unlock()
+	return make([]byte, size)
+}
+
+// Returning a reserved buffer does not return its credit. Cache memory is
+// charged separately, so cached storage cannot consume a promised window slot.
+func (b *memoryBudget) putReservedBuffer(buffer []byte) {
+	size := cap(buffer)
+	b.access.Lock()
+	if !b.pressure && b.cached+int64(size) <= b.cacheLimit && b.used+int64(size) <= b.limit {
+		b.cache[size] = append(b.cache[size], buffer[:size])
+		b.cached += int64(size)
+		b.used += int64(size)
+	}
+	b.updatePressureLocked(time.Now())
+	b.signalLocked()
+	b.access.Unlock()
 }
 
 func (b *memoryBudget) reserveSession(bytes int64) bool {

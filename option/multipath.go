@@ -24,6 +24,7 @@ type MultipathOutboundOptions struct {
 	ChunkSize                   uint32                   `json:"chunk_size,omitempty"`
 	QueueFrames                 uint32                   `json:"queue_frames,omitempty"`
 	BandwidthMbps               []uint32                 `json:"bandwidth_mbps,omitempty"`
+	MaxReorderFrames            uint32                   `json:"max_reorder_frames,omitempty"`
 	MaxReorderBytes             uint64                   `json:"max_reorder_bytes,omitempty"`
 	Leg1ReplayBytes             uint64                   `json:"leg1_replay_bytes,omitempty"`
 	Leg1ReplayTimeout           badoption.Duration       `json:"leg1_replay_timeout,omitempty"`

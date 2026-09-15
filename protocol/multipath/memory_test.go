@@ -83,7 +83,7 @@ func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 
 func TestMemoryBudgetSessionAdmissionIsReleased(t *testing.T) {
 	cfg := testCoreConfig()
-	reservation := sessionMemoryReservation(cfg)
+	reservation := sessionMemoryReservation(cfg) + int64(cfg.ChunkSize) + receiveFrameOverhead
 	budget := newMemoryBudget(reservation+1, false)
 	cfg.Memory = budget
 	first, _, err := newCoreWithError(context.Background(), cfg)

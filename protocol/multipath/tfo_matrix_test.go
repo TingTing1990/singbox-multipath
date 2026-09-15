@@ -207,10 +207,13 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 		t.Fatal(err)
 	}
 	writes, deadlines := clientConn.snapshot()
-	if !bytes.Equal(bytes.Join(writes, nil), append(hello, frame...)) {
-		t.Fatal("physical writes do not contain exactly the hello and first data frame")
+	initial := append(hello, frame...)
+	if !bytes.HasPrefix(bytes.Join(writes, nil), initial) {
+		t.Fatal("physical writes do not start with the hello and first data frame")
 	}
-	if multipathTFO && len(writes) != 1 {
+	// Window/control frames may follow the first DATA, but must not split or
+	// precede the hello + first DATA write used for TCP Fast Open.
+	if multipathTFO && (len(writes) == 0 || !bytes.Equal(writes[0], initial)) {
 		t.Fatalf("multipath TFO did not combine the hello and first frame: %d writes", len(writes))
 	}
 	if !multipathTFO && len(writes) <= 1 {

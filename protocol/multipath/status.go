@@ -313,7 +313,7 @@ func (s *outboundStatus) addSession(id [16]byte, destination string, core *mpCor
 	s.connectionsMade++
 	s.access.Unlock()
 	go func() {
-		<-core.Done()
+		<-core.released
 		s.removeSession(session)
 	}()
 	return session
