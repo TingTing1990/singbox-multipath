@@ -294,6 +294,10 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	metadata.Destination = destination
 	i.logger.InfoContext(ctx, "multipath session established to ", destination, " on leg ", hello.LegID)
 	logicalOnClose := N.OnceClose(func(closeErr error) {
+		// The router can report a target dial/early-write failure before it
+		// calls Close on appConn. A prior MP failure is already frozen and
+		// cannot be reclassified by this application-side cleanup callback.
+		core.noteCloseSource(closeSourceLocalEndpoint)
 		if closeErr == nil || errors.Is(closeErr, io.EOF) {
 			_ = appConn.Close()
 		} else {

@@ -51,6 +51,7 @@ type wireFrame struct {
 	flow                     flowMessage
 	replay                   bool
 	more                     bool // an incremental payload piece; only the last piece counts as a frame
+	closeReason              byte
 }
 
 func encodeFlow(frame wireFrame) [1 + flowPayloadSize]byte {
@@ -119,7 +120,13 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 	case frameTypeFIN, frameTypePing, frameTypePong:
 		binary.BigEndian.PutUint64(header[1:], frame.seq)
 		return writeAll(conn, header[:])
-	case frameTypeReset, frameTypeSessionClose:
+	case frameTypeSessionClose:
+		if frame.closeReason > closeReasonShutdown {
+			return errors.New("invalid multipath close reason")
+		}
+		header[1] = frame.closeReason
+		return writeAll(conn, header[:2])
+	case frameTypeReset:
 		return writeAll(conn, header[:1])
 	default:
 		return errors.New("unknown multipath frame type")
@@ -193,7 +200,14 @@ func readFrameData(conn net.Conn, scratch []byte, receive func(wireFrame) error)
 		if _, err = io.ReadFull(conn, header[1:9]); err == nil {
 			frame.seq = binary.BigEndian.Uint64(header[1:9])
 		}
-	case frameTypeReset, frameTypeSessionClose:
+	case frameTypeSessionClose:
+		if _, err = io.ReadFull(conn, header[1:2]); err == nil {
+			frame.closeReason = header[1]
+			if frame.closeReason > closeReasonShutdown {
+				err = errors.New("invalid multipath close reason")
+			}
+		}
+	case frameTypeReset:
 	default:
 		err = errors.New("unknown multipath frame type")
 	}

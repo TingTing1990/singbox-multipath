@@ -44,6 +44,7 @@ func (c *mpCore) Done() <-chan struct{} {
 }
 
 func (c *mpCore) Close() error {
+	c.noteCloseSource(closeSourceShutdown)
 	c.fail(net.ErrClosed)
 	// Service shutdown and explicit core disposal must also interrupt a peer
 	// close that is waiting for the local application to drain buffered data.
@@ -52,6 +53,9 @@ func (c *mpCore) Close() error {
 }
 
 func (c *mpCore) closeApplication() error {
+	// MP failures mark their source before exposing an application I/O error.
+	// A Close on a still-healthy logical connection comes from its caller.
+	c.noteCloseSource(closeSourceLocalEndpoint)
 	c.localClosing.Store(true)
 	c.localReadClosed.Store(true)
 	err, _ := c.appConn.closeInternal()
@@ -79,10 +83,14 @@ func (c *mpCore) isDone() bool {
 }
 
 func (c *mpCore) fail(err error) {
+	c.noteCloseSource(closeSourceTransport)
 	c.terminate(err, frameTypeSessionClose)
 }
 
 func (c *mpCore) peerSessionClosed(err error) {
+	// A peer close without provenance must not become a local endpoint close
+	// when the relay reacts to the resulting logical I/O error.
+	c.noteCloseSource(closeSourcePeerUnknown)
 	c.terminateWithReceiveDrain(err, 0, errors.Is(err, io.EOF) && c.receiveComplete())
 }
 
@@ -140,6 +148,7 @@ func (c *mpCore) terminateWithReceiveDrain(err error, terminalFrameType byte, dr
 }
 
 func (c *mpCore) protocolFail(err error) {
+	c.noteCloseSource(closeSourceTransport)
 	c.terminate(err, frameTypeReset)
 }
 
@@ -234,7 +243,7 @@ func (c *mpCore) finishLegShutdown(leg *mpLeg, request legShutdownRequest) {
 		_ = writeWireFrame(leg.conn, wireFrame{typ: frameTypeSenderStatus, status: *request.status})
 	}
 	if request.frameType != 0 {
-		_ = writeWireFrame(leg.conn, wireFrame{typ: request.frameType})
+		_ = writeWireFrame(leg.conn, wireFrame{typ: request.frameType, closeReason: c.wireCloseReason()})
 	}
 	leg.close(request.err)
 }

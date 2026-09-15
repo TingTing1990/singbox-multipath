@@ -239,6 +239,7 @@ type outboundStatusConfig struct {
 
 type statusErrorEvent struct {
 	message     string
+	source      string
 	category    string
 	stage       string
 	destination string
@@ -363,10 +364,19 @@ func (s *outboundStatus) recordLegError(legID uint8, stage string, destination s
 		return
 	}
 	category, transient, harmless := classifyStatusError(err)
+	source := closeSourceUnknown
+	var sourced *sourcedLegError
+	if errors.As(err, &sourced) {
+		source = sourced.source
+	}
 	s.access.Lock()
-	count := s.legErrors[legID].count + 1
+	count := s.legErrors[legID].count
+	if !isEndpointLegError(err) {
+		count++
+	}
 	s.legErrors[legID] = statusErrorEvent{
 		message:     err.Error(),
+		source:      source.String(),
 		category:    category,
 		stage:       stage,
 		destination: destination,
@@ -556,6 +566,7 @@ type statusLeg struct {
 	UDPCurrent              statusRate     `json:"udp_current"`
 	UDPCumulative           statusTraffic  `json:"udp_cumulative"`
 	LastError               string         `json:"last_error,omitempty"`
+	LastErrorSource         string         `json:"last_error_source,omitempty"`
 	LastErrorAt             string         `json:"last_error_at,omitempty"`
 	LastErrorCategory       string         `json:"last_error_category,omitempty"`
 	LastErrorStage          string         `json:"last_error_stage,omitempty"`
@@ -834,6 +845,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		}
 		if !legErrors[index].at.IsZero() {
 			legs[index].LastError = legErrors[index].message
+			legs[index].LastErrorSource = legErrors[index].source
 			legs[index].LastErrorAt = legErrors[index].at.Format(time.RFC3339Nano)
 			legs[index].LastErrorCategory = legErrors[index].category
 			legs[index].LastErrorStage = legErrors[index].stage

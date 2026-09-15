@@ -17,7 +17,7 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v8**. Older protocol versions are
+Both endpoints must use multipath protocol **v9**. Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -168,7 +168,7 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v8 requests a compact sender-status
+When the client enables `status_file`, protocol v9 requests a compact sender-status
 frame from the server on leg 0. It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
 are coalesced and do not consume data sequence numbers, replay space, or the payload
@@ -188,6 +188,19 @@ activation. Joins, attempts and reported remote failures retain closed-session
 totals; probe statistics cover active connections only. A lazy primary transport
 can be attached before its deferred handshake finishes. Remote failure totals
 include only events actually reported by the peer.
+
+Leg events include `last_error_source`: `local_endpoint`, `remote_endpoint`,
+`transport`, `shutdown`, or `unknown`. Closing a healthy logical connection marks
+an application-endpoint shutdown; a preceding multipath failure keeps its original
+source. Session-close frames carry this provenance to the peer on both legs.
+Only close-related I/O errors inherit endpoint attribution; timeouts and protocol
+errors remain visible. A missing close marker leaves the source unknown rather
+than guessing from EOF, reset or QUIC cancellation text. The marker is diagnostic
+only: it does not change FIN handling, scheduling, recovery or close timing.
+Status schema 3 adds the source field. Confirmed endpoint-close events do not
+increment leg failure/event counters; other events, including unattributed and
+harmless closures, retain their existing counting semantics. Protocol v9 requires
+updating both endpoints.
 
 Remote scheduler rate estimates are not one-second throughput or physical link
 capacity. DATA-feedback RTT follows the selected data leg outward and leg0 for

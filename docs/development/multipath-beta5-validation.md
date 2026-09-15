@@ -1,10 +1,27 @@
 # Multipath beta5 development validation
 
+## Updated beta5: endpoint error provenance
+
+The updated release uses protocol v9: session-close frames include a bounded
+close-reason field, and status schema 3 adds `last_error_source`. Both endpoints
+must be updated. Application closure is distinguished from prior MP failure;
+only closure-related I/O events inherit endpoint attribution. Missing provenance,
+timeouts and malformed frames are not filtered. Scheduling, flow control,
+reinjection, FIN/drain handling and close timing are unchanged.
+
+Close-reason codecs, cross-leg provenance, primary-failure attribution, QUIC
+code-zero cancellation classification and LuCI source-based filtering have
+regression coverage. The correctness race suite (excluding the historical
+`TestPerformanceHealthyLinks`) and direct/proxy TFO integration matrix passed.
+The performance results below are historical, not new measurements.
+
+## Earlier checkpoints
+
 Historical development checkpoint: 2026-09-16, before commit `cd94d40a6`.
 The source fingerprints, development artifacts and performance results below
 describe that checkpoint, at which the full performance suite had two failures.
 
-The `v1.14.0-multipath-beta5` release adds statistics-only corrections on top of
+The original beta5 release at `a6e18e4d8` adds statistics-only corrections on top of
 `cd94d40a6`: attachment counts independent of local TX activation and cumulative
 reported remote failures. Scheduling, path estimates, wire v8 and the data path
 are unchanged. Five race repetitions of the new counter tests, the correctness

@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionEightHello(t *testing.T) {
+func TestProtocolVersionNineHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		ChunkSize:   64 * 1024,
@@ -215,12 +215,12 @@ func TestProtocolVersionEightHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMP8" || encoded[4] != 8 {
+	if string(encoded[:4]) != "SMP9" || encoded[4] != 9 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV8Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV9Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -229,12 +229,12 @@ func TestWriteHelloResponseRejectsInvalidV8Values(t *testing.T) {
 		{Status: 2, ChunkSize: 64 * 1024},
 	} {
 		if err := writeHelloResponse(client, response); err == nil {
-			t.Fatalf("accepted invalid v7 hello response: %+v", response)
+			t.Fatalf("accepted invalid v9 hello response: %+v", response)
 		}
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV8Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidV9Values(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -244,6 +244,8 @@ func TestReadHelloResponseRejectsInvalidV8Values(t *testing.T) {
 		{"v4 response", 4, helloStatusOK, 64 * 1024},
 		{"v5 response", 5, helloStatusOK, 64 * 1024},
 		{"v6 response", 6, helloStatusOK, 64 * 1024},
+		{"v7 response", 7, helloStatusOK, 64 * 1024},
+		{"v8 response", 8, helloStatusOK, 64 * 1024},
 		{"unknown status", helloVersion, 2, 64 * 1024},
 		{"missing rejection reason", helloVersion, helloStatusRejected, 0},
 		{"unknown rejection reason", helloVersion, helloStatusRejected, 255},
@@ -263,7 +265,7 @@ func TestReadHelloResponseRejectsInvalidV8Values(t *testing.T) {
 				writeDone <- writeAll(server, header[:])
 			}()
 			if _, err := readHelloResponse(client); err == nil {
-				t.Fatal("accepted invalid v7 hello response")
+				t.Fatal("accepted invalid v9 hello response")
 			}
 			if err := <-writeDone; err != nil {
 				t.Fatal(err)
@@ -273,7 +275,7 @@ func TestReadHelloResponseRejectsInvalidV8Values(t *testing.T) {
 }
 
 func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
-	for _, version := range []byte{4, 5, 6, 7} {
+	for _, version := range []byte{4, 5, 6, 7, 8} {
 		header, err := encodeHelloHeader(helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"})
 		if err != nil {
 			t.Fatal(err)

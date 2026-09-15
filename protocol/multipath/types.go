@@ -187,6 +187,7 @@ type mpCore struct {
 	receivedFIN     atomic.Bool
 	ackedFIN        atomic.Bool
 	localClosing    atomic.Bool
+	closeSource     atomic.Uint32
 	localReadClosed atomic.Bool
 	ackedNext       atomic.Uint64
 	rxExpected      atomic.Uint64

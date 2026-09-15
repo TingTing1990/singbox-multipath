@@ -51,6 +51,10 @@ func TestCoreCloseWritesSessionCloseOnEveryLeg(t *testing.T) {
 		if frameType[0] != frameTypeSessionClose {
 			t.Fatalf("leg%d received frame type %d instead of session-close", legID, frameType[0])
 		}
+		var reason [1]byte
+		if _, err := io.ReadFull(peerConn, reason[:]); err != nil || reason[0] != closeReasonShutdown {
+			t.Fatalf("leg%d close reason: %v %v", legID, reason, err)
+		}
 	}
 }
 
@@ -156,7 +160,7 @@ func TestInitialFrameEncoderSupportsSessionClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded) != 1 || encoded[0] != frameTypeSessionClose {
+	if len(encoded) != 2 || encoded[0] != frameTypeSessionClose || encoded[1] != closeReasonUnknown {
 		t.Fatalf("unexpected encoded session-close frame: %v", encoded)
 	}
 }

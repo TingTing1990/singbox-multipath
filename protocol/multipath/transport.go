@@ -164,6 +164,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			}
 			return
 		case frameTypeSessionClose:
+			c.notePeerCloseReason(frame.closeReason)
 			if leg.id != 0 {
 				// A delayed secondary terminal frame cannot close the logical
 				// stream before the primary's ordered terminal event arrives.
@@ -255,16 +256,24 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		wakeFlow(c.pumpWake)
 		return
 	}
-	c.legFailureMu.Lock()
-	c.legFailures[leg.id]++
-	c.lastFailLeg = leg.id
-	c.lastFailStage = stage
-	c.legFailureMu.Unlock()
+	if leg.id == 0 {
+		// Freeze a primary transport failure before it can make the relay
+		// close the logical connection; that cleanup is not an endpoint fault.
+		c.noteCloseSource(closeSourceTransport)
+	}
+	eventErr := c.sourcedLegError(err)
+	if !isEndpointLegError(eventErr) {
+		c.legFailureMu.Lock()
+		c.legFailures[leg.id]++
+		c.lastFailLeg = leg.id
+		c.lastFailStage = stage
+		c.legFailureMu.Unlock()
+	}
 	if c.cfg.OnStatusEvent != nil {
 		c.cfg.OnStatusEvent()
 	}
 	if c.cfg.OnLegFailure != nil {
-		c.cfg.OnLegFailure(leg.id, stage, err)
+		c.cfg.OnLegFailure(leg.id, stage, eventErr)
 	}
 	if leg.id == 0 {
 		if c.receiveComplete() {
