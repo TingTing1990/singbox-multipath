@@ -17,7 +17,7 @@ The multipath protocol does not provide authentication or encryption by itself. 
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v7**. Older protocol versions are
+Both endpoints must use multipath protocol **v8**. Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -31,9 +31,20 @@ session no longer has its control path.
 Leg 1 is a capacity booster. It can attach while the connection is still using only
 leg 0, but it does not carry application data until a local activation trigger fires.
 Each direction makes that decision independently from its own accepted-byte count,
-measured rate, and leg 0 queue pressure. Once active, new frames are assigned by each
-leg's queued bytes divided by its `bandwidth_mbps` weight, so a backing-up leg becomes
-less attractive without delaying writes already queued on the other leg.
+measured rate, and leg 0 backlog. After activation, the scheduler compares outstanding
+path bytes divided by observed delivery rate. Receipt feedback comes from the far
+multipath endpoint, so outstanding bytes include buffering inside a local proxy and
+its remote transport. Completing a local socket write is not delivery confirmation.
+There are no configured bandwidth weights or rate limits.
+
+An unmeasured path starts with a bounded probe. Feedback establishes its observed
+delivery rate and timing, not a guaranteed estimate of unused capacity. Once sampled,
+the shared receive window, send-history budget and child write backpressure bound
+assignment; there is no second per-path congestion window. Busy or stalled writers
+do not block assignment to another eligible path. The preferred-only phase uses
+normal child backpressure without the discovery-probe limit. Packet-level congestion
+control, pacing, and retransmission remain in the child: this protocol does not
+replace Hysteria2's congestion controller with an outer TCP one.
 
 `aggregation_enabled` controls only the local sending direction: client upload on
 an outbound, server download on an inbound. With it disabled, all locally sent
@@ -43,8 +54,8 @@ peer enables aggregation, and the selected UDP outbound is unaffected.
 With aggregation enabled, the following triggers are independent alternatives
 (OR), evaluated separately for each connection and sending direction:
 
-- Queue: `activation_on_queue` is enabled and leg 0 backlog stays at least 80% of
-  its queue byte capacity for `activation_window`.
+- Queue: `activation_on_queue` is enabled and leg 0 in-flight plus local unsent
+  bytes stay at least 80% of `queue_frames * chunk_size` for `activation_window`.
 - Rate: `activation_threshold_mbps` is greater than zero and the average local
   ingress rate over `activation_window` reaches it.
 - Bytes: `activation_after_bytes` is greater than zero and the local TX accepted-byte
@@ -58,92 +69,85 @@ traffic drops. Explicit zero disables a numeric trigger. An omitted rate thresho
 retains the default of 150 Mbps when the byte trigger is disabled, or zero when a
 non-zero byte trigger is configured.
 
-The logical byte stream is split into globally sequenced frames. The receiver accepts
-frames from both legs, buffers only bounded out-of-order data, and writes contiguous
-frames to the application. Cumulative receipt ACKs return on leg 0 as part of window
-updates; they acknowledge data held by the receiver, not application consumption.
-A frame assigned to leg 1
-is retained once in the replay map until that ACK covers it; the queue and replay map
-refer to the same payload rather than keeping duplicate copies.
+### Byte stream, receive window, and recovery
+
+Both paths carry mappings into one 64-bit **byte** sequence space. Each path also
+has a separate sequence space and incarnation ID. A receiver deduplicates overlapping
+mappings and returns a cumulative Data ACK for the contiguous received prefix.
+That ACK means the receiver owns the bytes, not that the application has read them.
+DATA mappings are processed incrementally: an arriving prefix can be delivered and
+acknowledged before the remaining payload of the same mapping reaches the receiver.
+Only Data ACK releases the sender's connection-level history, which retains data
+from **both** paths. An original or recovery writer holds an independent reference,
+so acknowledgement cannot free a buffer while a blocked child still uses it.
+
+The receiver advertises one monotonic byte-window right edge shared by both paths.
+Application reads move the window; individual path receipts do not. Short writes
+consume their actual byte length, not a whole frame credit. Local unsent capacity,
+whole-path in-flight bytes, retained send history, and receive storage are separate
+states. There are no idle-credit epochs, weight-based quotas, or separate leg 1
+replay ownership rules.
+
+Receive storage uses sparse 16 KiB pages, allocated only for arriving bytes. Under
+memory pressure, a receiver may decline speculative data or prune wholly
+unacknowledged out-of-order pages. It never discards Data-ACKed bytes waiting for the
+application. Path receipts still report transport delivery; they do not release the
+connection history. If a received mapping still covers the missing connection head,
+the sender can reinject it from that history. Each admitted session has reserved
+reader scratch, one head receive page, and a reusable primary TX buffer, so a missing
+head is not dependent on leg 1 releasing speculative storage.
 
 ### Weak leg 1 and fallback
 
-Each receiver grants a connection-level window shared by both legs. Every credit
-reserves one full negotiated chunk plus frame metadata in the local memory budget.
-The window is bounded by both `max_reorder_frames` and `max_reorder_bytes`, including
-in-order data waiting for the application. The sender cannot assign new frames
-beyond the granted window, so ordinary reordering or exhausted credit applies
-backpressure instead of resetting the logical session. Malformed frames and data
-outside the granted window remain protocol errors.
+Each path has an independent writer. A blocked leg 1 write does not hold the state
+lock, prevent leg 0 writes, or stop receive/control processing. Recovery reuses the
+same immutable byte history, does not consume new connection-window space, and does
+not need another payload allocation. Late originals are harmless duplicates.
 
-Receipt ACKs and application-consumption credit are separate. A slow application
-stops the window from growing without blocking control processing or being mistaken
-for lost leg 1 data. Each admitted session retains one reusable receive credit and
-budgeted reader scratch space and a reusable leg0-only TX buffer. Leg 0 can therefore
-deliver a missing frame even if leg 1 is stuck partway through the original frame.
-After 250 ms without new TX data,
-the sender returns unused credit using an epoch change, retaining one immediately
-usable slot. Stale window updates cannot restore returned credit, but their
-receipt ACKs, FIN acknowledgement and leg 1 progress remain valid. Returning
-credit therefore does not interrupt acknowledgement processing while the return
-request is still queued in a child transport.
+Whole-path receipts drive delivery-rate and timing estimates. A leg without progress
+is marked stale and pauses new assignments; retained mappings can be reinjected on
+another available path. Receipt progress clears the stale state. A stall is not an
+automatic disconnect/reconnect, and a hard secondary failure does not close the
+logical stream. An individual leg receipt above a missing global byte is ordinary
+reordering, not evidence that the missing byte was lost.
 
-Startup credit is advertised before the first DATA frame. With early write,
-hello, startup credit and first DATA share one physical write; advertising credit
-does not start a lazy child connection on its own. The startup grant is at most
-`min(2 * queue_frames * chunk_size, 32 MiB)`, subject to local receive limits and
-the shared budget. Speculative grants stop once local budget usage reaches 1/8
-of `memory_limit`; every admitted session still retains its guaranteed first slot.
-Further window growth is demand-driven. Its per-session target shares half of the
-booster budget, excluding the buffer cache, between live sessions. Already granted
-credit is never revoked unilaterally. This leaves budget for TX and session
-overhead while allowing a few busy connections to use large receive windows.
+The adaptive no-progress interval is smoothed delivery RTT plus four times its
+variation, at least 200 ms, initially one second before measurements are available.
+An explicit `leg1_replay_timeout` supplies an additional lower bound. Buffering in
+child transports is included in timing measurements. Control/window updates take
+priority over DATA not yet submitted to the primary child; they cannot overtake an
+already blocked child write or bytes already queued inside a reliable transport.
 
-The two legs have independent writers. Control/window updates have priority on leg
-0, followed by a dedicated recovery queue, then ordinary data. The receiver also
-reports the highest complete leg 1 DATA sequence independently of the cumulative
-ACK. A leg 0 gap therefore does not make already received leg 1 data look lost.
-Only the cumulative ACK releases replay storage.
+These mechanisms preserve a usable leg 0 through secondary stalls and failures.
+They cannot guarantee the same latency as leg 0 alone after data have already been
+assigned to a slow path: detecting and recovering an earlier missing byte takes
+time and bandwidth. Aggregation also cannot exceed shared physical bottlenecks.
 
-When the earliest unreceived frame belongs to stalled leg 1, recovery re-injects
-retained frames on leg 0 in sequence order, at most 16 frames / 1 MiB per 20 ms
-pass (at least one frame), without waiting for recovery-queue space. New booster
-assignments pause until delivery progress resumes; already queued originals are
-not dropped unless that specific frame has been reassigned. A hard transport
-failure still schedules all remaining retained frames for recovery immediately.
-Recovery does not wait for the original writer to
-finish, and it does not immediately close leg 1. Queue, original-write, and replay
-references keep a shared payload alive until every user has released it; late
-duplicates are discarded by sequence number.
+Payload storage, path/mapping metadata, reserved progress buffers, cache, and estimated
+session overhead share one budget per multipath inbound or outbound. The default is
+`min(512 MiB, MemAvailable * 0.5)`. New booster assignments and ordinary receive-window
+growth pause at 7/8 and resume below 3/4; head progress remains reserved. Advertised
+but unused window space is not an allocation. This budget is not process RSS and
+does not include child TCP/QUIC buffers.
 
-`leg1_replay_timeout` defaults to **1 second** and is a lower bound on the recovery
-interval, not a queue-residence deadline. The timer starts when an original DATA
-write starts, or when a control write blocks queued DATA, and restarts on observed
-leg 1 delivery progress. RTT/jitter estimates and twice the smoothed DATA
-write-to-receipt time may lengthen this interval; they never shorten the configured
-value. This accounts for buffering inside child transports as well as the network.
-A leg with no subsequently observed delivery progress is detached only after
-`max(2s, 5 * effective recovery interval)` from recovery starting; the client then
-retries the leg. The stall timer clears once no unacknowledged data or blocked write remains;
-an idle leg is not detached merely because its delivery counters stop increasing.
+Omitted receive/send-history ceilings are derived from the node budget: half of
+its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
+one chunk). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
+not allocations or per-session reservations; concurrent sessions still share the
+same global allocator. Explicit byte limits remain hard caps. An omitted
+`max_reorder_frames` adds no independent chunk-count ceiling.
 
-This preserves the logical connection through booster stalls, disconnections, and
-receive-window pressure while leg 0 can still carry data. It does not guarantee
-identical latency to a standalone leg 0: detecting a missing earlier frame and
-delivering its replacement still take time, and retransmissions consume bandwidth.
-Bytes already written into a child transport cannot be reprioritized.
-
-Payloads, granted receive credit, reader scratch/TX reserve space, and estimated
-per-session overhead share one budget per multipath inbound or outbound. With `memory_limit`
-omitted, the budget is `min(512 MiB, MemAvailable * 0.5)`. New booster work and window
-growth pause at 7/8 of the budget and resume at 3/4; admitted sessions retain their
-leg 0 progress slot. Memory pressure alone does not close leg 1. Reported budget
-usage includes unused promised credit and is not a measurement of process RSS.
+The byte-sequence, Data ACK, shared-window, reinjection, and DATA_FIN model follows
+[RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html). The delivery-based scheduling
+basis follows [Linux MPTCP](https://github.com/torvalds/linux/blob/587858367581b9c55c3690f4e63382ad622719d4/net/mptcp/protocol.c).
+This is an independent implementation over reliable proxy streams, not MPTCP wire
+compatibility, native subflow TCP congestion control, or an implementation of every
+optional MPTCP path-management/security mechanism.
 
 ### Connection shutdown
 
-FIN identifies the final sequence of each sending direction. A window update
-acknowledges FIN only after every preceding frame has been received. An application
+DATA_FIN occupies one byte-sequence position at the end of each sending direction.
+A cumulative Data ACK covers it only after all preceding bytes have been received. An application
 close rejects further local I/O but drains accepted TX in the background; session-close
 is sent only after the peer acknowledges that final sequence. Half-closing one
 direction leaves the reverse direction usable, including through connection wrappers.
@@ -164,16 +168,16 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v7 requests a compact sender-status
+When the client enables `status_file`, protocol v8 requests a compact sender-status
 frame from the server on leg 0. It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
 are coalesced and do not consume data sequence numbers, replay space, or the payload
 memory budget. The client marks remote status stale when updates stop rather than
 interpreting missing telemetry as zero.
 
-Active aggregation sessions send low-rate PING/PONG probes independently of
-`status_file` so recovery has RTT samples. Client status collection also probes
-attached legs. Reported RTT is the effective application-layer round trip and
+Active paths send low-rate PING/PONG probes independently of `status_file` for
+observability. Recovery timing uses DATA receipt samples, not probe success alone.
+An idle unused secondary is not probed just because it is attached. Reported RTT is the effective application-layer round trip and
 therefore includes transport and proxy queueing. Probe timeouts and replay fallback
 ratios describe multipath-visible stalls; they are not raw IP or UDP packet-loss
 measurements. Traffic peaks are the highest one-second averages since process start,
@@ -227,11 +231,7 @@ already configured Hysteria2 outbound for the secondary leg:
       "activation_after_bytes_min_mbps": 120,
       "activation_window": "1s",
       "chunk_size": 65536,
-      "queue_frames": 256,
-      "bandwidth_mbps": [
-        160,
-        700
-      ]
+      "queue_frames": 256
     }
   ]
 }
@@ -262,11 +262,7 @@ is completed before the logical connection is returned.
       "activation_threshold_mbps": 120,
       "activation_window": "1s",
       "chunk_size": 65536,
-      "queue_frames": 256,
-      "bandwidth_mbps": [
-        160,
-        700
-      ]
+      "queue_frames": 256
     }
   ]
 }
@@ -282,14 +278,13 @@ inbound. TX and RX are relative to the side where a field is configured:
 | **Local TX** | Upload towards the aggregation server | Download towards the client |
 | **Local RX** | Download received from the server | Upload received from the client |
 
-Unless stated otherwise, tuning limits apply per logical TCP connection; send
-queues additionally apply per leg. The memory budget is shared by all sessions of
+Unless stated otherwise, tuning limits apply per logical TCP connection. The memory budget is shared by all sessions of
 one multipath inbound or outbound. These TCP tuning fields do not configure UDP
 forwarding or the child transports' TCP/QUIC buffers and congestion control.
 
 Most settings are local and independent: the server does not push its activation,
-queue, weight, replay, or memory configuration to the client. Receive limits are
-also configured locally, but constrain the credit advertised to the peer. Telemetry
+queue, replay, or memory configuration to the client. Receive limits are
+also configured locally, but constrain the byte window advertised to the peer. Telemetry
 reports remote values without applying them to local configuration.
 
 `chunk_size` is agreed during the hello exchange: the client requests one maximum frame payload size
@@ -302,20 +297,17 @@ telemetry; the file path itself is not sent.
 
 For example, with client `chunk_size: 16384, queue_frames: 64` and server
 `chunk_size: 65536, queue_frames: 256`, both directions use frames of at most 16 KiB.
-Each client leg has a pending-send limit of 64 frames / 1 MiB; each server leg has
-a limit of 256 frames / 4 MiB. These figures exclude the frame currently being
-written, replay/receive storage, and child transport buffers. Leg 0 additionally has
-a priority recovery queue of `queue_frames` slots referencing retained payloads;
-it does not duplicate their storage. Receive buffering uses the granted window,
-not a `queue_frames`-sized handoff channel.
+The client has 1 MiB of local unsent capacity per connection; the server has 4 MiB.
+This does not cap whole-path in-flight data. Already assigned bytes stay in the
+connection's send history until Data ACK; each path writer holds at most one
+assignment. Reinjection references history rather than a separate recovery queue.
 
-`max_reorder_frames` independently bounds local RX: client download on the outbound,
-server upload on the inbound. Both sides default to 2048. The maximum receive
-window is `min(max_reorder_frames, floor(max_reorder_bytes / chunk_size))` chunks;
-actual credit can be smaller due to shared memory availability and sender demand.
-With 16 KiB chunks, 2048 slots represent 32 MiB, not 64 MiB. Small frames consume a
-whole slot because their buffer allocation still has full chunk capacity. Raising
-only `max_reorder_bytes` does not increase a frame-limited window.
+`max_reorder_frames` is a capacity in negotiated chunk-size units, not a count of
+received wire frames. Together with `max_reorder_bytes` it sets the local RX byte
+window: `min(max_reorder_frames * chunk_size, max_reorder_bytes)`. With 16 KiB chunks,
+an explicit 2048 units mean 32 MiB. Short mappings consume only their actual byte range. Both
+limits include in-order data awaiting application reads; sparse page allocation and
+the shared memory budget separately control actual storage.
 
 ### Outbound fields
 
@@ -335,19 +327,18 @@ All fields below are available on both sides.
 | Field | Scope and peer interaction | Description | Accepted format / example |
 | --- | --- | --- | --- |
 | `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
-| `activation_on_queue` | **Local TX** leg 0 backlog; not negotiated. | **Condition 1**, an independent OR trigger: backlog (queued plus currently writing payload) stays at least 80% of the local send-queue byte capacity for `activation_window`. Default: `true`. | `true` or `false` |
+| `activation_on_queue` | **Local TX**; not negotiated. | **Condition 1**, an independent OR trigger: primary path in-flight plus local unsent bytes stay at least 80% of `chunk_size * queue_frames` for `activation_window`. Default: `true`. | `true` or `false` |
 | `activation_threshold_mbps` | **Local TX** ingress rate per connection; not negotiated. | **Condition 2**, an independent OR trigger measured over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |
 | `activation_after_bytes` | **Local TX** cumulative application bytes per connection; not negotiated. | **Condition 3**, an independent OR trigger. Counts bytes accepted into the local multipath sender, not peer delivery or combined RX/TX traffic. `0` or omitted disables it. | Non-negative integer or memory string, e.g. `2097152`, `"2MB"`, or `0` |
 | `activation_after_bytes_min_mbps` | **Local TX** rate gate for condition 3 only; not negotiated. | The byte threshold and this average rate over a complete `activation_window` must both be met. `0` or omitted removes the gate. Conditions 1 and 2 remain independent. | Non-negative integer Mbps, e.g. `120` or `0` |
 | `activation_window` | **Local TX** measurement / trigger timing; not negotiated. | Rate sampling window and sustained high-queue duration. Default: `1s`. Does not set a receive or replay timeout. | Duration, e.g. `"1s"` |
 | `chunk_size` | **Both TX and RX**, client-requested and server-accepted per session. | Client value is the requested maximum frame payload for both directions; server value is the maximum acceptable request. Oversized requests are rejected, not reduced. Range: 1 KiB to 1 MiB; default: 64 KiB. | Non-negative integer bytes, e.g. `16384` or `65536` |
-| `queue_frames` | **Local TX**, per leg; local and not negotiated. | Ordinary pending-send capacity of 8 to 4096 frames per leg; leg 0 has an additional priority recovery queue with the same slot count. Ordinary byte capacity is accepted `chunk_size * queue_frames`; the configured product must not exceed 64 MiB. Also influences sender window demand, but does not set peer RX limits. Default: `256`. | Non-negative integer, e.g. `64` or `256` |
-| `bandwidth_mbps` | **Local TX** scheduler only; not negotiated. | Optional relative capacity weights, not rate limits. On the client, entries follow the original `outbounds` order and move with the selected `preferred` child; on the server, entries are in leg 0 / leg 1 order. An omitted array uses `[1, 1]`; each `0` entry uses weight `1`. | Two-entry non-negative integer array, e.g. `[160, 700]` or `[0, 0]` |
-| `max_reorder_frames` | **Local RX**, independently configured; constrains window credit advertised to peer TX. Client value controls download; server value controls upload. | Maximum receive-window slots per connection, including in-order data awaiting application consumption. Credit exhaustion pauses new sends instead of closing the session. Default: `2048`; range on both sides: 64 to 65536. | Non-negative integer, e.g. `2048` or `8192` |
-| `max_reorder_bytes` | **Local RX** per connection; constrains window credit advertised to peer TX. | Client value controls download; server value controls upload. Maximum receive-window payload allocation, charged in full negotiated chunks even for short frames. Default: 64 MiB; maximum: 512 MiB. The frame limit and shared memory budget can further restrict the window. | Non-negative integer bytes, e.g. `67108864` |
-| `leg1_replay_bytes` | **Local TX** retained leg 1 payload per connection; not negotiated. | Client history recovers upload; server history recovers download. Released by cumulative ACKs from the peer on leg 0. Default: 64 MiB; maximum: 512 MiB. This is not the peer's receive window. | Non-negative integer bytes, e.g. `67108864` |
-| `leg1_replay_timeout` | **Local TX** recovery timeout for leg 1 data; not negotiated. | Minimum no-progress interval after an original write starts, not queue residence. RTT and DATA receipt timing may extend it. A missing leg 1 frame starts bounded replay on leg 0 without immediately closing leg 1; resumed delivery stops recovery. Persistent stalls detach the leg after `max(2s, 5 * effective interval)` from recovery starting. Not a bound on total recovery time. Default: `1s`; range: `100ms` to `5m`. | Duration, e.g. `"1s"` |
-| `memory_limit` | **Local TX and RX**, shared across all sessions of one inbound or outbound; independently resolved on each side. RX credit reflects available local budget. | Budget for payloads, promised receive credit, reader scratch and estimated session overhead, not whole-process RSS or child transport buffers. Default: `min(512 MiB, MemAvailable * 0.5)`. Booster/window growth backpressure starts at 7/8 and clears at 3/4. Does not replace per-session receive limits. | Non-negative integer or memory string, e.g. `268435456` or `"256MB"` |
+| `queue_frames` | **Local TX**, per connection; not negotiated. | Local unsent capacity in negotiated chunk-size units. Range: 8–4096; configured product at most 64 MiB. Not a per-leg in-flight limit or receive window. Default: `256`. | Non-negative integer, e.g. `64` or `256` |
+| `max_reorder_frames` | **Local RX**; window constrains peer TX. Client: download; server: upload. | Window capacity in negotiated chunk-size units, limited further by `max_reorder_bytes`. Not a count of wire frames. Omitted / `0`: no additional chunk-count ceiling. Explicit range: 64–65536. | Non-negative integer, e.g. `2048` or `8192` |
+| `max_reorder_bytes` | **Local RX**, per connection; window constrains peer TX. | Maximum receive-window byte span, including unread in-order data. Sparse storage is allocated on arrival; small frames do not consume a full chunk. Default: budget-derived (7/16 of total, capped at 512 MiB); explicit maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
+| `leg1_replay_bytes` | **Local TX**, per connection; not negotiated. | Historical field name; now limits the connection send history for **both** paths, including unsent bytes. Only peer Data ACK releases history. Separate from peer RX capacity. Default: budget-derived (7/16 of total, capped at 512 MiB); explicit maximum: 512 MiB. | Non-negative integer bytes, e.g. `67108864` |
+| `leg1_replay_timeout` | **Local TX** recovery timing; not negotiated. | Historical field name; optional floor on adaptive path no-progress detection. Stale paths pause assignment without automatic disconnection. Omitted / `"0s"`: adaptive. Explicit non-zero range: `100ms`–`5m`. Not a total recovery deadline. | Duration, e.g. `"0s"` or `"1s"` |
+| `memory_limit` | **Local TX and RX**, shared across sessions of one inbound/outbound; independently resolved. | Budget for actual storage, cache, metadata and reserved progress buffers, not unused advertised windows, RSS, or child buffers. Default: `min(512 MiB, MemAvailable * 0.5)`. Booster/ordinary window growth pauses at 7/8 and resumes below 3/4. | Non-negative integer or memory string, e.g. `268435456` or `"256MB"` |
 | `handshake_timeout` | **Local connection setup**, covering hello reads/writes rather than application TX/RX; not negotiated. | Client limits the hello exchange and each secondary dial-plus-handshake attempt; the initial preferred-child dial uses its own context/child settings. Server applies a deadline while handling each accepted leg's hello. Default: `10s`; range: `1s` to `1m`. | Duration, e.g. `"10s"` |
 
 ### Server listen fields
@@ -365,7 +356,10 @@ omission or `0` selects the default/automatic value; it does not disable bufferi
 For `activation_window`, `leg1_replay_timeout`, and `handshake_timeout`, omission or
 `"0s"` selects the default. This differs from the activation thresholds and the
 condition-3 minimum rate, where explicit `0` disables the corresponding trigger or
-gate, and from `bandwidth_mbps`, where `0` means weight `1`.
+gate. `bandwidth_mbps` no longer affects scheduling. For configuration migration,
+both inbound and outbound accept this legacy field, ignore its value, and emit one
+warning per node initialization. Remove it from existing configurations when convenient.
+Other unknown fields still fail strict validation; this does not enable old wire protocols.
 
 Byte fields that accept a memory string use binary units: for example, `"2MB"`
 means 2 MiB. Bare integers remain supported and are interpreted as bytes.

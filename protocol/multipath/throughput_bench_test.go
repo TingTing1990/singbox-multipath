@@ -16,7 +16,6 @@ func BenchmarkCoreTCPThroughput(b *testing.B) {
 			cfg := testCoreConfig()
 			cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
 			cfg.MaxReorderFrames, cfg.MaxReorderBytes, cfg.ReplayBytes = 2048, 64<<20, 64<<20
-			cfg.BandwidthMbps = []uint32{160, 600}
 			left, app := newCore(context.Background(), cfg)
 			right, peer := newCore(context.Background(), cfg)
 			defer left.Close()

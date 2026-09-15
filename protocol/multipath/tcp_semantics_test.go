@@ -83,6 +83,7 @@ func TestDeadlineRecoveryPreservesStream(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
 		cfg.MaxReorderFrames = 1
+		cfg.ReplayBytes = 8 << 10
 		left, app := newCore(context.Background(), cfg)
 		right, peer := newCore(context.Background(), cfg)
 		defer closeFlowCores(left, right)

@@ -138,7 +138,7 @@ func (c *clientFastOpenConn) Close() error {
 
 func encodeWireFrame(frame wireFrame) ([]byte, error) {
 	switch frame.typ {
-	case frameTypeWindow, frameTypeWindowRequest:
+	case frameTypeWindow:
 		encoded := encodeFlow(frame)
 		return encoded[:], nil
 	case frameTypeData:
@@ -148,7 +148,9 @@ func encodeWireFrame(frame wireFrame) ([]byte, error) {
 		encoded := make([]byte, dataFrameHeaderSize+len(frame.data))
 		encoded[0] = frameTypeData
 		binary.BigEndian.PutUint64(encoded[1:9], frame.seq)
-		binary.BigEndian.PutUint32(encoded[9:13], uint32(len(frame.data)))
+		binary.BigEndian.PutUint64(encoded[9:17], frame.pathSeq)
+		binary.BigEndian.PutUint64(encoded[17:25], frame.generation)
+		binary.BigEndian.PutUint32(encoded[25:29], uint32(len(frame.data)))
 		copy(encoded[dataFrameHeaderSize:], frame.data)
 		return encoded, nil
 	case frameTypeFIN:

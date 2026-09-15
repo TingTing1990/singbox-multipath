@@ -3,6 +3,7 @@ package multipath
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ type finAckGate struct {
 
 func (g *finAckGate) Close() error { g.once.Do(func() { close(g.stopped) }); return g.Conn.Close() }
 func (g *finAckGate) Write(p []byte) (int, error) {
-	if !g.blocked && len(p) == 1+flowPayloadSize && p[0] == frameTypeWindow && p[1]&flowFlagFINAck != 0 {
+	if !g.blocked && len(p) == 1+flowPayloadSize && p[0] == frameTypeWindow && binary.BigEndian.Uint64(p[2:10]) == (32<<10)+1 {
 		g.blocked = true
 		close(g.started)
 		select {
@@ -105,7 +106,6 @@ func TestApplicationCloseDrainsAcrossTransientLegs(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					cfg := flowTestConfig()
 					cfg.ReplayTimeout = time.Second
-					cfg.BandwidthMbps = []uint32{1, 1}
 					left, app := newCore(context.Background(), cfg)
 					cfg.Memory = newMemoryBudget(1<<20, false)
 					right, peer := newCore(context.Background(), cfg)
@@ -201,7 +201,7 @@ func TestForceCloseInterruptsReceiveDrain(t *testing.T) {
 func TestRejectPrematureFINAcknowledgement(t *testing.T) {
 	c, _ := newCore(context.Background(), flowTestConfig())
 	defer c.Close()
-	if c.handleWindow(flowMessage{Limit: 1, Flags: flowFlagFINAck}) == nil {
+	if c.handleWindow(flowMessage{Next: 1, Limit: 1}) == nil {
 		t.Fatal("accepted ACK without FIN")
 	}
 }

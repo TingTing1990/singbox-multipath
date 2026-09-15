@@ -44,7 +44,7 @@ func (c *auditDelayConn) Write(p []byte) (int, error) {
 	isData := len(p) == dataFrameHeaderSize && p[0] == frameTypeData
 	isPayload := c.payload
 	c.payload = isData
-	match := c.mode == "all" || c.mode == "header" && isData || c.mode == "payload" && isPayload || c.mode == "window" && len(p) == 1+flowPayloadSize && (p[0] == frameTypeWindow || p[0] == frameTypeWindowRequest)
+	match := c.mode == "all" || c.mode == "header" && isData || c.mode == "payload" && isPayload || c.mode == "window" && len(p) == 1+flowPayloadSize && p[0] == frameTypeWindow
 	if match {
 		c.count++
 		if c.count%c.every == 0 {
@@ -94,7 +94,6 @@ func TestFlowRegressionTransientStallMatrix(t *testing.T) {
 					synctest.Test(t, func(t *testing.T) {
 						cfg := flowTestConfig()
 						cfg.ReplayTimeout = time.Second
-						cfg.BandwidthMbps = []uint32{1, 1}
 						left, app := newCore(context.Background(), cfg)
 						cfg.Memory = newMemoryBudget(1<<20, false)
 						right, peer := newCore(context.Background(), cfg)
@@ -202,6 +201,7 @@ func TestFlowRegressionIdleReturnUnderDelayedLeg0(t *testing.T) {
 func TestFlowRegressionExplicitOutOfOrderAndDuplicate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
+		cfg.MaxReorderBytes = 16 << 10
 		core, app := newCore(context.Background(), cfg)
 		defer closeFlowCores(core)
 		a, b := net.Pipe()
@@ -212,24 +212,16 @@ func TestFlowRegressionExplicitOutOfOrderAndDuplicate(t *testing.T) {
 		}
 		// Drain receiver control to keep a full independent leg0 write path.
 		go io.Copy(io.Discard, b)
-		core.flow.rxMu.Lock()
-		extra := core.memory.reserveReceive(7, core.receiveSlotBytes())
-		core.flow.rxLimit += extra
-		core.flow.rxWanted = core.flow.rxLimit
-		core.flow.rxMu.Unlock()
-		if extra != 7 {
-			t.Fatal("grant failed")
-		}
 		seqs := []uint64{3, 2, 3, 0, 2, 1, 7, 5, 4, 7, 6, 0, 1}
 		want := make([]byte, 0, 8*1024)
 		for i := 0; i < 8; i++ {
 			want = append(want, auditStream(i, 1024)...)
 		}
 		go func() {
-			for _, seq := range seqs {
-				_ = writeWireFrame(b, wireFrame{typ: frameTypeData, seq: seq, data: auditStream(int(seq), 1024)})
+			for index, seq := range seqs {
+				_ = writeWireFrame(b, wireFrame{typ: frameTypeData, seq: seq * 1024, generation: 1, pathSeq: uint64(index) * 1024, data: auditStream(int(seq), 1024)})
 			}
-			_ = writeWireFrame(b, wireFrame{typ: frameTypeFIN, seq: 8})
+			_ = writeWireFrame(b, wireFrame{typ: frameTypeFIN, seq: 8 * 1024})
 		}()
 		_ = app.SetReadDeadline(time.Now().Add(3 * time.Second))
 		got, err := io.ReadAll(app)
@@ -297,7 +289,7 @@ func TestFlowRegressionTransientControlStallThenIdle(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		left.replayMu.Lock()
-		pending := len(left.replay)
+		pending := left.replayBytes
 		left.replayMu.Unlock()
 		t.Logf("after recovered: replay=%d ack=%d next=%d fallback=%d", pending, left.ackedNext.Load(), left.txSeq.Load(), left.fallbackF.Load())
 		time.Sleep(6 * time.Second)
@@ -420,7 +412,7 @@ func TestFlowRegressionCloseDrainsAlreadyACKedReceiveData(t *testing.T) {
 		sent := flowSend(peer, payload, true)
 		time.Sleep(500 * time.Millisecond)
 		synctest.Wait()
-		if right.ackedNext.Load() != 4 {
+		if right.ackedNext.Load() != uint64(len(payload))+1 {
 			t.Fatalf("not fully receipt ACKed: %d", right.ackedNext.Load())
 		}
 		if err := <-sent; err != nil {

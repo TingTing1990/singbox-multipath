@@ -17,7 +17,7 @@ func TestAutomaticMemoryLimit(t *testing.T) {
 	}
 }
 
-func TestMemoryStartupCreditAndSessionShares(t *testing.T) {
+func TestIdleSessionsDoNotAllocateAdvertisedWindows(t *testing.T) {
 	cfg := testCoreConfig()
 	cfg.ChunkSize, cfg.QueueFrames, cfg.QueueBytes = 65536, 256, 16<<20
 	budget := newMemoryBudget(512<<20, false)
@@ -45,81 +45,57 @@ func TestMemoryStartupCreditAndSessionShares(t *testing.T) {
 		t.Fatal("incorrect live session count")
 	}
 	if budget.snapshot().Pressure {
-		t.Fatal("idle startup grants exhausted the budget")
+		t.Fatal("idle session reservations exhausted the budget")
 	}
-	slot := cores[0].receiveSlotBytes()
-	if int64(budget.receiveShareSlots(slot))*slot*32 > (budget.boosterLimit-budget.cacheLimit)/2 {
-		t.Fatal("receive growth targets exceed shared allocation")
+	if budget.snapshot().UsedBytes > budget.limit/4 {
+		t.Fatal("idle connections allocated their entire advertised windows")
 	}
+}
+
+func acquireTestMemory(t *testing.T, budget *memoryBudget, size int) []byte {
+	t.Helper()
+	buffer, _ := budget.tryAcquirePrimary(size)
+	if buffer == nil {
+		t.Fatalf("test allocation failed: %d", size)
+	}
+	return buffer
 }
 
 func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 	budget := newMemoryBudget(1024, false)
-	first, err := budget.acquire(context.Background(), 800, memoryClassPrimary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := budget.acquire(context.Background(), 100, memoryClassPrimary)
-	if err != nil {
-		t.Fatal(err)
-	}
+	first := acquireTestMemory(t, budget, 800)
+	second := acquireTestMemory(t, budget, 100)
 	if snapshot := budget.snapshot(); !snapshot.Pressure || snapshot.BoosterLimitBytes != 896 || snapshot.BoosterResumeBytes != 768 {
 		t.Fatalf("unexpected pressure snapshot: %+v", snapshot)
 	}
-
-	boosterResult := make(chan []byte, 1)
-	boosterError := make(chan error, 1)
-	go func() {
-		buffer, acquireErr := budget.acquire(context.Background(), 64, memoryClassBooster)
-		if acquireErr != nil {
-			boosterError <- acquireErr
-			return
-		}
-		boosterResult <- buffer
-	}()
-	select {
-	case <-boosterResult:
-		t.Fatal("booster allocation passed the high watermark")
-	case err = <-boosterError:
-		t.Fatal(err)
-	case <-time.After(20 * time.Millisecond):
+	if budget.boosterAllowed() || budget.reservePage(64, false) {
+		t.Fatal("booster passed high watermark")
 	}
-
-	primary, err := budget.acquire(context.Background(), 100, memoryClassPrimary)
-	if err != nil {
-		t.Fatalf("primary could not use reserved memory: %v", err)
-	}
+	primary := acquireTestMemory(t, budget, 100)
 	budget.release(primary)
 	budget.release(second)
-	select {
-	case <-boosterResult:
-		t.Fatal("booster resumed above the low watermark")
-	case err = <-boosterError:
-		t.Fatal(err)
-	case <-time.After(20 * time.Millisecond):
+	if budget.boosterAllowed() {
+		t.Fatal("booster resumed above low watermark")
 	}
-
 	budget.release(first)
-	select {
-	case booster := <-boosterResult:
-		budget.release(booster)
-	case err = <-boosterError:
-		t.Fatal(err)
-	case <-time.After(time.Second):
-		t.Fatal("booster did not resume below the low watermark")
+	if !budget.boosterAllowed() || !budget.reservePage(64, false) {
+		t.Fatal("booster did not resume")
 	}
+	budget.releaseSession(64)
+	cached := acquireTestMemory(t, budget, 64)
+	budget.release(cached)
 	snapshot := budget.snapshot()
-	if snapshot.Pressure || snapshot.PressureEvents != 1 || snapshot.BackpressureEvents != 1 {
+	if snapshot.Pressure || snapshot.PressureEvents != 1 {
 		t.Fatalf("unexpected final memory snapshot: %+v", snapshot)
 	}
 	if snapshot.PeakUsedBytes < 1000 || snapshot.PeakCachedBytes < 64 {
-		t.Fatalf("memory peaks were not retained: %+v", snapshot)
+		t.Fatalf("memory peaks not retained: %+v", snapshot)
 	}
 }
 
 func TestMemoryBudgetSessionAdmissionIsReleased(t *testing.T) {
 	cfg := testCoreConfig()
-	reservation := sessionMemoryReservation(cfg) + int64(cfg.ChunkSize) + receiveFrameOverhead
+	reservation := minimumSessionMemory(cfg)
 	budget := newMemoryBudget(reservation+1, false)
 	cfg.Memory = budget
 	first, _, err := newCoreWithError(context.Background(), cfg)
@@ -165,12 +141,12 @@ func TestCoreMemoryPressureKeepsLeg0Available(t *testing.T) {
 
 	snapshot := budget.snapshot()
 	pressureBytes := int(snapshot.BoosterLimitBytes - snapshot.UsedBytes)
-	pressureBuffer, err := budget.acquire(context.Background(), pressureBytes, memoryClassPrimary)
-	if err != nil {
-		t.Fatal(err)
-	}
+	pressureBuffer := acquireTestMemory(t, budget, pressureBytes)
 	defer budget.release(pressureBuffer)
-	if selected := core.chooseLeg(cfg.ChunkSize); selected == nil || selected.id != 0 {
+	core.stateMu.Lock()
+	selected := core.choosePathLocked(cfg.ChunkSize)
+	core.stateMu.Unlock()
+	if selected == nil || selected.id != 0 {
 		t.Fatalf("memory pressure selected leg %v instead of leg0", selected)
 	}
 }

@@ -206,7 +206,7 @@ func TestHelloRejectsBoosterStatus(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionSevenHello(t *testing.T) {
+func TestProtocolVersionEightHello(t *testing.T) {
 	encoded, err := encodeHello(helloMessage{
 		LegID:       0,
 		ChunkSize:   64 * 1024,
@@ -215,12 +215,12 @@ func TestProtocolVersionSevenHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded[:4]) != "SMP7" || encoded[4] != 7 {
+	if string(encoded[:4]) != "SMP8" || encoded[4] != 8 {
 		t.Fatalf("unexpected multipath protocol header: %q version=%d", encoded[:4], encoded[4])
 	}
 }
 
-func TestWriteHelloResponseRejectsInvalidV7Values(t *testing.T) {
+func TestWriteHelloResponseRejectsInvalidV8Values(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -234,7 +234,7 @@ func TestWriteHelloResponseRejectsInvalidV7Values(t *testing.T) {
 	}
 }
 
-func TestReadHelloResponseRejectsInvalidV7Values(t *testing.T) {
+func TestReadHelloResponseRejectsInvalidV8Values(t *testing.T) {
 	tests := []struct {
 		name    string
 		version byte
@@ -273,7 +273,7 @@ func TestReadHelloResponseRejectsInvalidV7Values(t *testing.T) {
 }
 
 func TestReadHelloRejectsOldProtocolVersions(t *testing.T) {
-	for _, version := range []byte{4, 5, 6} {
+	for _, version := range []byte{4, 5, 6, 7} {
 		header, err := encodeHelloHeader(helloMessage{LegID: 0, ChunkSize: 64 * 1024, Destination: "example.com:443"})
 		if err != nil {
 			t.Fatal(err)

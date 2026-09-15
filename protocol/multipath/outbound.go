@@ -43,6 +43,9 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
+	if len(options.DeprecatedBandwidthMbps) > 0 {
+		logger.Warn("bandwidth_mbps is obsolete and ignored; multipath uses automatic delivery-based scheduling; remove this field from the configuration")
+	}
 	if len(options.Outbounds) != 2 {
 		return nil, E.New("multipath PoC requires exactly 2 outbounds")
 	}
@@ -59,15 +62,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("preferred outbound is not in outbounds: ", preferred)
 	}
 	tags := append([]string(nil), options.Outbounds...)
-	weights := append([]uint32(nil), options.BandwidthMbps...)
-	if len(weights) != 0 && len(weights) != len(tags) {
-		return nil, E.New("bandwidth_mbps must be empty or match outbounds length")
-	}
 	if preferredIndex != 0 {
 		tags[0], tags[preferredIndex] = tags[preferredIndex], tags[0]
-		if len(weights) > 0 {
-			weights[0], weights[preferredIndex] = weights[preferredIndex], weights[0]
-		}
 	}
 	udpTag := options.UDPOutbound
 	if udpTag == "" {
@@ -96,43 +92,37 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if queueBytes > maxQueueBytes {
 		return nil, E.New("chunk_size * queue_frames exceeds 64 MiB")
 	}
-	maxReorderFrames := int(options.MaxReorderFrames)
-	if maxReorderFrames == 0 {
-		maxReorderFrames = 2048
+	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
+	if memoryErr != nil {
+		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	if maxReorderFrames < 64 || maxReorderFrames > 65536 {
+	minimumMemory := minimumSessionMemory(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize})
+	if memoryLimit < minimumMemory {
+		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
+	}
+	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
+	maxReorderFrames := int(options.MaxReorderFrames)
+	if maxReorderFrames != 0 && (maxReorderFrames < 64 || maxReorderFrames > 65536) {
 		return nil, E.New("invalid max_reorder_frames")
 	}
 	maxReorderBufferBytes := int64(options.MaxReorderBytes)
 	if maxReorderBufferBytes == 0 {
-		maxReorderBufferBytes = 64 << 20
+		maxReorderBufferBytes = automaticBufferLimit(memory, chunkSize)
 	}
 	if maxReorderBufferBytes < int64(chunkSize) || maxReorderBufferBytes > maxReorderBytes {
 		return nil, E.New("invalid max_reorder_bytes")
 	}
 	replayBytes := int64(options.Leg1ReplayBytes)
 	if replayBytes == 0 {
-		replayBytes = 64 << 20
+		replayBytes = automaticBufferLimit(memory, chunkSize)
 	}
 	if replayBytes < int64(chunkSize) || replayBytes > maxReplayBytes {
 		return nil, E.New("invalid leg1_replay_bytes")
 	}
 	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
-	if replayTimeout <= 0 {
-		replayTimeout = time.Second
-	}
-	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
+	if replayTimeout != 0 && (replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute) {
 		return nil, E.New("invalid leg1_replay_timeout")
 	}
-	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
-	if memoryErr != nil {
-		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
-	}
-	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize}) + int64(chunkSize) + receiveFrameOverhead
-	if memoryLimit < minimumMemory {
-		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
-	}
-	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 10 * time.Second
@@ -165,7 +155,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			ActivationAfterBytes:           activationAfterBytes,
 			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
 			ActivationWindow:               window,
-			BandwidthMbps:                  weights,
 			MaxReorderFrames:               maxReorderFrames,
 			MaxReorderBytes:                maxReorderBufferBytes,
 			ReplayBytes:                    replayBytes,
@@ -457,6 +446,10 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 			case <-core.Done():
 				return
 			case <-leg.Done():
+				if leg.peerTerminal.Load() {
+					<-core.Done()
+					return
+				}
 				select {
 				case <-core.Done():
 					return

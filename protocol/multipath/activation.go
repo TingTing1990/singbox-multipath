@@ -1,0 +1,156 @@
+package multipath
+
+import "time"
+
+func resolveActivationThreshold(threshold *uint32, afterBytes uint64) uint64 {
+	if threshold != nil {
+		return uint64(*threshold) * 1_000_000 / 8
+	}
+	if afterBytes == 0 {
+		return 150 * 1_000_000 / 8
+	}
+	return 0
+}
+
+func (c *mpCore) activationLoop() {
+	if !c.cfg.AggregationEnabled || c.active.Load() ||
+		(!c.cfg.ActivationOnQueue && c.cfg.ThresholdBytesPS == 0 && c.cfg.ActivationAfterBytes == 0) {
+		return
+	}
+	interval := c.cfg.ActivationWindow / 10
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+	if interval > 200*time.Millisecond {
+		interval = 200 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	windowStart := time.Now()
+	windowBase := c.ingressBytes.Load()
+	var queueHighSince time.Time
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-ticker.C:
+			if c.active.Load() {
+				return
+			}
+			bytesNow := c.ingressBytes.Load()
+			if info, ok := activationAfterBytes(c.cfg, bytesNow, windowBase, now.Sub(windowStart)); ok {
+				c.activate(info)
+				return
+			}
+			if (c.cfg.ThresholdBytesPS > 0 || (c.cfg.ActivationAfterBytes > 0 && c.cfg.ActivationAfterBytesMinBytesPS > 0)) && now.Sub(windowStart) >= c.cfg.ActivationWindow {
+				delta := bytesNow - windowBase
+				elapsed := now.Sub(windowStart)
+				rate := uint64(0)
+				if elapsed > 0 {
+					rate = uint64(float64(delta) / elapsed.Seconds())
+				}
+				if c.cfg.ThresholdBytesPS > 0 && rate >= c.cfg.ThresholdBytesPS {
+					c.activate(activationInfo{
+						Reason:           activationReasonThroughput,
+						WindowBytes:      delta,
+						RateBytesPS:      rate,
+						ThresholdBytesPS: c.cfg.ThresholdBytesPS,
+						Elapsed:          elapsed,
+					})
+					return
+				}
+				windowStart = now
+				windowBase = bytesNow
+			}
+			if !c.cfg.ActivationOnQueue {
+				continue
+			}
+			primary := c.getLeg(0)
+			if primary == nil {
+				continue
+			}
+			c.stateMu.Lock()
+			backlogBytes := primary.backlogBytes() + int64(c.tx.WriteNext-min(c.tx.Next, c.tx.WriteNext))
+			c.stateMu.Unlock()
+			if backlogBytes*5 >= c.cfg.QueueBytes*4 {
+				if queueHighSince.IsZero() {
+					queueHighSince = now
+				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow {
+					c.activate(activationInfo{
+						Reason:           activationReasonLeg0Queue,
+						BacklogBytes:     backlogBytes,
+						QueueBytes:       c.cfg.QueueBytes,
+						Elapsed:          now.Sub(queueHighSince),
+						RequiredDuration: c.cfg.ActivationWindow,
+					})
+					return
+				}
+			} else {
+				queueHighSince = time.Time{}
+			}
+		}
+	}
+}
+
+func activationAfterBytes(cfg coreConfig, bytesNow, windowBase uint64, elapsed time.Duration) (activationInfo, bool) {
+	if cfg.ActivationAfterBytes == 0 || bytesNow < cfg.ActivationAfterBytes {
+		return activationInfo{}, false
+	}
+	info := activationInfo{
+		Reason:         activationReasonBytes,
+		CurrentBytes:   bytesNow,
+		ThresholdBytes: cfg.ActivationAfterBytes,
+	}
+	if cfg.ActivationAfterBytesMinBytesPS == 0 {
+		return info, true
+	}
+	if elapsed < cfg.ActivationWindow || elapsed <= 0 {
+		return activationInfo{}, false
+	}
+	delta := bytesNow - windowBase
+	rate := uint64(float64(delta) / elapsed.Seconds())
+	if rate < cfg.ActivationAfterBytesMinBytesPS {
+		return activationInfo{}, false
+	}
+	info.RateBytesPS = rate
+	info.MinRateBytesPS = cfg.ActivationAfterBytesMinBytesPS
+	info.Elapsed = elapsed
+	return info, true
+}
+
+func (c *mpCore) activate(info activationInfo) {
+	if !c.cfg.AggregationEnabled {
+		return
+	}
+	c.activateOnce.Do(func() {
+		c.activationMu.Lock()
+		c.activation = info
+		c.activationAt = time.Now()
+		c.activationMu.Unlock()
+		c.active.Store(true)
+		close(c.activeCh)
+		c.notifyLeg1Active()
+	})
+}
+
+func (c *mpCore) notifyLeg1Active() {
+	if !c.active.Load() || c.cfg.OnLeg1Active == nil {
+		return
+	}
+	leg := c.getLeg(1)
+	if leg == nil {
+		return
+	}
+	c.activationMu.Lock()
+	if c.notifiedLeg1 == leg {
+		c.activationMu.Unlock()
+		return
+	}
+	info := c.activation
+	reconnect := c.leg1Joins > 0
+	c.notifiedLeg1 = leg
+	c.leg1Joins++
+	callback := c.cfg.OnLeg1Active
+	c.activationMu.Unlock()
+	callback(info, reconnect)
+}

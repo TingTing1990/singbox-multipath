@@ -47,6 +47,9 @@ type Inbound struct {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
+	if len(options.DeprecatedBandwidthMbps) > 0 {
+		logger.Warn("bandwidth_mbps is obsolete and ignored; multipath uses automatic delivery-based scheduling; remove this field from the configuration")
+	}
 	activationAfterBytes := options.ActivationAfterBytes.Value()
 	threshold := resolveActivationThreshold(options.ActivationThresholdMbps, activationAfterBytes)
 	window := time.Duration(options.ActivationWindow)
@@ -71,52 +74,43 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if queueBytes > maxQueueBytes {
 		return nil, E.New("chunk_size * queue_frames exceeds 64 MiB")
 	}
-	maxReorderFrames := int(options.MaxReorderFrames)
-	if maxReorderFrames == 0 {
-		maxReorderFrames = 2048
+	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
+	if memoryErr != nil {
+		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
 	}
-	if maxReorderFrames < 64 || maxReorderFrames > 65536 {
+	minimumMemory := minimumSessionMemory(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize})
+	if memoryLimit < minimumMemory {
+		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
+	}
+	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
+	maxReorderFrames := int(options.MaxReorderFrames)
+	if maxReorderFrames != 0 && (maxReorderFrames < 64 || maxReorderFrames > 65536) {
 		return nil, E.New("invalid max_reorder_frames")
 	}
 	maxReorderBufferBytes := int64(options.MaxReorderBytes)
 	if maxReorderBufferBytes == 0 {
-		maxReorderBufferBytes = 64 << 20
+		maxReorderBufferBytes = automaticBufferLimit(memory, chunkSize)
 	}
 	if maxReorderBufferBytes < int64(chunkSize) || maxReorderBufferBytes > maxReorderBytes {
 		return nil, E.New("invalid max_reorder_bytes")
 	}
 	replayBytes := int64(options.Leg1ReplayBytes)
 	if replayBytes == 0 {
-		replayBytes = 64 << 20
+		replayBytes = automaticBufferLimit(memory, chunkSize)
 	}
 	if replayBytes < int64(chunkSize) || replayBytes > maxReplayBytes {
 		return nil, E.New("invalid leg1_replay_bytes")
 	}
 	replayTimeout := time.Duration(options.Leg1ReplayTimeout)
-	if replayTimeout <= 0 {
-		replayTimeout = time.Second
-	}
-	if replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute {
+	if replayTimeout != 0 && (replayTimeout < 100*time.Millisecond || replayTimeout > 5*time.Minute) {
 		return nil, E.New("invalid leg1_replay_timeout")
 	}
-	memoryLimit, automaticMemoryLimit, memoryErr := resolveMemoryLimit(options.MemoryLimit.Value())
-	if memoryErr != nil {
-		logger.Warn("detect available memory for multipath: ", memoryErr, "; using 256 MiB fallback")
-	}
-	minimumMemory := sessionMemoryReservation(coreConfig{QueueFrames: queueFrames, ChunkSize: chunkSize}) + int64(chunkSize) + receiveFrameOverhead
-	if memoryLimit < minimumMemory {
-		return nil, E.New("memory_limit is too small for one multipath session: ", memoryLimit, " < ", minimumMemory)
-	}
-	memory := newMemoryBudget(memoryLimit, automaticMemoryLimit)
 	handshakeTimeout := time.Duration(options.HandshakeTimeout)
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 10 * time.Second
 	}
 	if handshakeTimeout < time.Second || handshakeTimeout > time.Minute {
 		return nil, E.New("invalid handshake_timeout")
-	}
-	if len(options.BandwidthMbps) != 0 && len(options.BandwidthMbps) != 2 {
-		return nil, E.New("multipath PoC bandwidth_mbps must contain exactly 2 entries")
 	}
 	i := &Inbound{
 		Adapter:          inbound.NewAdapter(C.TypeMultipath, tag),
@@ -136,7 +130,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			ActivationAfterBytes:           activationAfterBytes,
 			ActivationAfterBytesMinBytesPS: uint64(options.ActivationAfterBytesMinMbps) * 1000 * 1000 / 8,
 			ActivationWindow:               window,
-			BandwidthMbps:                  append([]uint32(nil), options.BandwidthMbps...),
 			MaxReorderFrames:               maxReorderFrames,
 			MaxReorderBytes:                maxReorderBufferBytes,
 			ReplayBytes:                    replayBytes,

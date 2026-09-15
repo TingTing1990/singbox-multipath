@@ -130,14 +130,12 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 			return err
 		}
 		if initialWindow.typ != frameTypeWindow || initialWindow.flow.Next != 0 || initialWindow.flow.Limit < 1 {
-			serverCore.putBuffer(initialWindow.data)
 			return errors.New("missing startup credit before first DATA")
 		}
 		frame, err := readWireFrame(serverWire, serverCore)
 		if err != nil {
 			return err
 		}
-		defer serverCore.putBuffer(frame.data)
 		if frame.typ != frameTypeData || frame.seq != 0 || !bytes.Equal(frame.data, payload) {
 			return errors.New("unexpected first multipath data frame")
 		}
@@ -212,7 +210,7 @@ func testTFOCombination(t *testing.T, multipathTFO, childTFO bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame, err := encodeWireFrame(wireFrame{typ: frameTypeData, data: payload})
+	frame, err := encodeWireFrame(wireFrame{typ: frameTypeData, generation: 1, data: payload})
 	if err != nil {
 		t.Fatal(err)
 	}

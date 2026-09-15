@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	statusSchemaVersion = 2
+	statusSchemaVersion = 3
 	statusTopFlowCount  = 10
 
 	leg1PhaseWaiting int32 = iota
@@ -504,9 +504,9 @@ type statusLogical struct {
 	Cumulative               statusTraffic           `json:"cumulative"`
 	ReplayBytes              int64                   `json:"replay_bytes"`
 	ReorderBytes             int64                   `json:"reorder_bytes"`
-	ReorderFrames            int64                   `json:"reorder_frames"`
+	ReorderFrames            int64                   `json:"reorder_pages"`
 	ReorderPeakBytes         int64                   `json:"reorder_peak_bytes"`
-	ReorderPeakFrames        int64                   `json:"reorder_peak_frames"`
+	ReorderPeakFrames        int64                   `json:"reorder_peak_pages"`
 	LocalSender              statusSenderDiagnostics `json:"local_sender"`
 	RemoteSender             statusSenderDiagnostics `json:"remote_sender"`
 	LastActivation           *statusActivation       `json:"last_activation,omitempty"`
@@ -524,6 +524,10 @@ type statusFlow struct {
 }
 
 type statusLeg struct {
+	RemoteDeliveryRate      uint64         `json:"remote_delivery_bytes_per_second"`
+	RemoteDeliveryRTT       uint64         `json:"remote_delivery_rtt_max_ms"`
+	RemoteMinimumRTT        uint64         `json:"remote_delivery_rtt_min_ms"`
+	RemotePipeline          uint64         `json:"remote_pipeline_bytes"`
 	ID                      int            `json:"id"`
 	Tag                     string         `json:"tag"`
 	Type                    string         `json:"type"`
@@ -547,9 +551,6 @@ type statusLeg struct {
 	RemoteWriteBlockedMS    int64          `json:"remote_write_blocked_ms"`
 	RemotePeakBacklogBytes  int64          `json:"remote_peak_backlog_bytes"`
 	QueueBytesPerConnection int64          `json:"queue_bytes_per_connection"`
-	ConfiguredBandwidthMbps uint32         `json:"configured_bandwidth_mbps"`
-	TXWeight                uint32         `json:"tx_weight"`
-	TXSharePercent          float64        `json:"tx_share_percent"`
 	JoinCount               uint64         `json:"join_count"`
 	AttemptCount            uint64         `json:"attempt_count"`
 	UDPSelected             bool           `json:"udp_selected"`
@@ -821,7 +822,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			TopFlows:                []statusFlow{},
 		},
 	}
-	weightTotal := uint64(0)
 	for index := range legs {
 		if legs[index].Tag == s.config.udpOutbound {
 			legs[index].UDPSelected = true
@@ -832,14 +832,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			legs[index].Cumulative.TXBytes += udpTotals.TXBytes
 			legs[index].Cumulative.RXBytes += udpTotals.RXBytes
 		}
-		if index < len(s.config.cfg.BandwidthMbps) {
-			legs[index].ConfiguredBandwidthMbps = s.config.cfg.BandwidthMbps[index]
-		}
-		legs[index].TXWeight = 1
-		if legs[index].ConfiguredBandwidthMbps > 0 {
-			legs[index].TXWeight = legs[index].ConfiguredBandwidthMbps
-		}
-		weightTotal += uint64(legs[index].TXWeight)
 		if !legErrors[index].at.IsZero() {
 			legs[index].LastError = legErrors[index].message
 			legs[index].LastErrorAt = legErrors[index].at.Format(time.RFC3339Nano)
@@ -853,12 +845,6 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			legs[index].LastErrorHarmless = legErrors[index].harmless
 		}
 	}
-	for index := range legs {
-		if weightTotal > 0 {
-			legs[index].TXSharePercent = float64(legs[index].TXWeight) * 100 / float64(weightTotal)
-		}
-	}
-
 	var latestActivation time.Time
 	var latestRemote time.Time
 	var latestRemoteFailure [2]time.Time
@@ -911,6 +897,13 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			leg.WritingBytes += snapshot.legWriting[legIndex]
 			leg.WriteBlockedMS = max(leg.WriteBlockedMS, snapshot.legWriteBlock[legIndex].Milliseconds())
 			if remote.status.Sequence > 0 {
+				leg.RemoteDeliveryRate += remote.status.LegDeliveryRate[legIndex]
+				leg.RemoteDeliveryRTT = max(leg.RemoteDeliveryRTT, remote.status.LegDeliveryRTT[legIndex]/uint64(time.Millisecond))
+				rtt := remote.status.LegMinimumRTT[legIndex] / uint64(time.Millisecond)
+				if rtt > 0 && (leg.RemoteMinimumRTT == 0 || rtt < leg.RemoteMinimumRTT) {
+					leg.RemoteMinimumRTT = rtt
+				}
+				leg.RemotePipeline += remote.status.LegPipeline[legIndex]
 				leg.RemoteBacklogBytes += int64(remote.status.LegBacklog[legIndex])
 				leg.RemoteWritingBytes += int64(remote.status.LegWriting[legIndex])
 				leg.RemoteWriteBlockedMS = max(leg.RemoteWriteBlockedMS, int64(remote.status.LegWriteBlockedNanos[legIndex]/uint64(time.Millisecond)))

@@ -23,13 +23,6 @@ const (
 
 var errMemoryLimit = errors.New("multipath memory limit reached")
 
-type memoryClass uint8
-
-const (
-	memoryClassPrimary memoryClass = iota
-	memoryClassBooster
-)
-
 type memorySnapshot struct {
 	LimitBytes         int64
 	UsedBytes          int64
@@ -74,29 +67,6 @@ type memoryBudget struct {
 	logOnce       sync.Once
 }
 
-// A growth target, not a revocation of already granted credit. Share half of the
-// booster budget between live sessions so unused lookahead cannot consume the
-// entire budget; the other half remains available for TX and session overhead.
-func (b *memoryBudget) receiveShareSlots(slotBytes int64) uint64 {
-	share := (b.boosterLimit - b.cacheLimit) / 2 / max(1, b.sessions.Load())
-	return uint64(max(1, share/slotBytes))
-}
-
-// Speculative startup credit must leave room for real traffic, even when many
-// idle connections are constructed before any peer can return unused credit.
-func (b *memoryBudget) reserveStartup(slots uint64, slotBytes int64) uint64 {
-	b.access.Lock()
-	defer b.access.Unlock()
-	available := b.limit/8 - b.used
-	if available < slotBytes || b.pressure {
-		return 0
-	}
-	granted := min(slots, uint64(available/slotBytes))
-	b.used += int64(granted) * slotBytes
-	b.updatePressureLocked(time.Now())
-	return granted
-}
-
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {
 	if configured > math.MaxInt64 {
 		return 0, false, errors.New("memory_limit exceeds the supported range")
@@ -139,11 +109,11 @@ func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
 }
 
 func sessionMemoryReservation(cfg coreConfig) int64 {
-	// Covers goroutine stacks, maps, and the incoming plus two per-leg channel
-	// backing arrays. Payload buffers are charged separately at allocation time.
-	// Two readers and a leg0-only TX buffer guarantee progress independently
-	// of general payload allocations, even during partial booster reads.
-	return sessionMemoryBase + int64(cfg.QueueFrames)*5*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
+	// Fixed channels: one assignment, 32 controls and one coalesced feedback
+	// frame per path. The base also covers worker stacks and 16 prepaid primary
+	// flight records. Two reader scratch buffers and one primary TX reserve
+	// keep head recovery independent of speculative allocations.
+	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
 }
 
 func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
@@ -170,26 +140,7 @@ func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
 	return nil, b.changed
 }
 
-// reserveReceive grants only memory-backed credit. Unused grants count against
-// the same budget as payloads, and are returned by the peer's idle-credit epoch.
-func (b *memoryBudget) reserveReceive(slots uint64, slotBytes int64) uint64 {
-	b.access.Lock()
-	defer b.access.Unlock()
-	if b.cached > 0 && b.boosterLimit-b.used < int64(slots)*slotBytes {
-		b.dropCacheLocked()
-	}
-	b.updatePressureLocked(time.Now())
-	available := b.boosterLimit - b.used
-	if available < slotBytes || b.pressure {
-		return 0
-	}
-	granted := min(slots, uint64(available/slotBytes))
-	b.used += int64(granted) * slotBytes
-	b.updatePressureLocked(time.Now())
-	return granted
-}
-
-// The caller has already charged a receive credit or a reader scratch slot.
+// The caller has already charged a reusable session scratch/TX reservation.
 func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	b.access.Lock()
 	if buffers := b.cache[size]; len(buffers) > 0 {
@@ -209,8 +160,8 @@ func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	return make([]byte, size)
 }
 
-// Returning a reserved buffer does not return its credit. Cache memory is
-// charged separately, so cached storage cannot consume a promised window slot.
+// Returning a reserved buffer does not release its session reservation. Cache
+// storage is charged separately until reused or dropped.
 func (b *memoryBudget) putReservedBuffer(buffer []byte) {
 	size := cap(buffer)
 	b.access.Lock()
@@ -253,76 +204,6 @@ func (b *memoryBudget) releaseSession(bytes int64) {
 	b.updatePressureLocked(time.Now())
 	b.signalLocked()
 	b.access.Unlock()
-}
-
-func (b *memoryBudget) acquire(ctx context.Context, size int, class memoryClass) ([]byte, error) {
-	if size <= 0 {
-		return nil, errors.New("invalid multipath buffer size")
-	}
-	waited := false
-	for {
-		b.access.Lock()
-		b.updatePressureLocked(time.Now())
-		if class == memoryClassBooster && b.pressure {
-			if !waited {
-				b.waitCount++
-				waited = true
-			}
-			changed := b.changed
-			b.access.Unlock()
-			select {
-			case <-ctx.Done():
-				return nil, errCoreClosed
-			case <-changed:
-			}
-			continue
-		}
-
-		if buffers := b.cache[size]; len(buffers) > 0 {
-			buffer := buffers[len(buffers)-1]
-			if len(buffers) == 1 {
-				delete(b.cache, size)
-			} else {
-				b.cache[size] = buffers[:len(buffers)-1]
-			}
-			b.cached -= int64(size)
-			b.access.Unlock()
-			return buffer[:size], nil
-		}
-
-		allocationLimit := b.limit
-		if class == memoryClassBooster {
-			allocationLimit = b.boosterLimit
-		}
-		if b.used+int64(size) <= allocationLimit {
-			b.used += int64(size)
-			b.updatePressureLocked(time.Now())
-			b.access.Unlock()
-			return make([]byte, size), nil
-		}
-
-		if b.cached > 0 {
-			b.dropCacheLocked()
-			b.updatePressureLocked(time.Now())
-			b.signalLocked()
-			b.access.Unlock()
-			continue
-		}
-		if class == memoryClassBooster {
-			b.enterPressureLocked(time.Now())
-		}
-		if !waited {
-			b.waitCount++
-			waited = true
-		}
-		changed := b.changed
-		b.access.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, errCoreClosed
-		case <-changed:
-		}
-	}
 }
 
 func (b *memoryBudget) release(buffer []byte) {

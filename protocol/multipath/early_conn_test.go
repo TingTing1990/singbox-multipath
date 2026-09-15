@@ -89,7 +89,7 @@ func TestClientFastOpenCombinesHelloAndFirstFrame(t *testing.T) {
 		Destination: "1.1.1.1:80",
 	}
 	payload := []byte("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\n\r\n")
-	frame := wireFrame{typ: frameTypeData, seq: 0, data: payload}
+	frame := wireFrame{typ: frameTypeData, generation: 1, seq: 0, data: payload}
 	spy := new(fastOpenSpyConn)
 	deadline := time.Now().Add(time.Second)
 	conn, err := newClientFastOpenConn(spy, message, deadline)
@@ -143,7 +143,7 @@ func TestClientFastOpenSupportsOpaqueLazyChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = writeWireFrame(conn, wireFrame{typ: frameTypeData, data: []byte("payload")}); err != nil {
+	if err = writeWireFrame(conn, wireFrame{typ: frameTypeData, generation: 1, data: []byte("payload")}); err != nil {
 		t.Fatal(err)
 	}
 	if writes := spy.snapshotWrites(); len(writes) != 1 {
@@ -278,7 +278,6 @@ func TestEarlyLogicalConnSendsPayloadWithHello(t *testing.T) {
 			readErr = errors.New("unexpected early data frame")
 		}
 		if len(frame.data) > 0 {
-			serverCore.putBuffer(frame.data)
 		}
 		if readErr == nil {
 			readErr = writeHelloResponse(serverWire, helloResponse{Status: helloStatusOK, ChunkSize: message.ChunkSize})
@@ -339,7 +338,6 @@ func TestEarlyLogicalConnRejectClosesConnection(t *testing.T) {
 			frame, readErr = readStartupDataFrame(serverWire, serverCore)
 		}
 		if len(frame.data) > 0 {
-			serverCore.putBuffer(frame.data)
 		}
 		if readErr == nil {
 			readErr = writeHelloResponse(serverWire, helloResponse{
@@ -372,7 +370,6 @@ func readStartupDataFrame(conn net.Conn, core *mpCore) (wireFrame, error) {
 		return wireFrame{}, err
 	}
 	if window.typ != frameTypeWindow || window.flow.Next != 0 || window.flow.Limit < 1 {
-		core.putBuffer(window.data)
 		return wireFrame{}, errors.New("missing initial receive window")
 	}
 	return readWireFrame(conn, core)

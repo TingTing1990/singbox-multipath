@@ -54,8 +54,9 @@ func TestCoreCloseWritesSessionCloseOnEveryLeg(t *testing.T) {
 	}
 }
 
-func TestSessionCloseOnBoosterTerminatesCore(t *testing.T) {
+func TestSessionCloseOnBoosterCannotOvertakePrimary(t *testing.T) {
 	core, appConn := newCore(context.Background(), testCoreConfig())
+	t.Cleanup(func() { core.Close() })
 	t.Cleanup(func() { appConn.Close() })
 	peers := make([]net.Conn, 0, 2)
 	for legID := uint8(0); legID < 2; legID++ {
@@ -73,14 +74,14 @@ func TestSessionCloseOnBoosterTerminatesCore(t *testing.T) {
 	}()
 	select {
 	case <-core.Done():
-	case <-time.After(time.Second):
-		t.Fatal("session-close on booster leg did not terminate the core")
+		t.Fatal("secondary terminal event overtook primary")
+	case <-time.After(50 * time.Millisecond):
 	}
 	if err := <-writeResult; err != nil {
 		t.Fatal(err)
 	}
-	if !core.isDone() {
-		t.Fatal("core remained active after peer session-close")
+	if core.isDone() || core.getLeg(0) == nil {
+		t.Fatal("secondary terminal event terminated the logical stream")
 	}
 }
 

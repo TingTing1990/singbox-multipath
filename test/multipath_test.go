@@ -129,13 +129,11 @@ func TestMultipathDirectionalAggregation(t *testing.T) {
 					inbound.ActivationOnQueue = common.Ptr(false)
 					inbound.ActivationThresholdMbps = common.Ptr(uint32(0))
 					inbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
-					inbound.BandwidthMbps = []uint32{1, 1000}
 					outbound := options.Outbounds[len(options.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
 					outbound.AggregationEnabled = common.Ptr(clientEnabled)
 					outbound.ActivationOnQueue = common.Ptr(false)
 					outbound.ActivationThresholdMbps = common.Ptr(uint32(0))
 					outbound.ActivationWindow = badoption.Duration(50 * time.Millisecond)
-					outbound.BandwidthMbps = []uint32{1, 1000}
 					outbound.StatusFile = filepath.Join(t.TempDir(), "multipath.json")
 					startInstance(t, options)
 					dialer := socks.NewClient(N.SystemDialer, M.ParseSocksaddrHostPort("127.0.0.1", clientPort), socks.Version5, "", "")
@@ -226,14 +224,12 @@ func multipathTFOTestOptions(
 		activationWindow     badoption.Duration
 		chunkSize            uint32
 		queueFrames          uint32
-		bandwidthMbps        []uint32
 		handshakeTimeout     badoption.Duration
 	}{
 		activationAfterBytes: 1,
 		activationWindow:     badoption.Duration(time.Second),
 		chunkSize:            16 * 1024,
 		queueFrames:          64,
-		bandwidthMbps:        []uint32{100, 100},
 		handshakeTimeout:     badoption.Duration(5 * time.Second),
 	}
 
@@ -261,7 +257,6 @@ func multipathTFOTestOptions(
 				ActivationWindow:     sharedMultipathOptions.activationWindow,
 				ChunkSize:            sharedMultipathOptions.chunkSize,
 				QueueFrames:          sharedMultipathOptions.queueFrames,
-				BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
 				HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
 			},
 		},
@@ -330,7 +325,6 @@ func multipathTFOTestOptions(
 			ActivationWindow:     sharedMultipathOptions.activationWindow,
 			ChunkSize:            sharedMultipathOptions.chunkSize,
 			QueueFrames:          sharedMultipathOptions.queueFrames,
-			BandwidthMbps:        sharedMultipathOptions.bandwidthMbps,
 			HandshakeTimeout:     sharedMultipathOptions.handshakeTimeout,
 		},
 	})

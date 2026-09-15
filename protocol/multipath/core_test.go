@@ -66,7 +66,6 @@ func testCoreConfig() coreConfig {
 		ChunkSize:          4 * 1024,
 		QueueFrames:        64,
 		QueueBytes:         256 * 1024,
-		BandwidthMbps:      []uint32{1, 16},
 		MaxReorderFrames:   4096,
 		MaxReorderBytes:    16 << 20,
 		ReplayBytes:        16 << 20,

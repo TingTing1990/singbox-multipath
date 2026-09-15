@@ -128,7 +128,7 @@ func TestOutboundStatusDocument(t *testing.T) {
 	})
 
 	document := status.buildDocument(time.Now().Add(time.Second))
-	if document.SchemaVersion != 2 {
+	if document.SchemaVersion != 3 {
 		t.Fatalf("unexpected status schema: %d", document.SchemaVersion)
 	}
 	if document.Node.Parameters.MemoryLimitBytes != 8<<20 || document.Node.Memory.LimitBytes != 8<<20 || !document.Node.Memory.Automatic {

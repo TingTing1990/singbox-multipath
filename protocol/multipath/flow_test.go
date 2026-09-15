@@ -9,6 +9,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
 // A complete DATA header and part of its payload arrive, then the original
@@ -128,7 +130,7 @@ func TestFlowTinyWindowSurvivesPartialBooster(t *testing.T) {
 				fault := newPartialBooster(a)
 				connectTestLeg(t, left, right, 1, fault, b)
 				if late {
-					go func() { <-fault.started; time.Sleep(350 * time.Millisecond); close(fault.release) }()
+					go func() { <-fault.started; time.Sleep(1350 * time.Millisecond); close(fault.release) }()
 				}
 				payload := flowPayload(2 << 20)
 				result := flowSend(app, payload, true)
@@ -257,7 +259,7 @@ func TestFlowSlowReaderDoesNotBlockControlOrReverseData(t *testing.T) {
 	})
 }
 
-func TestFlowIdleCreditReturnAndReactivation(t *testing.T) {
+func TestFlowIdleReleasesStorageWithoutRetractingWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
 		cfg.MaxReorderBytes = 128 << 10
@@ -278,15 +280,15 @@ func TestFlowIdleCreditReturnAndReactivation(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, payload) {
-				t.Fatal("payload mismatch after epoch change")
+				t.Fatal("payload mismatch after idle interval")
 			}
 			time.Sleep(750 * time.Millisecond)
 			synctest.Wait()
-			right.flow.rxMu.Lock()
-			held := right.flow.rxLimit - right.flow.rxConsumed
-			right.flow.rxMu.Unlock()
-			if held != 1 {
-				t.Fatalf("idle connection retained %d credits", held)
+			right.stateMu.Lock()
+			held, _, _ := right.rx.Buffered()
+			right.stateMu.Unlock()
+			if held != 0 {
+				t.Fatalf("idle connection retained %d unread bytes", held)
 			}
 			assertFlowAlive(t, left, right)
 		}
@@ -294,8 +296,8 @@ func TestFlowIdleCreditReturnAndReactivation(t *testing.T) {
 }
 
 func TestFlowMessageCodec(t *testing.T) {
-	message := flowMessage{Epoch: 3, Next: 5, Limit: 64, GapAge: 12345, Leg1Next: 67890, Flags: flowFlagGap | flowFlagPressure}
-	for _, typ := range []byte{frameTypeWindow, frameTypeWindowRequest} {
+	message := flowMessage{Next: 5, Limit: 64, Paths: [2]stream.Receipt{{Generation: 1, Next: 1024, ReceivedAt: 12345}, {Generation: 2, Next: 4096, ReceivedAt: 78900}}, Flags: flowFlagPressure}
+	for _, typ := range []byte{frameTypeWindow} {
 		a, b := net.Pipe()
 		go func() { defer a.Close(); _ = writeWireFrame(a, wireFrame{typ: typ, flow: message}) }()
 		core, _ := newCore(context.Background(), testCoreConfig())
@@ -309,19 +311,16 @@ func TestFlowMessageCodec(t *testing.T) {
 }
 
 func TestRecoveryTimeoutDefaultsAndBounds(t *testing.T) {
-	cfg := flowTestConfig()
-	cfg.ReplayTimeout = 0
-	core, _ := newCore(context.Background(), cfg)
-	defer core.Close()
-	if got := core.recoveryTimeout(); got != time.Second {
-		t.Fatalf("default timeout %s", got)
+	path := stream.Path{}
+	if got := path.RTO(0); got != time.Second {
+		t.Fatalf("initial timeout %s", got)
 	}
-	core.probeMu.Lock()
-	core.probeRTT[0] = legRTTSnapshot{Samples: 1, EWMA: 65 * time.Millisecond}
-	core.probeRTT[1] = legRTTSnapshot{Samples: 1, EWMA: 80 * time.Millisecond, Jitter: 10 * time.Millisecond}
-	core.probeMu.Unlock()
-	if got := core.recoveryTimeout(); got != time.Second {
+	path.SRTT, path.RTTVar = 80*time.Millisecond, 10*time.Millisecond
+	if got := path.RTO(0); got != 200*time.Millisecond {
 		t.Fatalf("adaptive timeout %s", got)
+	}
+	if got := path.RTO(2 * time.Second); got != 2*time.Second {
+		t.Fatalf("configured floor ignored: %s", got)
 	}
 }
 
@@ -352,10 +351,7 @@ func TestFlowSharedBudgetPreservesEveryLeg0(t *testing.T) {
 		defer closeFlowCores(cores...)
 		synctest.Wait()
 		snapshot := budget.snapshot()
-		held, err := budget.acquire(context.Background(), int(snapshot.BoosterLimitBytes-snapshot.UsedBytes), memoryClassPrimary)
-		if err != nil {
-			t.Fatal(err)
-		}
+		held := acquireTestMemory(t, budget, int(snapshot.BoosterLimitBytes-snapshot.UsedBytes))
 		defer budget.release(held)
 		payload := flowPayload(64 << 10)
 		results := make(chan error, len(apps))
@@ -375,7 +371,7 @@ func TestFlowSharedBudgetPreservesEveryLeg0(t *testing.T) {
 			}(peers[index], written)
 		}
 		for range apps {
-			if err = <-results; err != nil {
+			if err := <-results; err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -386,49 +382,44 @@ func TestFlowSharedBudgetPreservesEveryLeg0(t *testing.T) {
 	})
 }
 
-func TestFlowCreditReturnValidation(t *testing.T) {
+func TestFlowFeedbackValidation(t *testing.T) {
 	core, _ := newCore(context.Background(), flowTestConfig())
 	defer core.Close()
-	limit := core.flow.rxLimit
-	for _, message := range []flowMessage{
-		{Next: limit + 1, Limit: limit + 2}, // No corresponding credit was granted.
-		{Next: 1, Limit: 0},
-		{Epoch: 1, Next: limit, Limit: limit + 1}, // Cannot "return" credit by expanding it.
-		{Flags: flowFlagGap, Limit: 1},
-	} {
-		if core.handleWindowRequest(message) == nil {
-			t.Fatalf("accepted invalid request: %+v", message)
+	for _, message := range []flowMessage{{Next: 1, Limit: 2}, {Next: 1, Limit: 0}} {
+		if core.handleWindow(message) == nil {
+			t.Fatalf("accepted invalid feedback: %+v", message)
 		}
 	}
 }
 
-func TestFlowOldEpochStillAcknowledgesDelivery(t *testing.T) {
+func TestFlowByteACKAndReorderedWindow(t *testing.T) {
 	core, _ := newCore(context.Background(), flowTestConfig())
 	defer core.Close()
-	core.txSeq.Store(2)
-	core.localFIN.Store(true)
-	core.flow.txMu.Lock()
-	core.flow.txEpoch, core.flow.txLimit = 1, 3
-	core.flow.recovering = true
-	core.flow.txMu.Unlock()
-	err := core.handleWindow(flowMessage{Epoch: 0, Next: 2, Limit: 256, Leg1Next: 2, Flags: flowFlagFINAck})
-	if err != nil {
+	core.stateMu.Lock()
+	core.tx.WindowEnd = 4096
+	_ = core.tx.Append(stream.NewBuffer(make([]byte, 2048), nil))
+	segment, _ := core.tx.NextRange(2048)
+	_ = core.tx.Sent(segment)
+	core.tx.CloseWrite()
+	core.tx.SendFIN()
+	core.stateMu.Unlock()
+	if err := core.handleWindow(flowMessage{Next: 2049, Limit: 4096}); err != nil {
 		t.Fatal(err)
 	}
-	core.flow.txMu.Lock()
-	defer core.flow.txMu.Unlock()
-	if core.flow.txLimit != 3 {
-		t.Fatal("old epoch restored returned credit")
+	if err := core.handleWindow(flowMessage{Next: 1024, Limit: 2048}); err != nil {
+		t.Fatal(err)
 	}
-	if core.ackedNext.Load() != 2 || !core.ackedFIN.Load() || core.flow.peerLeg1Next != 2 || core.flow.recovering {
-		t.Fatal("old epoch discarded valid receipt, FIN acknowledgement or leg1 progress")
+	core.stateMu.Lock()
+	defer core.stateMu.Unlock()
+	if core.tx.Una != 2049 || !core.tx.FINAcked || core.tx.WindowEnd != 4096 || core.tx.Buffered() != 0 {
+		t.Fatal("stale feedback changed ACK or window")
 	}
 }
 
 func TestFlowMinimumBudgetStillTransmits(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := flowTestConfig()
-		minimum := sessionMemoryReservation(cfg) + int64(cfg.ChunkSize) + receiveFrameOverhead
+		minimum := minimumSessionMemory(cfg)
 		cfg.Memory = newMemoryBudget(minimum, false)
 		left, app := newCore(context.Background(), cfg)
 		cfg.Memory = newMemoryBudget(minimum, false)

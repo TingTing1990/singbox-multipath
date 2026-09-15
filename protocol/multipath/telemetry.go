@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	senderStatusSchemaVersion byte = 1
-	senderStatusPayloadSize        = 228
+	senderStatusSchemaVersion byte = 2
+	senderStatusPayloadSize        = 292
 	senderStatusHeaderSize         = 3
 
 	senderStatusFlagActive byte = 1 << iota
@@ -20,6 +20,10 @@ const (
 )
 
 type senderStatus struct {
+	LegDeliveryRate          [2]uint64
+	LegDeliveryRTT           [2]uint64
+	LegMinimumRTT            [2]uint64
+	LegPipeline              [2]uint64
 	Sequence                 uint64
 	Flags                    byte
 	LogicalTX                uint64
@@ -100,6 +104,10 @@ func encodeSenderStatus(status senderStatus) [senderStatusPayloadSize]byte {
 		status.LegWriting,
 		status.LegWriteBlockedNanos,
 		status.LegPeakBacklog,
+		status.LegDeliveryRate,
+		status.LegDeliveryRTT,
+		status.LegMinimumRTT,
+		status.LegPipeline,
 	} {
 		put(values[0])
 		put(values[1])
@@ -148,6 +156,10 @@ func decodeSenderStatus(payload []byte) (senderStatus, error) {
 		&status.LegWriting,
 		&status.LegWriteBlockedNanos,
 		&status.LegPeakBacklog,
+		&status.LegDeliveryRate,
+		&status.LegDeliveryRTT,
+		&status.LegMinimumRTT,
+		&status.LegPipeline,
 	}
 	for _, values := range arrays {
 		values[0] = read()
@@ -237,6 +249,7 @@ func (c *mpCore) buildSenderStatus(now time.Time) senderStatus {
 	if c.active.Load() {
 		status.Flags |= senderStatusFlagActive
 	}
+	c.stateMu.Lock()
 	for index := range status.LegTX {
 		status.LegTX[index] = c.legCounters[index].txBytes.Load()
 		status.LegTXFrames[index] = c.legCounters[index].txFrames.Load()
@@ -250,11 +263,16 @@ func (c *mpCore) buildSenderStatus(now time.Time) senderStatus {
 		} else {
 			status.Flags |= senderStatusFlagLeg1Present
 		}
+		status.LegDeliveryRate[index] = uint64(leg.path.Rate)
+		status.LegDeliveryRTT[index] = uint64(leg.path.SRTT)
+		status.LegMinimumRTT[index] = uint64(leg.path.MinimumRTT)
+		status.LegPipeline[index] = leg.path.Pipeline(min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4), uint64(c.cfg.ReplayBytes))
 		status.LegBacklog[index] = uint64(max(0, leg.backlogBytes()))
 		writing, blocked := leg.writingSnapshot(now)
 		status.LegWriting[index] = uint64(max(0, writing))
 		status.LegWriteBlockedNanos[index] = uint64(max(0, blocked))
 	}
+	c.stateMu.Unlock()
 	memory := c.memory.snapshot()
 	status.MemoryUsed = uint64(max(0, memory.UsedBytes))
 	status.MemoryPeakUsed = uint64(max(0, memory.PeakUsedBytes))
@@ -338,6 +356,9 @@ func (c *mpCore) scheduleProbes(now time.Time) {
 		interval = 2 * time.Second
 	}
 	for index := range c.probePending {
+		if index == 1 && !c.active.Load() && c.legCounters[1].txBytes.Load() == 0 && c.legCounters[1].rxBytes.Load() == 0 {
+			continue
+		}
 		pending := c.probePending[index]
 		if pending.id != 0 && !pending.sentAt.IsZero() && now.Sub(pending.sentAt) >= 5*time.Second {
 			c.probeRTT[index].ProbeTimeout++

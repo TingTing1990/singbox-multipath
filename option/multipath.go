@@ -2,6 +2,7 @@ package option
 
 import (
 	"github.com/sagernet/sing/common/byteformats"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
@@ -23,7 +24,6 @@ type MultipathOutboundOptions struct {
 	ActivationWindow            badoption.Duration       `json:"activation_window,omitempty"`
 	ChunkSize                   uint32                   `json:"chunk_size,omitempty"`
 	QueueFrames                 uint32                   `json:"queue_frames,omitempty"`
-	BandwidthMbps               []uint32                 `json:"bandwidth_mbps,omitempty"`
 	MaxReorderFrames            uint32                   `json:"max_reorder_frames,omitempty"`
 	MaxReorderBytes             uint64                   `json:"max_reorder_bytes,omitempty"`
 	Leg1ReplayBytes             uint64                   `json:"leg1_replay_bytes,omitempty"`
@@ -31,6 +31,8 @@ type MultipathOutboundOptions struct {
 	MemoryLimit                 *byteformats.MemoryBytes `json:"memory_limit,omitempty"`
 	HandshakeTimeout            badoption.Duration       `json:"handshake_timeout,omitempty"`
 	StatusFile                  string                   `json:"status_file,omitempty"`
+	// Deprecated: accepted only to warn during migration; never used by the scheduler.
+	DeprecatedBandwidthMbps json.RawMessage `json:"bandwidth_mbps,omitempty"`
 }
 
 type MultipathInboundOptions struct {
@@ -43,11 +45,12 @@ type MultipathInboundOptions struct {
 	ActivationWindow            badoption.Duration       `json:"activation_window,omitempty"`
 	ChunkSize                   uint32                   `json:"chunk_size,omitempty"`
 	QueueFrames                 uint32                   `json:"queue_frames,omitempty"`
-	BandwidthMbps               []uint32                 `json:"bandwidth_mbps,omitempty"`
 	MaxReorderFrames            uint32                   `json:"max_reorder_frames,omitempty"`
 	MaxReorderBytes             uint64                   `json:"max_reorder_bytes,omitempty"`
 	Leg1ReplayBytes             uint64                   `json:"leg1_replay_bytes,omitempty"`
 	Leg1ReplayTimeout           badoption.Duration       `json:"leg1_replay_timeout,omitempty"`
 	MemoryLimit                 *byteformats.MemoryBytes `json:"memory_limit,omitempty"`
 	HandshakeTimeout            badoption.Duration       `json:"handshake_timeout,omitempty"`
+	// Deprecated: accepted only to warn during migration; never used by the scheduler.
+	DeprecatedBandwidthMbps json.RawMessage `json:"bandwidth_mbps,omitempty"`
 }

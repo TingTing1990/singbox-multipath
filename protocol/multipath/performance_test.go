@@ -93,7 +93,6 @@ func TestPerformanceHealthyLinks(t *testing.T) {
 				cfg.MaxReorderBytes = 64 << 20
 				cfg.ReplayBytes = 64 << 20
 				cfg.ReplayTimeout = time.Second
-				cfg.BandwidthMbps = []uint32{uint32(tc.rate0), uint32(tc.rate1)}
 				budget := int64(512 << 20)
 				senderMemory, receiverMemory := newMemoryBudget(budget, false), newMemoryBudget(budget, false)
 				var senders, receivers []*mpCore
