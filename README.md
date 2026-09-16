@@ -148,12 +148,15 @@ optional MPTCP path-management/security mechanism.
 
 ### Optional path failover
 
-`failover_enabled` defaults to `false` on both endpoints. Disabled outbounds create
-no shared recovery probes or UDP relay sockets; disabled inbounds listen only for
-TCP. Existing aggregation and direct child UDP forwarding remain unchanged.
+`failover_enabled` is a **client-only** option and defaults to `false`. Disabled
+outbounds create no shared recovery probes or UDP relay sockets; their existing
+aggregation and direct child UDP forwarding remain unchanged. The server always
+listens on TCP and UDP and accepts both ordinary and recovery-enabled sessions.
+It creates recovery groups only when requested by a client and has no
+`failover_enabled` configuration field.
 
-Enable the flag on **both** the client outbound and server inbound. The client
-sets `failover_timeout` (default `"5s"`) and `failback_delay` (default `"30s"`). Each
+Enable the flag on the client outbound. The client also sets `failover_timeout`
+(default `"5s"`) and `failback_delay` (default `"30s"`). Each
 outbound maintains one TCP control connection and one native UDP association per
 child, shared across all business connections. A path is healthy only while both
 transports have fresh challenge replies from the multipath server. A full failure
@@ -205,8 +208,9 @@ Client additions (independent of `aggregation_enabled`):
 }
 ```
 
-Server addition: `"failover_enabled": true`. The two durations are client-only;
-the client synchronizes its path selection and group lease to the server.
+No server-side recovery option is required or accepted. All three fields above
+are client-only; the client synchronizes its path selection and group lease to
+the server. Remove `failover_enabled` from existing inbound configurations.
 
 ### Connection shutdown
 
@@ -409,6 +413,7 @@ the shared memory budget separately control actual storage.
 | `outbounds` | Client path selection for **both directions**; tags are local, while hello messages identify the leg roles. | Exactly two child outbound tags. Both children must support TCP. | `["leg0", "leg1"]` |
 | `preferred` | Client assigns the shared leg 0 role; the server uses the leg IDs supplied by the client. | Session anchor, initial data path, and fallback path. Defaults to the first entry in `outbounds`; changing it affects both directions' path roles, not just upload scheduling. | `"leg0"` |
 | `udp_outbound` | Client UDP preference, independent of TCP. With failover, the selected path is synchronized for server replies. | Defaults to `preferred`. Without failover it forwards directly and may name another outbound. With failover it must be one of the two legs; both must support UDP, and the server relays all packets. | `"leg0"` or `"leg1"` |
+| `failover_enabled` | Client-only, applies to the entire session in both directions; the server accepts the requested mode. | Default `false`: no client recovery probes or UDP relay. When enabled, either leg may carry control and data. Independent of aggregation. The server always listens on TCP and UDP and has no matching option. | `true` or `false` |
 | `failover_timeout` | Client-only shared TCP/UDP health detection, applies to both directions. | Default `5s`; range `1s`–`5m`. A path needs fresh TCP and UDP replies. Only active when failover is enabled. | Duration, e.g. `"5s"` or `"10s"` |
 | `failback_delay` | Client-only preferred-path stability hold, applies to both directions. | Default `30s`; range `1s`–`1h`. TCP returns to leg 0; UDP returns to `udp_outbound`. Hold is bypassed if the fallback fails. | Duration, e.g. `"30s"` or `"1m"` |
 | `server` / `server_port` | Client connection destination for both legs; must reach the server listener. | Address and port of the remote multipath inbound. These are not the final application destination. | `"10.66.67.1"` / `39000` |
@@ -421,7 +426,6 @@ All fields below are available on both sides.
 
 | Field | Scope and peer interaction | Description | Accepted format / example |
 | --- | --- | --- | --- |
-| `failover_enabled` | Both endpoints must enable it; the client supplies shared path decisions. | Default `false`: no new recovery traffic or UDP relay. When enabled, either leg may carry control and data; the server additionally listens on UDP. Independent of aggregation. | `true` or `false` |
 | `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 except during optional failover, without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
 | `activation_on_queue` | **Local TX**; not negotiated. | **Condition 1**, an independent OR trigger: primary path in-flight plus local unsent bytes stay at least 80% of `chunk_size * queue_frames` for `activation_window`. Default: `true`. | `true` or `false` |
 | `activation_threshold_mbps` | **Local TX** ingress rate per connection; not negotiated. | **Condition 2**, an independent OR trigger measured over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |

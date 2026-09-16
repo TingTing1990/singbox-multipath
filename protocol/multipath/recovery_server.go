@@ -39,8 +39,8 @@ func (i *Inbound) recoveryGroup(id [16]byte) *recoveryServerGroup {
 }
 
 func (i *Inbound) serveRecoveryControl(conn net.Conn, h helloMessage, onClose N.CloseHandlerFunc) {
-	if !i.failoverEnabled || !h.Recovery || h.Group == [16]byte{} || h.Group != h.Session || h.Create || h.ChunkSize != 1 {
-		i.rejectHello(conn, onClose, helloRejectSessionMismatch, errors.New("multipath failover is not enabled or control hello is invalid"))
+	if !h.Recovery || h.Group == [16]byte{} || h.Group != h.Session || h.Create || h.ChunkSize != 1 {
+		i.rejectHello(conn, onClose, helloRejectSessionMismatch, errors.New("invalid multipath recovery control hello"))
 		return
 	}
 	i.recoveryMu.Lock()

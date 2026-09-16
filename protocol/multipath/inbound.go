@@ -42,14 +42,13 @@ type Inbound struct {
 	cfg              coreConfig
 	handshakeTimeout time.Duration
 
-	access          sync.Mutex
-	sessions        map[[16]byte]*serverSession
-	statusWake      chan struct{}
-	failoverEnabled bool
-	recoveryMu      sync.Mutex
-	recoveryGroups  map[[16]byte]*recoveryServerGroup
-	recoveryClosed  bool
-	recoveryCancel  context.CancelFunc
+	access         sync.Mutex
+	sessions       map[[16]byte]*serverSession
+	statusWake     chan struct{}
+	recoveryMu     sync.Mutex
+	recoveryGroups map[[16]byte]*recoveryServerGroup
+	recoveryClosed bool
+	recoveryCancel context.CancelFunc
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
@@ -126,7 +125,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		sessions:         make(map[[16]byte]*serverSession),
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
-		failoverEnabled:  options.FailoverEnabled,
+		recoveryGroups:   make(map[[16]byte]*recoveryServerGroup),
 		cfg: coreConfig{
 			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
 			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
@@ -144,15 +143,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Memory:                         memory,
 		},
 	}
-	networks := []string{N.NetworkTCP}
-	if options.FailoverEnabled {
-		networks = append(networks, N.NetworkUDP)
-		i.recoveryGroups = make(map[[16]byte]*recoveryServerGroup)
-	}
 	i.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
-		Network:           networks,
+		Network:           []string{N.NetworkTCP, N.NetworkUDP},
 		Listen:            options.ListenOptions,
 		ConnectionHandler: i,
 		PacketHandler:     i,
@@ -169,11 +163,9 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	}
 	i.cfg.Memory.startLogging(i.ctx, i.logger, "server")
 	go i.senderStatusLoop()
-	if i.failoverEnabled {
-		ctx, cancel := context.WithCancel(i.ctx)
-		i.recoveryCancel = cancel
-		go i.recoveryMaintenance(ctx)
-	}
+	ctx, cancel := context.WithCancel(i.ctx)
+	i.recoveryCancel = cancel
+	go i.recoveryMaintenance(ctx)
 	return nil
 }
 
@@ -223,9 +215,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	var group *recoveryServerGroup
 	if hello.Recovery {
-		if i.failoverEnabled {
-			group = i.recoveryGroup(hello.Group)
-		}
+		group = i.recoveryGroup(hello.Group)
 		if group == nil {
 			i.rejectHello(conn, onClose, helloRejectSessionMismatch, errRecoveryNotReady)
 			return

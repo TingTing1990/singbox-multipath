@@ -120,7 +120,7 @@ func (c *recoveryCountingChild) DialContext(ctx context.Context, network string,
 	return c.Outbound.DialContext(ctx, network, destination)
 }
 
-func TestMultipathRecoveryDisabledHasNoProbesOrUDPListener(t *testing.T) {
+func TestMultipathRecoveryClientDisabledHasNoProbes(t *testing.T) {
 	var calls atomic.Int32
 	registry := include.OutboundRegistry()
 	outbound.Register[option.DirectOutboundOptions](registry, "recovery-count", func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, opts option.DirectOutboundOptions) (adapter.Outbound, error) {
@@ -150,10 +150,10 @@ func TestMultipathRecoveryDisabledHasNoProbesOrUDPListener(t *testing.T) {
 		t.Fatalf("disabled recovery dialed children %d times", calls.Load())
 	}
 	udp, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", serverPort))
-	if err != nil {
-		t.Fatal("disabled server unexpectedly occupies UDP port:", err)
+	if err == nil {
+		udp.Close()
+		t.Fatal("server must listen on UDP regardless of the client recovery flag")
 	}
-	udp.Close()
 }
 
 func recoveryTestInstance(t *testing.T, fast, secondaryUDP, startDown bool, useHY2 ...bool) (*box.Box, *atomic.Bool, string) {
@@ -201,7 +201,6 @@ func recoveryTestInstance(t *testing.T, fast, secondaryUDP, startDown bool, useH
 		}
 	}
 	in := opts.Inbounds[1].Options.(*option.MultipathInboundOptions)
-	in.FailoverEnabled = true
 	out := opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions)
 	out.FailoverEnabled = true
 	out.FailoverTimeout = badoption.Duration(time.Second)
@@ -427,7 +426,6 @@ func TestMultipathRecoveryTFOCombinations(t *testing.T) {
 					for _, tfo1 := range []bool{false, true} {
 						t.Run(fmt.Sprintf("%s-%t/%s-%t/mp-%t", kind0, tfo0, kind1, tfo1, fast), func(t *testing.T) {
 							opts := multipathTFOTestOptions(fast, multipathTestLeg{tag: "leg0", kind: kind0, tfo: tfo0, proxyPort: otherPort}, multipathTestLeg{tag: "leg1", kind: kind1, tfo: tfo1, proxyPort: otherClientPort}, shadowaead.List[0], mkBase64(t, 16))
-							opts.Inbounds[1].Options.(*option.MultipathInboundOptions).FailoverEnabled = true
 							opts.Outbounds[len(opts.Outbounds)-1].Options.(*option.MultipathOutboundOptions).FailoverEnabled = true
 							startInstance(t, opts)
 							testTCP(t, clientPort, testPort)

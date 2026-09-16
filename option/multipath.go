@@ -40,7 +40,6 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
-	FailoverEnabled             bool                     `json:"failover_enabled,omitempty"`
 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
 	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
 	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`
