@@ -22,13 +22,23 @@ func (c *mpCore) pumpLoop() {
 		case <-timer.C:
 		}
 		now := time.Now()
+		if c.cfg.Recovery != nil {
+			for _, leg := range c.availableLegs() {
+				if !c.cfg.Recovery.allows(leg.id) {
+					c.legFailed(leg, legFailureReadData, errors.New("multipath path declared unavailable by shared health check"))
+				}
+			}
+		}
 		c.stateMu.Lock()
 		if c.isDone() {
 			c.stateMu.Unlock()
 			return
 		}
 		wait := time.Second
-		primary := c.getLeg(0)
+		primary := c.controlLeg()
+		if c.cfg.Recovery != nil && now.Sub(lastFeedback) >= time.Second {
+			c.feedbackDirty = true
+		}
 		if primary != nil && primary.ready.Load() && c.feedbackDirty {
 			if now.Sub(lastFeedback) >= 5*time.Millisecond || c.rx.Complete() {
 				c.legsMu.RLock()
@@ -80,6 +90,13 @@ func (c *mpCore) pumpLoop() {
 				// A full control channel is transient. Do not lose the FIN.
 				c.tx.FINSent = false
 				c.tx.Next--
+			} else {
+				c.finPath = primary
+			}
+		}
+		if c.cfg.Recovery != nil && primary != nil && c.finPath != primary && c.tx.FINSent && !c.tx.FINAcked {
+			if primary.tryQueueControl(wireFrame{typ: frameTypeFIN, seq: c.tx.FIN}) {
+				c.finPath = primary
 			}
 		}
 		c.updateStateCountersLocked()
@@ -165,10 +182,14 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	var chosen *mpLeg
 	score := math.Inf(1)
 	for _, leg := range legs {
+		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
+			continue
+		}
 		if leg.path.Stale || leg.busy {
 			continue
 		}
-		if !c.active.Load() && leg.id == 0 {
+		emergency := c.cfg.Recovery != nil && c.controlLeg() == leg && leg.id == 1
+		if (!c.active.Load() && leg.id == 0) || emergency {
 			return leg
 		}
 		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
@@ -191,8 +212,9 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 
 func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error {
 	prepaid := false
-	if !c.memory.reservePage(128, leg.id == 0) {
-		if leg.id != 0 || leg.prepaidFlights >= 16 {
+	essential := leg.id == 0 || (c.cfg.Recovery != nil && c.controlLeg() == leg)
+	if !c.memory.reservePage(128, essential) {
+		if !essential || leg.prepaidFlights >= 16 {
 			return errMemoryLimit
 		}
 		leg.prepaidFlights++
@@ -250,9 +272,12 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		if pruned && !stale && now.Sub(mapping.sentAt) < owner.path.RTO(c.cfg.ReplayTimeout) {
 			continue
 		}
-		target := c.getLeg(0)
+		target := c.controlLeg()
 		if mapping.path == 0 && stale && c.active.Load() {
 			target = c.getLeg(1)
+		}
+		if c.cfg.Recovery != nil && target != nil && !c.cfg.Recovery.allows(target.id) {
+			continue
 		}
 		if target == nil || target.busy || !target.ready.Load() || target.path.Stale {
 			continue

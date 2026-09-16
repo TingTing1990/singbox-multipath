@@ -300,7 +300,7 @@ func (c *mpCore) queueSenderStatus(now time.Time, force bool) bool {
 	if !c.cfg.SendStatus {
 		return false
 	}
-	leg0 := c.getLeg(0)
+	leg0 := c.controlLeg()
 	if leg0 == nil {
 		return false
 	}

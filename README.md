@@ -10,14 +10,15 @@ This branch adds an experimental `multipath` inbound and outbound. It carries on
 logical TCP byte stream over exactly two existing reliable outbounds. Traffic starts
 on the preferred, stable low-latency leg (leg 0); the secondary leg (leg 1) joins the
 data path after the configured traffic or queue threshold is reached. This is an
-application-layer aggregation protocol, not kernel MPTCP. UDP is not aggregated and
-is delegated to one selected child outbound.
+application-layer aggregation protocol, not kernel MPTCP. UDP is not aggregated.
+By default it uses one child directly; optional failover relays it through the
+same multipath server on either child while retaining the server's UDP socket.
 
 The multipath protocol does not provide authentication or encryption by itself. The
 aggregation listener should only be reachable through trusted or authenticated child
 paths, such as a private WireGuard path and a Hysteria2 path.
 
-Both endpoints must use multipath protocol **v9**. Older protocol versions are
+Both endpoints must use multipath protocol **v10** (beta6). Older protocol versions are
 rejected; there is no compatibility mode.
 
 ### Data path and leg roles
@@ -25,11 +26,12 @@ rejected; there is no compatibility mode.
 Leg 0 is the session anchor and preferred path. It creates the session, carries
 cumulative acknowledgements and stream control, and carries all application data
 before aggregation activates. This keeps connection setup and small transfers on the
-configured low-latency path. Losing leg 0 closes the logical connection because the
-session no longer has its control path.
+configured low-latency path. With recovery disabled, losing leg 0 closes the logical
+connection. Optional recovery permits session creation, control and data on leg 1.
 
 Leg 1 is a capacity booster. It can attach while the connection is still using only
-leg 0, but it does not carry application data until a local activation trigger fires.
+leg 0, but it does not carry application data until a local activation trigger fires
+or optional failover takes over from leg 0.
 Each direction makes that decision independently from its own accepted-byte count,
 measured rate, and leg 0 backlog. After activation, the scheduler compares outstanding
 path bytes divided by observed delivery rate. Receipt feedback comes from the far
@@ -48,7 +50,7 @@ replace Hysteria2's congestion controller with an outer TCP one.
 
 `aggregation_enabled` controls only the local sending direction: client upload on
 an outbound, server download on an inbound. With it disabled, all locally sent
-application data stays on leg 0. Leg 1 can still attach and receive data when the
+application data stays on leg 0, except during optional failover. Leg 1 can still attach and receive data when the
 peer enables aggregation, and the selected UDP outbound is unaffected.
 
 With aggregation enabled, the following triggers are independent alternatives
@@ -144,6 +146,68 @@ This is an independent implementation over reliable proxy streams, not MPTCP wir
 compatibility, native subflow TCP congestion control, or an implementation of every
 optional MPTCP path-management/security mechanism.
 
+### Optional path failover
+
+`failover_enabled` defaults to `false` on both endpoints. Disabled outbounds create
+no shared recovery probes or UDP relay sockets; disabled inbounds listen only for
+TCP. Existing aggregation and direct child UDP forwarding remain unchanged.
+
+Enable the flag on **both** the client outbound and server inbound. The client
+sets `failover_timeout` (default `"5s"`) and `failback_delay` (default `"30s"`). Each
+outbound maintains one TCP control connection and one native UDP association per
+child, shared across all business connections. A path is healthy only while both
+transports have fresh challenge replies from the multipath server. A full failure
+timeout declares it unavailable; a delayed old reply does not establish recovery.
+Checks normally run once per second. Detection and session reattachment add time
+to the configured timeout; it is not a bound on application-visible interruption.
+
+When leg 0 fails, existing TCP sessions retain their target connections, byte
+sequence numbers, receive windows and unacknowledged send history. Data, cumulative
+ACKs and FIN can use leg 1 without enabling aggregation. New sessions can also start
+on leg 1. The client reconnects lost transports; the server does not redial the
+target. A recovered leg 0 must remain healthy for the failback delay before normal
+leg roles resume. One missed probe does not reset that period; a full failure
+timeout does. If the fallback fails while the preferred path is available, the
+stability hold is bypassed. Explicit application closure, server restart, or loss
+of both paths beyond the recovery-group lease can still terminate a connection.
+
+With recovery enabled, `udp_outbound` is the **preferred UDP leg**, independently
+of TCP's leg 0 preference, and must name one of the two children. Both children must
+support TCP and UDP. UDP uses the server relay from the first packet, so switching
+paths does not replace the target-facing socket or its source port. Choosing leg 1
+for UDP keeps it on leg 1 when leg 0 fails and recovers; only a failure of the UDP
+preferred path triggers its own fallback. The same failure and return durations
+apply. Client-selected path epochs also direct server replies, including one-way
+application traffic; delayed messages cannot revert a newer selection.
+
+UDP payloads remain unreliable datagrams, not UDP-over-TCP. The relay fragments
+large packets into small outer datagrams and reassembles each independently, without
+retransmission. Missing fragments expire after five seconds. Buffers use the shared
+memory budget; pressure drops UDP packets rather than accumulating reliable queues.
+UDP associations expire after five minutes without application packets. Closed session
+IDs are retained for two minutes to reject delayed packets and joins; these records
+also consume the shared budget. Group state expires after no control or UDP
+traffic for `max(2 minutes, 4 * failover_timeout + failback_delay)`.
+
+The server's listening port must be reachable over **both TCP and UDP** through both
+children. The server's normal routing rules determine the final TCP and UDP exit.
+The protocol adds no authentication or encryption; keep this listener on trusted
+paths. Failover cannot prevent a game from disconnecting if its own timeout expires
+during detection, or preserve a socket across server restart.
+
+Client additions (independent of `aggregation_enabled`):
+
+```json
+{
+  "failover_enabled": true,
+  "failover_timeout": "5s",
+  "failback_delay": "30s"
+}
+```
+
+Server addition: `"failover_enabled": true`. The two durations are client-only;
+the client synchronizes its path selection and group lease to the server.
+
 ### Connection shutdown
 
 DATA_FIN occupies one byte-sequence position at the end of each sending direction.
@@ -168,16 +232,19 @@ error rather than a clean EOF, while local close interrupts pending application 
 
 ### Runtime telemetry
 
-When the client enables `status_file`, protocol v9 requests a compact sender-status
-frame from the server on leg 0. It reports the server-side downlink queues, replay and fallback counters,
+When the client enables `status_file`, protocol v10 requests a compact sender-status
+frame from the server on the control path (leg 0 normally, leg 1 during failover).
+It reports the server-side downlink queues, replay and fallback counters,
 write stalls, and memory pressure for the matching logical session. Status frames
 are coalesced and do not consume data sequence numbers, replay space, or the payload
 memory budget. The client marks remote status stale when updates stop rather than
 interpreting missing telemetry as zero.
 
 Active paths send low-rate PING/PONG probes independently of `status_file` for
-observability. Recovery timing uses DATA receipt samples, not probe success alone.
-An idle unused secondary is not probed just because it is attached. Reported RTT is the effective application-layer round trip and
+observability. Data reinjection timing uses DATA receipt samples, not probe success alone.
+An idle unused secondary does not receive per-flow probes just because it is attached.
+Optional failover separately uses shared TCP/UDP health probes on both children.
+Reported RTT is the effective application-layer round trip and
 therefore includes transport and proxy queueing. Probe timeouts and reinjection/stall
 counters describe multipath-visible events; they are not raw IP or UDP packet-loss
 measurements. Traffic peaks are the highest one-second averages since process start,
@@ -185,7 +252,9 @@ while memory peaks are updated directly by the allocator.
 
 Leg joins count successfully attached transports independently of local TX
 activation. Joins, attempts and reported remote failures retain closed-session
-totals; probe statistics cover active connections only. A lazy primary transport
+totals; probe statistics cover active connections only. With failover enabled, attempts
+count business TCP dials on each leg, excluding shared health connections. Without it,
+leg 0 attempts count created logical connections. A lazy primary transport
 can be attached before its deferred handshake finishes. Remote failure totals
 include only events actually reported by the peer.
 
@@ -199,7 +268,7 @@ than guessing from EOF, reset or QUIC cancellation text. The marker is diagnosti
 only: it does not change FIN handling, scheduling, recovery or close timing.
 Status schema 3 adds the source field. Confirmed endpoint-close events do not
 increment leg failure/event counters; other events, including unattributed and
-harmless closures, retain their existing counting semantics. Protocol v9 requires
+harmless closures, retain their existing counting semantics. Protocol v10 requires
 updating both endpoints.
 
 Remote scheduler rate estimates are not one-second throughput or physical link
@@ -339,7 +408,9 @@ the shared memory budget separately control actual storage.
 | --- | --- | --- | --- |
 | `outbounds` | Client path selection for **both directions**; tags are local, while hello messages identify the leg roles. | Exactly two child outbound tags. Both children must support TCP. | `["leg0", "leg1"]` |
 | `preferred` | Client assigns the shared leg 0 role; the server uses the leg IDs supplied by the client. | Session anchor, initial data path, and fallback path. Defaults to the first entry in `outbounds`; changing it affects both directions' path roles, not just upload scheduling. | `"leg0"` |
-| `udp_outbound` | Client UDP path selection, separate from the multipath TCP session; not negotiated. | Outbound used for UDP requests and replies without aggregation. Defaults to `preferred` and must support UDP; may name an outbound outside the two TCP legs. | `"leg0"` |
+| `udp_outbound` | Client UDP preference, independent of TCP. With failover, the selected path is synchronized for server replies. | Defaults to `preferred`. Without failover it forwards directly and may name another outbound. With failover it must be one of the two legs; both must support UDP, and the server relays all packets. | `"leg0"` or `"leg1"` |
+| `failover_timeout` | Client-only shared TCP/UDP health detection, applies to both directions. | Default `5s`; range `1s`–`5m`. A path needs fresh TCP and UDP replies. Only active when failover is enabled. | Duration, e.g. `"5s"` or `"10s"` |
+| `failback_delay` | Client-only preferred-path stability hold, applies to both directions. | Default `30s`; range `1s`–`1h`. TCP returns to leg 0; UDP returns to `udp_outbound`. Hold is bypassed if the fallback fails. | Duration, e.g. `"30s"` or `"1m"` |
 | `server` / `server_port` | Client connection destination for both legs; must reach the server listener. | Address and port of the remote multipath inbound. These are not the final application destination. | `"10.66.67.1"` / `39000` |
 | `tcp_fast_open` | Client connection setup / early TX; not a negotiated multipath flag. The server's same-named listen option has a different role. | Enables the multipath early-write path. Also enable TCP Fast Open on the preferred child and server inbound for SYN data. Default: `false`. | `true` or `false` |
 | `status_file` | Client-local file containing local TX/RX statistics and requested remote sender telemetry. | Optional path for periodically written status JSON. Enables client status probes and requests server TX statistics; the server does not use or write this path. Active-session recovery probes do not require it. | `"/var/run/multipath.json"` |
@@ -350,7 +421,8 @@ All fields below are available on both sides.
 
 | Field | Scope and peer interaction | Description | Accepted format / example |
 | --- | --- | --- | --- |
-| `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
+| `failover_enabled` | Both endpoints must enable it; the client supplies shared path decisions. | Default `false`: no new recovery traffic or UDP relay. When enabled, either leg may carry control and data; the server additionally listens on UDP. Independent of aggregation. | `true` or `false` |
+| `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 except during optional failover, without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
 | `activation_on_queue` | **Local TX**; not negotiated. | **Condition 1**, an independent OR trigger: primary path in-flight plus local unsent bytes stay at least 80% of `chunk_size * queue_frames` for `activation_window`. Default: `true`. | `true` or `false` |
 | `activation_threshold_mbps` | **Local TX** ingress rate per connection; not negotiated. | **Condition 2**, an independent OR trigger measured over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |
 | `activation_after_bytes` | **Local TX** cumulative application bytes per connection; not negotiated. | **Condition 3**, an independent OR trigger. Counts bytes accepted into the local multipath sender, not peer delivery or combined RX/TX traffic. `0` or omitted disables it. | Non-negative integer or memory string, e.g. `2097152`, `"2MB"`, or `0` |

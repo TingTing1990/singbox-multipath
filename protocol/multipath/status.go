@@ -227,6 +227,7 @@ func (s *statusSession) recordLegError(legID uint8, stage string, err error) {
 }
 
 type outboundStatusConfig struct {
+	recovery         *recoveryClient
 	tag              string
 	aggregation      string
 	udpOutbound      string
@@ -270,6 +271,8 @@ type outboundStatus struct {
 	connectionsMade uint64
 	legErrors       [2]statusErrorEvent
 	udpCounters     udpTrafficCounters
+	udpLegCounters  [2]udpTrafficCounters
+	previousUDPLegs [2]statusTraffic
 
 	sampleAccess      sync.Mutex
 	lastSample        time.Time
@@ -393,6 +396,19 @@ func (s *outboundStatus) recordLegError(legID uint8, stage string, destination s
 func (s *outboundStatus) countUDPTX(bytes int64) {
 	if s != nil && bytes > 0 {
 		s.udpCounters.txBytes.Add(uint64(bytes))
+	}
+}
+
+func (s *outboundStatus) countRecoveryUDP(id byte, rx bool, bytes int64) {
+	if s == nil || id > 1 || bytes <= 0 {
+		return
+	}
+	if rx {
+		s.countUDPRX(bytes)
+		s.udpLegCounters[id].rxBytes.Add(uint64(bytes))
+	} else {
+		s.countUDPTX(bytes)
+		s.udpLegCounters[id].txBytes.Add(uint64(bytes))
 	}
 }
 
@@ -591,6 +607,7 @@ type statusLeg struct {
 }
 
 type statusNode struct {
+	Recovery    *recoveryStatus  `json:"recovery,omitempty"`
 	Tag         string           `json:"tag"`
 	Type        string           `json:"type"`
 	Aggregation string           `json:"aggregation_server"`
@@ -834,14 +851,24 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		},
 	}
 	for index := range legs {
-		if legs[index].Tag == s.config.udpOutbound {
-			legs[index].UDPSelected = true
-			legs[index].UDPCurrent = udpRate
-			legs[index].UDPCumulative = udpTotals
-			legs[index].Current.TXBytesPS += udpRate.TXBytesPS
-			legs[index].Current.RXBytesPS += udpRate.RXBytesPS
-			legs[index].Cumulative.TXBytes += udpTotals.TXBytes
-			legs[index].Cumulative.RXBytes += udpTotals.RXBytes
+		if s.config.recovery != nil || legs[index].Tag == s.config.udpOutbound {
+			current, total := udpRate, udpTotals
+			legs[index].UDPSelected = legs[index].Tag == s.config.udpOutbound
+			if r := s.config.recovery; r != nil {
+				total = statusTraffic{TXBytes: s.udpLegCounters[index].txBytes.Load(), RXBytes: s.udpLegCounters[index].rxBytes.Load()}
+				current = statusRate{TXBytesPS: counterRate(total.TXBytes, s.previousUDPLegs[index].TXBytes, elapsed), RXBytesPS: counterRate(total.RXBytes, s.previousUDPLegs[index].RXBytes, elapsed)}
+				if firstSample {
+					current = statusRate{}
+				}
+				s.previousUDPLegs[index] = total
+				legs[index].UDPSelected = int(r.policy.udp.Load()) == index
+			}
+			legs[index].UDPCurrent = current
+			legs[index].UDPCumulative = total
+			legs[index].Current.TXBytesPS += current.TXBytesPS
+			legs[index].Current.RXBytesPS += current.RXBytesPS
+			legs[index].Cumulative.TXBytes += total.TXBytes
+			legs[index].Cumulative.RXBytes += total.RXBytes
 		}
 		if !legErrors[index].at.IsZero() {
 			legs[index].LastError = legErrors[index].message
@@ -1034,11 +1061,23 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.State = "preferred_only"
 	}
 
+	if r := s.config.recovery; r != nil {
+		for index := range legs {
+			legs[index].AttemptCount = r.attempts[index].Load()
+		}
+		if r.policy.mask.Load() == 0 {
+			logical.State = "unavailable"
+		} else if !r.policy.allows(0) {
+			logical.State = "failover"
+		}
+	}
 	return statusDocument{
+		// Recovery is additive to schema 3; older readers can ignore it.
 		SchemaVersion:    statusSchemaVersion,
 		GeneratedAt:      now.Format(time.RFC3339Nano),
 		ProcessStartedAt: s.startedAt.Format(time.RFC3339Nano),
 		Node: statusNode{
+			Recovery:    s.config.recovery.snapshot(now),
 			Tag:         s.config.tag,
 			Type:        "multipath",
 			Aggregation: s.config.aggregation,

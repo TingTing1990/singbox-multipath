@@ -11,6 +11,7 @@ import (
 )
 
 type coreConfig struct {
+	Recovery                       *recoveryPolicy
 	AggregationEnabled             bool
 	ActivationOnQueue              bool
 	ChunkSize                      int
@@ -156,7 +157,8 @@ type mpLeg struct {
 }
 
 type mpCore struct {
-	peerPressure    bool // stateMu; suppress speculative secondary assignments
+	finPath         *mpLeg // stateMu; retransmit FIN after a control path change
+	peerPressure    bool   // stateMu; suppress speculative secondary assignments
 	cfg             coreConfig
 	ctx             context.Context
 	cancel          context.CancelFunc

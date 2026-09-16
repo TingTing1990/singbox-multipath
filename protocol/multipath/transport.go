@@ -141,7 +141,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		}
 		switch frame.typ {
 		case frameTypeWindow:
-			if leg.id != 0 {
+			if leg.id != 0 && c.cfg.Recovery == nil {
 				err = errors.New("multipath feedback requires the primary path")
 			} else {
 				err = c.handleWindow(frame.flow)
@@ -151,13 +151,13 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 		case frameTypePong:
 			c.handlePong(leg.id, frame.seq, time.Now())
 		case frameTypeSenderStatus:
-			if leg.id != 0 {
+			if leg.id != 0 && c.cfg.Recovery == nil {
 				err = errors.New("multipath sender status requires the primary path")
 			} else {
 				c.handlePeerSenderStatus(frame.status, time.Now())
 			}
 		case frameTypeReset:
-			if leg.id == 1 {
+			if leg.id == 1 && c.cfg.Recovery == nil {
 				c.legFailed(leg, legFailureReadData, errors.New("multipath secondary reset"))
 			} else {
 				c.peerSessionClosed(errors.New("multipath peer reset"))
@@ -165,7 +165,7 @@ func (c *mpCore) legReadLoop(leg *mpLeg) {
 			return
 		case frameTypeSessionClose:
 			c.notePeerCloseReason(frame.closeReason)
-			if leg.id != 0 {
+			if leg.id != 0 && c.cfg.Recovery == nil {
 				// A delayed secondary terminal frame cannot close the logical
 				// stream before the primary's ordered terminal event arrives.
 				leg.peerTerminal.Store(true)
@@ -198,7 +198,7 @@ func (c *mpCore) receiveMapping(leg *mpLeg, frame wireFrame) error {
 	}
 	var err error
 	if frame.typ == frameTypeFIN {
-		if leg.id != 0 {
+		if leg.id != 0 && c.cfg.Recovery == nil {
 			return errors.New("multipath data FIN requires the primary path")
 		}
 		err = c.rx.SetFIN(frame.seq)
@@ -256,7 +256,7 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 		wakeFlow(c.pumpWake)
 		return
 	}
-	if leg.id == 0 {
+	if leg.id == 0 && c.cfg.Recovery == nil {
 		// Freeze a primary transport failure before it can make the relay
 		// close the logical connection; that cleanup is not an endpoint fault.
 		c.noteCloseSource(closeSourceTransport)
@@ -275,7 +275,7 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 	if c.cfg.OnLegFailure != nil {
 		c.cfg.OnLegFailure(leg.id, stage, eventErr)
 	}
-	if leg.id == 0 {
+	if leg.id == 0 && c.cfg.Recovery == nil {
 		if c.receiveComplete() {
 			c.terminateWithReceiveDrain(err, 0, true)
 		} else {

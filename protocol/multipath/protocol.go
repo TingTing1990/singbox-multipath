@@ -9,18 +9,21 @@ import (
 )
 
 var (
-	helloMagic    = [4]byte{'S', 'M', 'P', '9'}
+	helloMagic    = [4]byte{'S', 'M', 'P', 'A'}
 	responseMagic = [4]byte{'S', 'M', 'P', 'R'}
 )
 
 const (
-	helloVersion    byte = 9
-	helloFlagStatus byte = 1 << 0
+	helloVersion      byte = 10
+	helloFlagStatus   byte = 1 << 0
+	helloFlagRecovery byte = 1 << 1
+	helloFlagControl  byte = 1 << 2
+	helloFlagCreate   byte = 1 << 3
 
 	helloStatusOK       byte = 0
 	helloStatusRejected byte = 1
 
-	helloHeaderSize    = 29
+	helloHeaderSize    = 55
 	responseHeaderSize = 10
 )
 
@@ -30,6 +33,13 @@ type helloMessage struct {
 	RequestStatus bool
 	ChunkSize     uint32
 	Destination   string
+	Group         [16]byte
+	Recovery      bool
+	Control       bool
+	Create        bool
+	RecoveryEpoch uint64
+	RecoveryMask  byte
+	RecoveryUDP   byte
 }
 
 type helloResponse struct {
@@ -111,6 +121,18 @@ func encodeHelloHeader(message helloMessage) ([helloHeaderSize]byte, error) {
 	if message.RequestStatus {
 		header[6] |= helloFlagStatus
 	}
+	if message.Recovery {
+		header[6] |= helloFlagRecovery
+	}
+	if message.Control {
+		header[6] |= helloFlagControl
+	}
+	if message.Create {
+		header[6] |= helloFlagCreate
+	}
+	copy(header[29:45], message.Group[:])
+	binary.BigEndian.PutUint64(header[45:53], message.RecoveryEpoch)
+	header[53], header[54] = message.RecoveryMask, message.RecoveryUDP
 	copy(header[7:23], message.Session[:])
 	binary.BigEndian.PutUint32(header[23:27], message.ChunkSize)
 	binary.BigEndian.PutUint16(header[27:29], uint16(len(message.Destination)))
@@ -147,11 +169,23 @@ func readHello(conn net.Conn) (helloMessage, error) {
 	if string(header[0:4]) != string(helloMagic[:]) || header[4] != helloVersion {
 		return message, errors.New("invalid multipath hello")
 	}
-	if header[6]&^helloFlagStatus != 0 {
+	if header[6]&^(helloFlagStatus|helloFlagRecovery|helloFlagControl|helloFlagCreate) != 0 {
 		return message, errors.New("invalid multipath hello flags")
 	}
 	message.LegID = header[5]
 	message.RequestStatus = header[6]&helloFlagStatus != 0
+	message.Recovery = header[6]&helloFlagRecovery != 0
+	message.Control = header[6]&helloFlagControl != 0
+	message.Create = header[6]&helloFlagCreate != 0
+	copy(message.Group[:], header[29:45])
+	message.RecoveryEpoch = binary.BigEndian.Uint64(header[45:53])
+	message.RecoveryMask, message.RecoveryUDP = header[53], header[54]
+	if message.RecoveryMask > 3 || message.RecoveryUDP > 1 {
+		return message, errors.New("invalid recovery policy")
+	}
+	if !message.Recovery && (message.Control || message.Create || message.Group != [16]byte{} || message.RecoveryEpoch != 0 || message.RecoveryMask != 0 || message.RecoveryUDP != 0) {
+		return message, errors.New("invalid multipath recovery flags")
+	}
 	copy(message.Session[:], header[7:23])
 	message.ChunkSize = binary.BigEndian.Uint32(header[23:27])
 	if message.ChunkSize == 0 || message.ChunkSize > maxFramePayload {

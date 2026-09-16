@@ -162,7 +162,7 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		}
 	}
 	c.legs[id] = leg
-	if id == 0 {
+	if id == 0 || c.cfg.Recovery != nil {
 		initial := wireFrame{typ: frameTypeWindow, flow: c.feedbackLockedWithoutLegs()}
 		if early, ok := conn.(*clientFastOpenConn); ok {
 			encoded := encodeFlow(initial)

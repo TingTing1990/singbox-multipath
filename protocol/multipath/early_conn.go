@@ -200,7 +200,15 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 		c.helloOnce.Do(func() {
 			c.core.startWorkers(func() {
 				if err := c.primary.writeHelloOnly(); err != nil {
-					c.core.fail(err)
+					if c.core.cfg.Recovery == nil {
+						c.core.fail(err)
+					} else {
+						for _, leg := range c.core.availableLegs() {
+							if leg.conn == c.primary {
+								c.core.legFailed(leg, legFailureHandshake, err)
+							}
+						}
+					}
 				}
 			})
 		})
@@ -219,6 +227,9 @@ func (c *earlyLogicalConn) Write(payload []byte) (int, error) {
 func (c *earlyLogicalConn) waitInitialWrite() error {
 	select {
 	case <-c.primary.startDone:
+		if c.core.cfg.Recovery != nil && !c.core.isDone() {
+			return nil
+		}
 		return c.primary.startErr
 	case <-c.core.appConn.writeClosed:
 		return net.ErrClosed

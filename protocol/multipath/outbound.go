@@ -40,6 +40,10 @@ type Outbound struct {
 	handshakeTimeout time.Duration
 	statusFile       string
 	status           *outboundStatus
+	failoverEnabled  bool
+	failoverTimeout  time.Duration
+	failbackDelay    time.Duration
+	recovery         *recoveryClient
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathOutboundOptions) (adapter.Outbound, error) {
@@ -68,6 +72,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	udpTag := options.UDPOutbound
 	if udpTag == "" {
 		udpTag = preferred
+	}
+	failoverTimeout, failbackDelay, err := recoveryDurations(time.Duration(options.FailoverTimeout), time.Duration(options.FailbackDelay))
+	if err != nil {
+		return nil, err
+	}
+	if options.FailoverEnabled && !slices.Contains(tags, udpTag) {
+		return nil, E.New("failover requires udp_outbound to be one of the two legs")
 	}
 	threshold := resolveActivationThreshold(options.ActivationThresholdMbps, activationAfterBytes)
 	window := time.Duration(options.ActivationWindow)
@@ -145,6 +156,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		tcpFastOpen:      options.TCPFastOpen,
 		handshakeTimeout: handshakeTimeout,
 		statusFile:       options.StatusFile,
+		failoverEnabled:  options.FailoverEnabled,
+		failoverTimeout:  failoverTimeout,
+		failbackDelay:    failbackDelay,
 		cfg: coreConfig{
 			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
 			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
@@ -175,6 +189,9 @@ func (o *Outbound) Start() error {
 			return E.New("multipath child does not support TCP: ", tag)
 		}
 		o.children[index] = child
+		if o.failoverEnabled && !slices.Contains(child.Network(), N.NetworkUDP) {
+			return E.New("failover requires TCP and UDP on both legs: ", tag)
+		}
 	}
 	udpOutbound, loaded := o.manager.Outbound(o.udpTag)
 	if !loaded {
@@ -184,6 +201,14 @@ func (o *Outbound) Start() error {
 		return E.New("multipath UDP outbound does not support UDP: ", o.udpTag)
 	}
 	o.udpOutbound = udpOutbound
+	if o.failoverEnabled {
+		var err error
+		o.recovery, err = newRecoveryClient(o)
+		if err != nil {
+			return err
+		}
+		o.cfg.Recovery = &o.recovery.policy
+	}
 	if o.statusFile != "" {
 		var legTypes [2]string
 		for index, child := range o.children {
@@ -198,22 +223,36 @@ func (o *Outbound) Start() error {
 			legTags:          [2]string{o.tags[0], o.tags[1]},
 			legTypes:         legTypes,
 			cfg:              o.cfg,
+			recovery:         o.recovery,
 		})
 		o.status.start(o.ctx, func(err error) {
 			o.logger.Warn("write multipath status: ", err)
 		})
 	}
 	o.cfg.Memory.startLogging(o.ctx, o.logger, "client")
+	if o.recovery != nil {
+		o.recovery.start()
+	}
 	return nil
 }
 
 func (o *Outbound) Close() error {
+	if o.recovery != nil {
+		o.recovery.close()
+	}
 	return o.status.close()
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkUDP:
+		if o.recovery != nil {
+			conn, err := o.recovery.listenPacket(ctx, destination)
+			if err != nil {
+				return nil, err
+			}
+			return bufio.NewBindPacketConn(conn, destination), nil
+		}
 		conn, err := o.udpOutbound.DialContext(ctx, network, destination)
 		if err != nil {
 			return conn, err
@@ -225,6 +264,9 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 	if len(o.children) != 2 {
 		return nil, E.New("multipath outbound is not started")
+	}
+	if o.recovery != nil {
+		return o.dialRecovery(ctx, destination)
 	}
 	if o.tcpFastOpen {
 		return o.dialTCPFastOpen(ctx, destination)
@@ -487,6 +529,9 @@ func (o *Outbound) joinSecondary(core *mpCore, sessionID [16]byte, chunkSize uin
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if o.recovery != nil {
+		return o.recovery.listenPacket(ctx, destination)
+	}
 	if o.udpOutbound == nil {
 		return nil, E.New("multipath outbound is not started")
 	}

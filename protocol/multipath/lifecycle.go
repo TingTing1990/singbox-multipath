@@ -59,7 +59,7 @@ func (c *mpCore) closeApplication() error {
 	c.localClosing.Store(true)
 	c.localReadClosed.Store(true)
 	err, _ := c.appConn.closeInternal()
-	if c.getLeg(0) == nil {
+	if c.getLeg(0) == nil && c.cfg.Recovery == nil {
 		c.fail(io.EOF)
 	} else {
 		c.finishApplicationClose()
@@ -125,7 +125,7 @@ func (c *mpCore) terminateWithReceiveDrain(err error, terminalFrameType byte, dr
 		c.legsMu.RUnlock()
 		for _, leg := range legs {
 			var legStatus *senderStatus
-			if leg.id == 0 {
+			if leg.id == 0 || c.cfg.Recovery != nil {
 				legStatus = finalStatus
 			}
 			leg.requestShutdown(err, terminalFrameType, legStatus)

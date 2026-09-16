@@ -16,6 +16,9 @@ type MultipathOutboundOptions struct {
 	Server                      string                   `json:"server"`
 	ServerPort                  uint16                   `json:"server_port"`
 	TCPFastOpen                 bool                     `json:"tcp_fast_open,omitempty"`
+	FailoverEnabled             bool                     `json:"failover_enabled,omitempty"`
+	FailoverTimeout             badoption.Duration       `json:"failover_timeout,omitempty"`
+	FailbackDelay               badoption.Duration       `json:"failback_delay,omitempty"`
 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
 	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
 	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`
@@ -37,6 +40,7 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
+	FailoverEnabled             bool                     `json:"failover_enabled,omitempty"`
 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
 	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
 	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`

@@ -24,6 +24,7 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 type serverSession struct {
+	group         *recoveryServerGroup
 	id            [16]byte
 	destination   M.Socksaddr
 	chunkSize     uint32
@@ -41,9 +42,14 @@ type Inbound struct {
 	cfg              coreConfig
 	handshakeTimeout time.Duration
 
-	access     sync.Mutex
-	sessions   map[[16]byte]*serverSession
-	statusWake chan struct{}
+	access          sync.Mutex
+	sessions        map[[16]byte]*serverSession
+	statusWake      chan struct{}
+	failoverEnabled bool
+	recoveryMu      sync.Mutex
+	recoveryGroups  map[[16]byte]*recoveryServerGroup
+	recoveryClosed  bool
+	recoveryCancel  context.CancelFunc
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MultipathInboundOptions) (adapter.Inbound, error) {
@@ -120,6 +126,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		sessions:         make(map[[16]byte]*serverSession),
 		statusWake:       make(chan struct{}, 1),
 		handshakeTimeout: handshakeTimeout,
+		failoverEnabled:  options.FailoverEnabled,
 		cfg: coreConfig{
 			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
 			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
@@ -137,12 +144,18 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Memory:                         memory,
 		},
 	}
+	networks := []string{N.NetworkTCP}
+	if options.FailoverEnabled {
+		networks = append(networks, N.NetworkUDP)
+		i.recoveryGroups = make(map[[16]byte]*recoveryServerGroup)
+	}
 	i.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
-		Network:           []string{N.NetworkTCP},
+		Network:           networks,
 		Listen:            options.ListenOptions,
 		ConnectionHandler: i,
+		PacketHandler:     i,
 	})
 	return i, nil
 }
@@ -156,10 +169,29 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	}
 	i.cfg.Memory.startLogging(i.ctx, i.logger, "server")
 	go i.senderStatusLoop()
+	if i.failoverEnabled {
+		ctx, cancel := context.WithCancel(i.ctx)
+		i.recoveryCancel = cancel
+		go i.recoveryMaintenance(ctx)
+	}
 	return nil
 }
 
 func (i *Inbound) Close() error {
+	if i.recoveryCancel != nil {
+		i.recoveryCancel()
+	}
+	i.recoveryMu.Lock()
+	i.recoveryClosed = true
+	var groups []*recoveryServerGroup
+	for _, g := range i.recoveryGroups {
+		groups = append(groups, g)
+	}
+	clear(i.recoveryGroups)
+	i.recoveryMu.Unlock()
+	for _, g := range groups {
+		g.close()
+	}
 	listenerErr := i.listener.Close()
 	i.access.Lock()
 	sessions := make([]*serverSession, 0, len(i.sessions))
@@ -185,6 +217,21 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		i.rejectHello(conn, onClose, helloRejectInvalidLegID, E.New("invalid multipath leg id: ", hello.LegID))
 		return
 	}
+	if hello.Control {
+		i.serveRecoveryControl(conn, hello, onClose)
+		return
+	}
+	var group *recoveryServerGroup
+	if hello.Recovery {
+		if i.failoverEnabled {
+			group = i.recoveryGroup(hello.Group)
+		}
+		if group == nil {
+			i.rejectHello(conn, onClose, helloRejectSessionMismatch, errRecoveryNotReady)
+			return
+		}
+		group.policy.update(hello.RecoveryEpoch, hello.RecoveryMask, hello.RecoveryUDP)
+	}
 	destination := M.ParseSocksaddr(hello.Destination)
 	if !destination.IsValid() || destination.Port == 0 {
 		i.rejectHello(conn, onClose, helloRejectInvalidDestination, E.New("invalid multipath destination: ", hello.Destination))
@@ -194,12 +241,12 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	i.access.Lock()
 	session := i.sessions[hello.Session]
 	if session != nil {
-		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize || session.requestStatus != hello.RequestStatus {
+		if session.destination.String() != destination.String() || session.chunkSize != hello.ChunkSize || session.requestStatus != hello.RequestStatus || session.group != group {
 			i.access.Unlock()
 			i.rejectHello(conn, onClose, helloRejectSessionMismatch, E.New("multipath session parameters mismatch"))
 			return
 		}
-		if hello.LegID != 1 {
+		if hello.LegID != 1 && group == nil {
 			i.access.Unlock()
 			i.rejectHello(conn, onClose, helloRejectDuplicateControl, E.New("multipath session already has a control leg"))
 			return
@@ -223,10 +270,21 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		i.logger.InfoContext(ctx, "multipath leg ", hello.LegID, " joined session for ", destination)
 		return
 	}
-	if hello.LegID != 0 {
+	if (group == nil && hello.LegID != 0) || (group != nil && !hello.Create) {
 		i.access.Unlock()
 		i.rejectHello(conn, onClose, helloRejectSessionUnavailable, E.New("multipath control leg must create the session"))
 		return
+	}
+	if group != nil {
+		group.mu.Lock()
+		_, closed := group.closedTCP[hello.Session]
+		unavailable := group.closed || closed
+		group.mu.Unlock()
+		if unavailable {
+			i.access.Unlock()
+			i.rejectHello(conn, onClose, helloRejectSessionUnavailable, errCoreClosed)
+			return
+		}
 	}
 	if int(hello.ChunkSize) > i.cfg.ChunkSize {
 		i.access.Unlock()
@@ -235,6 +293,9 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 
 	cfg := i.cfg
+	if group != nil {
+		cfg.Recovery = &group.policy
+	}
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
 	cfg.OnProtocolError = func(err error) {
@@ -252,13 +313,32 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			" ", info.String(),
 		)
 	}
+	if group != nil {
+		group.mu.Lock()
+		if group.closed || !i.cfg.Memory.reservePage(128, true) {
+			group.mu.Unlock()
+			i.access.Unlock()
+			i.rejectHello(conn, onClose, helloRejectLegUnavailable, errMemoryLimit)
+			return
+		}
+		group.closedTCP[hello.Session] = time.Time{}
+		group.mu.Unlock()
+	}
 	core, appConn, err := newCoreWithError(i.ctx, cfg)
 	if err != nil {
+		if group != nil {
+			group.mu.Lock()
+			if !group.closed {
+				group.closedTCP[hello.Session] = time.Now()
+			}
+			group.mu.Unlock()
+		}
 		i.access.Unlock()
 		i.rejectHello(conn, onClose, helloRejectLegUnavailable, E.Cause(err, "create multipath session"))
 		return
 	}
 	session = &serverSession{
+		group:         group,
 		id:            hello.Session,
 		destination:   destination,
 		chunkSize:     uint32(cfg.ChunkSize),
@@ -320,6 +400,13 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 	i.access.Lock()
 	if current := i.sessions[id]; current == session {
 		delete(i.sessions, id)
+		if session.group != nil {
+			session.group.mu.Lock()
+			if !session.group.closed {
+				session.group.closedTCP[id] = time.Now()
+			}
+			session.group.mu.Unlock()
+		}
 	}
 	i.access.Unlock()
 }
