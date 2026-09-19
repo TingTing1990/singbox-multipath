@@ -539,14 +539,18 @@ jobs:
 
           echo "PASS: frozen donor resolved exactly at ${DONOR_SHA}"
 
-      - name: Byte-compare Mieru outbound with frozen donor
+            - name: Byte-compare Mieru outbound with frozen donor
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          DONOR_FILE="${
-            RUNNER_TEMP
-          }/mbox-donor/protocol/mieru/outbound.go"
+          DONOR_FILE="${RUNNER_TEMP}/mbox-donor/protocol/mieru/outbound.go"
+
+          if [ ! -f "${DONOR_FILE}" ]; then
+            echo "FAIL: frozen donor outbound file does not exist"
+            echo "expected_path=${DONOR_FILE}"
+            exit 1
+          fi
 
           if ! cmp \
             protocol/mieru/outbound.go \
@@ -568,7 +572,7 @@ jobs:
           echo "=== DONOR SHA256 ==="
           sha256sum "${DONOR_FILE}"
 
-          echo "PASS: outbound.go is byte-identical to frozen donor"
+          echo "PASS: outbound.go is byte-identical to frozen donor ${DONOR_SHA}"
 
       - name: Check source patch whitespace
         shell: bash
