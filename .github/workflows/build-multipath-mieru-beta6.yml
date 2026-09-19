@@ -1,0 +1,882 @@
+name: Build Multipath + Mieru beta6 v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch/tag/commit to audit and build"
+        required: true
+        type: string
+        default: "feature/mieru-outbound-beta6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multipath-mieru-beta6-v2-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.source_ref }}
+
+  BASE_SHA: 31970756db5fd37d9e4080734dfeed9ffd5ceefd
+
+  DONOR_REPO: https://github.com/enfein/mbox.git
+  DONOR_SHA: 7300c5fc048ce99306f2eda3d63c2c7bda389177
+
+  MIERU_VERSION: v3.36.1
+  GO_VERSION: 1.25.5
+
+  BUILD_VERSION: 1.14.0-multipath-mieru-beta6
+
+jobs:
+  audit:
+    name: Static source audit
+    runs-on: ubuntu-latest
+
+    outputs:
+      source_sha: ${{ steps.source_identity.outputs.source_sha }}
+
+    steps:
+      - name: Checkout source candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Setup frozen Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Resolve source identity
+        id: source_identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_SHA="$(git rev-parse HEAD)"
+
+          echo "source_sha=${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+
+          echo "=== SOURCE IDENTITY ==="
+          echo "source_ref=${SOURCE_REF}"
+          echo "source_sha=${SOURCE_SHA}"
+          echo "base_sha=${BASE_SHA}"
+          echo "donor_sha=${DONOR_SHA}"
+          echo "mieru_version=${MIERU_VERSION}"
+          echo "go_version=${GO_VERSION}"
+          echo
+          go version
+
+      - name: Verify frozen base ancestry
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git cat-file -e "${BASE_SHA}^{commit}"
+
+          if ! git merge-base --is-ancestor "${BASE_SHA}" HEAD; then
+            echo "FAIL: source candidate does not descend from frozen base"
+            exit 1
+          fi
+
+          echo "PASS: source descends from frozen base ${BASE_SHA}"
+
+      - name: Verify exact approved write-set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git diff --name-only "${BASE_SHA}..HEAD" \
+            | grep -v '^\.github/workflows/build-multipath-mieru-beta6\.yml$' \
+            | sort \
+            > /tmp/actual-files.txt
+
+          cat > /tmp/expected-files.txt <<'EOF'
+          constant/proxy.go
+          go.mod
+          go.sum
+          include/registry.go
+          option/mieru.go
+          protocol/mieru/outbound.go
+          EOF
+
+          sort -o /tmp/expected-files.txt /tmp/expected-files.txt
+
+          echo "=== ACTUAL FUNCTIONAL DELTA ==="
+          cat /tmp/actual-files.txt
+
+          echo
+          echo "=== APPROVED FUNCTIONAL DELTA ==="
+          cat /tmp/expected-files.txt
+
+          echo
+          diff -u /tmp/expected-files.txt /tmp/actual-files.txt
+
+          echo "PASS: exactly six approved functional files changed"
+
+      - name: Reconstruct and verify exact base-derived delta
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import difflib
+          import os
+          import subprocess
+          import sys
+
+          base = os.environ["BASE_SHA"]
+
+          def git_show(path):
+              return subprocess.check_output(
+                  ["git", "show", f"{base}:{path}"],
+                  text=True,
+              )
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"FAIL: {label}: expected one anchor, found {count}"
+                  )
+              return text.replace(old, new, 1)
+
+          def compare(path, expected):
+              actual = Path(path).read_text()
+
+              if actual == expected:
+                  print(f"PASS: exact delta: {path}")
+                  return
+
+              print(f"FAIL: unexpected content delta: {path}")
+
+              for line in difflib.unified_diff(
+                  expected.splitlines(True),
+                  actual.splitlines(True),
+                  fromfile=f"expected/{path}",
+                  tofile=f"actual/{path}",
+              ):
+                  sys.stdout.write(line)
+
+              raise SystemExit(1)
+
+          # ----------------------------------------------------------
+          # constant/proxy.go
+          # Frozen base + exactly:
+          #   TypeMieru = "mieru"
+          #   ProxyDisplayName(TypeMieru) => "Mieru"
+          # ----------------------------------------------------------
+
+          expected = git_show("constant/proxy.go")
+
+          anchor = '\tTypeAnyTLS            = "anytls"\n'
+          expected = replace_once(
+              expected,
+              anchor,
+              anchor + '\tTypeMieru              = "mieru"\n',
+              "constant TypeMieru",
+          )
+
+          anchor = '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n'
+          expected = replace_once(
+              expected,
+              anchor,
+              anchor + '\tcase TypeMieru:\n\t\treturn "Mieru"\n',
+              "constant Mieru display name",
+          )
+
+          compare("constant/proxy.go", expected)
+
+          # ----------------------------------------------------------
+          # include/registry.go
+          # Frozen base + exactly:
+          #   mieru import
+          #   mieru.RegisterOutbound(registry)
+          # No inbound registration.
+          # ----------------------------------------------------------
+
+          expected = git_show("include/registry.go")
+
+          anchor = (
+              '\t"github.com/sagernet/sing-box/protocol/mixed"\n'
+          )
+
+          expected = replace_once(
+              expected,
+              anchor,
+              '\t"github.com/sagernet/sing-box/protocol/mieru"\n'
+              + anchor,
+              "registry Mieru import",
+          )
+
+          anchor = '\tmultipath.RegisterOutbound(registry)\n'
+
+          expected = replace_once(
+              expected,
+              anchor,
+              anchor + '\tmieru.RegisterOutbound(registry)\n',
+              "registry Mieru outbound",
+          )
+
+          compare("include/registry.go", expected)
+
+          # ----------------------------------------------------------
+          # go.mod
+          # Frozen base + exactly one direct dependency:
+          # github.com/enfein/mieru/v3 v3.36.1
+          # ----------------------------------------------------------
+
+          expected = git_show("go.mod")
+
+          anchor = (
+              '\tgithub.com/dblohm7/wingoes '
+              'v0.0.0-20240119213807-a09d6be7affa\n'
+          )
+
+          expected = replace_once(
+              expected,
+              anchor,
+              anchor
+              + '\tgithub.com/enfein/mieru/v3 v3.36.1\n',
+              "go.mod Mieru dependency",
+          )
+
+          compare("go.mod", expected)
+
+          # ----------------------------------------------------------
+          # go.sum
+          # Frozen base + exactly two Mieru v3.36.1 checksum lines,
+          # inserted at the canonical module-order position.
+          # ----------------------------------------------------------
+
+          lines = git_show("go.sum").splitlines(keepends=True)
+
+          marker = (
+              "github.com/ebitengine/purego v0.10.0/go.mod "
+          )
+
+          positions = [
+              i for i, line in enumerate(lines)
+              if line.startswith(marker)
+          ]
+
+          if len(positions) != 1:
+              raise SystemExit(
+                  "FAIL: go.sum purego insertion anchor is ambiguous"
+              )
+
+          insert_at = positions[0] + 1
+
+          mieru_sums = [
+              "github.com/enfein/mieru/v3 v3.36.1 "
+              "h1:g8iaFf+jNc/MGE3qiGslJ4BPSPTeWPmULa0HIvfhENM=\n",
+
+              "github.com/enfein/mieru/v3 v3.36.1/go.mod "
+              "h1:zJBUCsi5rxyvHM8fjFf+GLaEl4OEjjBXr1s5F6Qd3hM=\n",
+          ]
+
+          lines[insert_at:insert_at] = mieru_sums
+
+          expected = "".join(lines)
+
+          compare("go.sum", expected)
+
+          print("PASS: all four base-derived files are exact approved deltas")
+          PY
+
+      - name: Verify exact canonical outbound-only option
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > /tmp/mieru-option.expected.go <<'EOF'
+          package option
+
+          import "github.com/sagernet/sing/common/json/badoption"
+
+          type MieruOutboundOptions struct {
+          	DialerOptions
+          	ServerOptions
+          	ServerPortRanges badoption.Listable[string] `json:"server_ports,omitempty"`
+          	Transport        string                     `json:"transport,omitempty"`
+          	UserName         string                     `json:"username,omitempty"`
+          	Password         string                     `json:"password,omitempty"`
+          	Multiplexing     string                     `json:"multiplexing,omitempty"`
+          	TrafficPattern   string                     `json:"traffic_pattern,omitempty"`
+          }
+          EOF
+
+          cmp \
+            /tmp/mieru-option.expected.go \
+            option/mieru.go
+
+          echo "PASS: option/mieru.go is exact outbound-only canonical version"
+
+      - name: Reject every Mieru inbound surface
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [ -e protocol/mieru/inbound.go ]; then
+            echo "FAIL: protocol/mieru/inbound.go exists"
+            exit 1
+          fi
+
+          if grep -Rns \
+            --include='*.go' \
+            -E \
+            'MieruInboundOptions|MieruUser|mieru\.RegisterInbound' \
+            constant option protocol include
+          then
+            echo "FAIL: forbidden Mieru inbound symbol detected"
+            exit 1
+          fi
+
+          echo "PASS: Mieru inbound is absent"
+
+      - name: Verify Multipath registrations remain present
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          grep -Fq \
+            '"github.com/sagernet/sing-box/protocol/multipath"' \
+            include/registry.go
+
+          grep -Fq \
+            'multipath.RegisterInbound(registry)' \
+            include/registry.go
+
+          grep -Fq \
+            'multipath.RegisterOutbound(registry)' \
+            include/registry.go
+
+          echo "PASS: Multipath inbound/outbound registration remains present"
+
+      - name: Fetch frozen Mieru donor
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DONOR_DIR="${RUNNER_TEMP}/mbox-donor"
+
+          rm -rf "${DONOR_DIR}"
+
+          git init "${DONOR_DIR}"
+
+          git -C "${DONOR_DIR}" \
+            remote add origin "${DONOR_REPO}"
+
+          git -C "${DONOR_DIR}" \
+            fetch \
+            --depth=1 \
+            origin "${DONOR_SHA}"
+
+          git -C "${DONOR_DIR}" \
+            checkout --detach FETCH_HEAD
+
+          ACTUAL_DONOR_SHA="$(
+            git -C "${DONOR_DIR}" rev-parse HEAD
+          )"
+
+          if [ "${ACTUAL_DONOR_SHA}" != "${DONOR_SHA}" ]; then
+            echo "FAIL: donor SHA mismatch"
+            echo "expected=${DONOR_SHA}"
+            echo "actual=${ACTUAL_DONOR_SHA}"
+            exit 1
+          fi
+
+          echo "PASS: frozen donor resolved exactly"
+
+      - name: Byte-compare Mieru outbound with frozen donor
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DONOR_FILE="${RUNNER_TEMP}/mbox-donor/protocol/mieru/outbound.go"
+
+          cmp \
+            protocol/mieru/outbound.go \
+            "${DONOR_FILE}"
+
+          echo "=== CANDIDATE SHA256 ==="
+          sha256sum protocol/mieru/outbound.go
+
+          echo "=== DONOR SHA256 ==="
+          sha256sum "${DONOR_FILE}"
+
+          echo "PASS: Mieru outbound is byte-identical to donor ${DONOR_SHA}"
+
+      - name: Check canonical new option formatting
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          BAD="$(gofmt -l option/mieru.go)"
+
+          if [ -n "${BAD}" ]; then
+            echo "FAIL: option/mieru.go is not gofmt-clean"
+            echo "${BAD}"
+            exit 1
+          fi
+
+          echo "PASS: option/mieru.go is gofmt-clean"
+
+      - name: Check patch whitespace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git diff --check "${BASE_SHA}..HEAD"
+
+          echo "PASS: changed source has no whitespace errors"
+
+      - name: Verify module checksums
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          go mod verify
+
+          echo "PASS: go mod verify"
+
+      - name: Verify module graph is tidy without mutation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          go mod tidy -diff
+
+          echo "PASS: go mod tidy -diff"
+
+      - name: Compile changed Go packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          go test \
+            ./constant \
+            ./option \
+            ./protocol/mieru
+
+          echo "PASS: changed package graph compiles on audit runner"
+
+  build-darwin-amd64:
+    name: Build macOS Intel
+    needs:
+      - audit
+
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout audited source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.audit.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Setup frozen Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Resolve build inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+
+          if [ "${ACTUAL_SHA}" != "${{ needs.audit.outputs.source_sha }}" ]; then
+            echo "FAIL: Darwin checkout SHA differs from audited SHA"
+            exit 1
+          fi
+
+          BUILD_TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+
+          {
+            echo "AUDITED_SOURCE_SHA=${ACTUAL_SHA}"
+            echo "BUILD_TAGS=${BUILD_TAGS}"
+            echo "LDFLAGS_SHARED=${LDFLAGS_SHARED}"
+          } >> "${GITHUB_ENV}"
+
+          echo "source_sha=${ACTUAL_SHA}"
+          echo "build_tags=${BUILD_TAGS}"
+
+      - name: Build darwin amd64
+        shell: bash
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p dist
+
+          go build \
+            -v \
+            -trimpath \
+            -o dist/sing-box \
+            -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${BUILD_VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      - name: Verify Darwin binary architecture and execution
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== FILE ==="
+          file dist/sing-box
+
+          ARCHS="$(lipo -archs dist/sing-box)"
+
+          echo "architectures=${ARCHS}"
+
+          if [ "${ARCHS}" != "x86_64" ]; then
+            echo "FAIL: expected a single x86_64 Mach-O binary"
+            exit 1
+          fi
+
+          echo "=== VERSION ==="
+          ./dist/sing-box version
+
+          echo "PASS: Darwin amd64 binary executes on Intel runner"
+
+      - name: Package Darwin artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DIR_NAME="sing-box-${BUILD_VERSION}-darwin-amd64"
+
+          mkdir -p "package/${DIR_NAME}"
+
+          cp dist/sing-box \
+            "package/${DIR_NAME}/sing-box"
+
+          cp LICENSE \
+            "package/${DIR_NAME}/LICENSE"
+
+          shasum -a 256 \
+            "package/${DIR_NAME}/sing-box" \
+            > "package/${DIR_NAME}/SHA256SUMS"
+
+          {
+            echo "project=singbox-multipath"
+            echo "variant=multipath-mieru-beta6"
+            echo "source_ref=${SOURCE_REF}"
+            echo "source_sha=${AUDITED_SOURCE_SHA}"
+            echo "base_sha=${BASE_SHA}"
+            echo "donor_sha=${DONOR_SHA}"
+            echo "mieru_version=${MIERU_VERSION}"
+            echo "go_version=${GO_VERSION}"
+            echo "build_version=${BUILD_VERSION}"
+            echo "goos=darwin"
+            echo "goarch=amd64"
+            echo "cgo_enabled=1"
+            echo "runner=macos-15-intel"
+            echo "build_tags=${BUILD_TAGS}"
+            echo "ldflags=${LDFLAGS_SHARED}"
+          } > "package/${DIR_NAME}/BUILD-MANIFEST.txt"
+
+          tar \
+            -C package \
+            -czf "${DIR_NAME}.tar.gz" \
+            "${DIR_NAME}"
+
+          shasum -a 256 \
+            "${DIR_NAME}.tar.gz" \
+            > "${DIR_NAME}.tar.gz.sha256"
+
+          echo "=== ARCHIVE SHA256 ==="
+          cat "${DIR_NAME}.tar.gz.sha256"
+
+      - name: Upload Darwin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ env.BUILD_VERSION }}-darwin-amd64
+          path: |
+            sing-box-${{ env.BUILD_VERSION }}-darwin-amd64.tar.gz
+            sing-box-${{ env.BUILD_VERSION }}-darwin-amd64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows-amd64:
+    name: Build Windows amd64
+    needs:
+      - audit
+
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout audited source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.audit.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Setup frozen Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Resolve build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $actualSha = (git rev-parse HEAD).Trim()
+
+          if ($actualSha -ne "${{ needs.audit.outputs.source_sha }}") {
+            throw "Windows checkout SHA differs from audited SHA"
+          }
+
+          $tags = (Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS -Raw).Trim()
+          $ldflags = (Get-Content release/LDFLAGS -Raw).Trim()
+
+          "AUDITED_SOURCE_SHA=$actualSha" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "BUILD_TAGS=$tags" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "LDFLAGS_SHARED=$ldflags" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "source_sha=$actualSha"
+          Write-Host "build_tags=$tags"
+
+      - name: Build windows amd64
+        shell: pwsh
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item \
+            -ItemType Directory \
+            -Force \
+            -Path dist |
+            Out-Null
+
+          go build `
+            -v `
+            -trimpath `
+            -o dist/sing-box.exe `
+            -tags "$env:BUILD_TAGS" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:BUILD_VERSION' $env:LDFLAGS_SHARED -s -w -buildid=" `
+            ./cmd/sing-box
+
+      - name: Extract official libcronet.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cronetVersion = (
+            Get-Content .github/CRONET_GO_VERSION -Raw
+          ).Trim()
+
+          $libraryPath = "lib/windows_amd64/libcronet.dll"
+
+          $cronetDir = Join-Path $env:RUNNER_TEMP "cronet-go-lib"
+
+          if (Test-Path $cronetDir) {
+            Remove-Item -Recurse -Force $cronetDir
+          }
+
+          git init $cronetDir
+
+          git -C $cronetDir remote add origin `
+            https://github.com/sagernet/cronet-go.git
+
+          git -C $cronetDir sparse-checkout set `
+            --no-cone `
+            "/$libraryPath"
+
+          git -C $cronetDir fetch `
+            --depth=1 `
+            --filter=blob:none `
+            origin `
+            $cronetVersion
+
+          git -C $cronetDir checkout FETCH_HEAD
+
+          Copy-Item `
+            (Join-Path $cronetDir $libraryPath) `
+            dist/libcronet.dll
+
+          "CRONET_GO_VERSION=$cronetVersion" |
+            Out-File \
+              -FilePath $env:GITHUB_ENV \
+              -Encoding utf8 \
+              -Append
+
+          Write-Host "cronet_go_version=$cronetVersion"
+
+      - name: Verify Windows PE amd64 binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $path = (
+            Resolve-Path "dist/sing-box.exe"
+          ).Path
+
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+
+          if ($bytes.Length -lt 64) {
+            throw "PE file is unexpectedly small"
+          }
+
+          $peOffset = [BitConverter]::ToInt32(
+            $bytes,
+            0x3c
+          )
+
+          $signature = [BitConverter]::ToUInt32(
+            $bytes,
+            $peOffset
+          )
+
+          if ($signature -ne 0x00004550) {
+            throw "Invalid PE signature"
+          }
+
+          $machine = [BitConverter]::ToUInt16(
+            $bytes,
+            $peOffset + 4
+          )
+
+          if ($machine -ne 0x8664) {
+            throw (
+              "Unexpected PE machine: 0x{0:X4}" -f $machine
+            )
+          }
+
+          Write-Host "PASS: PE machine is AMD64 (0x8664)"
+
+          Write-Host "=== VERSION ==="
+
+          & .\dist\sing-box.exe version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "sing-box.exe version failed"
+          }
+
+          if (-not (Test-Path "dist/libcronet.dll")) {
+            throw "libcronet.dll is missing"
+          }
+
+          Write-Host "PASS: Windows binary and libcronet.dll present"
+
+      - name: Package Windows artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dirName = "sing-box-$env:BUILD_VERSION-windows-amd64"
+
+          $packageRoot = Join-Path "package" $dirName
+
+          New-Item \
+            -ItemType Directory \
+            -Force \
+            -Path $packageRoot |
+            Out-Null
+
+          Copy-Item \
+            dist/sing-box.exe \
+            (Join-Path $packageRoot "sing-box.exe")
+
+          Copy-Item \
+            dist/libcronet.dll \
+            (Join-Path $packageRoot "libcronet.dll")
+
+          Copy-Item \
+            LICENSE \
+            (Join-Path $packageRoot "LICENSE")
+
+          $binaryHash = (
+            Get-FileHash \
+              (Join-Path $packageRoot "sing-box.exe") \
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          $cronetHash = (
+            Get-FileHash \
+              (Join-Path $packageRoot "libcronet.dll") \
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          @(
+            "$binaryHash  sing-box.exe"
+            "$cronetHash  libcronet.dll"
+          ) |
+            Set-Content \
+              -Path (Join-Path $packageRoot "SHA256SUMS") \
+              -Encoding ascii
+
+          @(
+            "project=singbox-multipath"
+            "variant=multipath-mieru-beta6"
+            "source_ref=$env:SOURCE_REF"
+            "source_sha=$env:AUDITED_SOURCE_SHA"
+            "base_sha=$env:BASE_SHA"
+            "donor_sha=$env:DONOR_SHA"
+            "mieru_version=$env:MIERU_VERSION"
+            "go_version=$env:GO_VERSION"
+            "build_version=$env:BUILD_VERSION"
+            "goos=windows"
+            "goarch=amd64"
+            "cgo_enabled=0"
+            "runner=windows-2025"
+            "build_tags=$env:BUILD_TAGS"
+            "ldflags=$env:LDFLAGS_SHARED"
+            "cronet_go_version=$env:CRONET_GO_VERSION"
+          ) |
+            Set-Content \
+              -Path (Join-Path $packageRoot "BUILD-MANIFEST.txt") \
+              -Encoding ascii
+
+          $archive = "$dirName.zip"
+
+          Compress-Archive \
+            -Path $packageRoot \
+            -DestinationPath $archive \
+            -Force
+
+          $archiveHash = (
+            Get-FileHash \
+              $archive \
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          "$archiveHash  $archive" |
+            Set-Content \
+              -Path "$archive.sha256" \
+              -Encoding ascii
+
+          Write-Host "=== ARCHIVE SHA256 ==="
+
+          Get-Content "$archive.sha256"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ env.BUILD_VERSION }}-windows-amd64
+          path: |
+            sing-box-${{ env.BUILD_VERSION }}-windows-amd64.zip
+            sing-box-${{ env.BUILD_VERSION }}-windows-amd64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
