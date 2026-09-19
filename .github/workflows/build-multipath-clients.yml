@@ -1,0 +1,229 @@
+name: Build multipath clients
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 1.14.0-multipath-beta6
+  REVISION: 31970756db5fd37d9e4080734dfeed9ffd5ceefd
+  GO_VERSION: 1.25.5
+
+jobs:
+  macos-intel:
+    name: macOS Intel amd64
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout beta6 revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: 31970756db5fd37d9e4080734dfeed9ffd5ceefd
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git rev-parse HEAD)"
+          echo "EXPECTED=${REVISION}"
+          echo "ACTUAL=${ACTUAL}"
+          test "${ACTUAL}" = "${REVISION}"
+
+      - name: Setup Go 1.25.5
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+          cache: false
+
+      - name: Verify Go
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          test "$(go env GOVERSION)" = "go1.25.5"
+
+      - name: Build macOS Intel bare core
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+
+          echo "BUILD_TAGS=${TAGS}"
+
+          mkdir -p dist
+
+          go build \
+            -v \
+            -trimpath \
+            -o dist/sing-box \
+            -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      - name: Runtime verify macOS binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$(./dist/sing-box version)"
+          printf '%s\n' "${OUT}"
+
+          grep -F "sing-box version ${VERSION}" <<<"${OUT}"
+          grep -F "Revision: ${REVISION}" <<<"${OUT}"
+          grep -F "Environment: go1.25.5 darwin/amd64" <<<"${OUT}"
+
+      - name: Package macOS Intel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAME="sing-box-${VERSION}-darwin-amd64"
+
+          mkdir -p "dist/${NAME}"
+          cp LICENSE "dist/${NAME}/"
+          cp dist/sing-box "dist/${NAME}/"
+
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+
+          shasum -a 256 "dist/${NAME}.tar.gz" | tee "dist/${NAME}.sha256"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-multipath-beta6-darwin-amd64
+          path: |
+            dist/sing-box-1.14.0-multipath-beta6-darwin-amd64.tar.gz
+            dist/sing-box-1.14.0-multipath-beta6-darwin-amd64.sha256
+          if-no-files-found: error
+
+
+  windows-amd64:
+    name: Windows amd64
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout beta6 revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: 31970756db5fd37d9e4080734dfeed9ffd5ceefd
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $actual = (git rev-parse HEAD).Trim()
+
+          Write-Host "EXPECTED=$env:REVISION"
+          Write-Host "ACTUAL=$actual"
+
+          if ($actual -ne $env:REVISION) {
+            throw "revision mismatch"
+          }
+
+      - name: Setup Go 1.25.5
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+          cache: false
+
+      - name: Verify Go
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          go version
+
+          $actual = (go env GOVERSION).Trim()
+          if ($actual -ne "go1.25.5") {
+            throw "Go version mismatch: $actual"
+          }
+
+      - name: Build Windows amd64 bare core
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tags = (Get-Content release/DEFAULT_BUILD_TAGS_OTHERS -Raw).Trim()
+          $ldflagsShared = (Get-Content release/LDFLAGS -Raw).Trim()
+
+          Write-Host "BUILD_TAGS=$tags"
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          go build `
+            -v `
+            -trimpath `
+            -o dist/sing-box.exe `
+            -tags "$tags" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION' $ldflagsShared -s -w -buildid=" `
+            ./cmd/sing-box
+
+      - name: Runtime verify Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = (& .\dist\sing-box.exe version | Out-String)
+
+          Write-Host $out
+
+          if (-not $out.Contains("sing-box version $env:VERSION")) {
+            throw "version verification failed"
+          }
+
+          if (-not $out.Contains("Revision: $env:REVISION")) {
+            throw "revision verification failed"
+          }
+
+          if (-not $out.Contains("Environment: go1.25.5 windows/amd64")) {
+            throw "environment verification failed"
+          }
+
+      - name: Package Windows amd64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $name = "sing-box-$env:VERSION-windows-amd64"
+
+          New-Item -ItemType Directory -Force "dist\$name" | Out-Null
+
+          Copy-Item LICENSE "dist\$name\"
+          Copy-Item "dist\sing-box.exe" "dist\$name\"
+
+          Compress-Archive `
+            -Path "dist\$name" `
+            -DestinationPath "dist\$name.zip"
+
+          $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()
+
+          "$hash  $name.zip" |
+            Set-Content -NoNewline "dist\$name.sha256"
+
+          Get-Content "dist\$name.sha256"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-multipath-beta6-windows-amd64
+          path: |
+            dist/sing-box-1.14.0-multipath-beta6-windows-amd64.zip
+            dist/sing-box-1.14.0-multipath-beta6-windows-amd64.sha256
+          if-no-files-found: error
