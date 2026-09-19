@@ -86,6 +86,7 @@ func OutboundRegistry() *outbound.Registry {
 	direct.RegisterOutbound(registry)
 	bridge.RegisterOutbound(registry)
 	multipath.RegisterOutbound(registry)
+	mieru.RegisterOutbound(registry)
 
 	block.RegisterOutbound(registry)
 
