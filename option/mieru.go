@@ -1,36 +1,14 @@
-// Copyright (C) 2021  mieru authors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+package option
 
-// Binary mieru is the client of mieru proxy.
-package main
+import "github.com/sagernet/sing/common/json/badoption"
 
-import (
-	"runtime/debug"
-
-	"github.com/enfein/mieru/v3/pkg/appctl"
-	"github.com/enfein/mieru/v3/pkg/cli"
-	"github.com/enfein/mieru/v3/pkg/log"
-)
-
-func main() {
-	appctl.RecordAppStartTime()
-	appctl.SetAppType(appctl.CLIENT_APP)
-	debug.SetGCPercent(90)
-	cli.RegisterClientCommands()
-	err := cli.ParseAndExecute()
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
+type MieruOutboundOptions struct {
+	DialerOptions
+	ServerOptions
+	ServerPortRanges badoption.Listable[string] `json:"server_ports,omitempty"`
+	Transport        string                     `json:"transport,omitempty"`
+	UserName         string                     `json:"username,omitempty"`
+	Password         string                     `json:"password,omitempty"`
+	Multiplexing     string                     `json:"multiplexing,omitempty"`
+	TrafficPattern   string                     `json:"traffic_pattern,omitempty"`
 }
