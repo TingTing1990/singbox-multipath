@@ -107,7 +107,7 @@ func ProxyDisplayName(proxyType string) string {
 	case TypeAnyTLS:
 		return "AnyTLS"
 	case TypeMieru:
-        return "Mieru"
+		return "Mieru"
 	case TypeOpenConnect:
 		return "OpenConnect"
 	case TypeOpenVPNClient:
