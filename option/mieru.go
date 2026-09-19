@@ -1,6 +1,7 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import
+"github.com/sagernet/sing/common/json/badoption"
 
 type MieruOutboundOptions struct {
 	DialerOptions
