@@ -26,6 +26,7 @@ jobs:
     name: Source audit + independent tests
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       parent_sha: ${{ steps.resolve.outputs.parent_sha }}
@@ -63,7 +64,10 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
 
-          PARENT_SHA="$(git rev-parse "refs/remotes/origin/${PARENT_BRANCH}^{commit}")"
+          PARENT_SHA="$(
+            git rev-parse \
+              "refs/remotes/origin/${PARENT_BRANCH}^{commit}"
+          )"
 
           echo "source_ref=${SOURCE_REF}"
           echo "candidate_sha=${CANDIDATE_SHA}"
@@ -79,8 +83,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
-          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          BUILD_TAGS="$(
+            tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS
+          )"
+
+          LDFLAGS_SHARED="$(
+            tr -d '\r\n' < release/LDFLAGS
+          )"
 
           test -n "$BUILD_TAGS"
 
@@ -102,42 +111,82 @@ jobs:
           import sys
 
           root = Path('.')
-          parent = f"refs/remotes/origin/{os.environ['PARENT_BRANCH']}"
+
+          parent = (
+              f"refs/remotes/origin/"
+              f"{os.environ['PARENT_BRANCH']}"
+          )
+
 
           def fail(message):
               print(f"FAIL {message}")
               raise SystemExit(1)
 
+
           def ok(message):
               print(f"PASS {message}")
 
+
           def git(*args):
-              return subprocess.check_output(['git', *args], text=True)
+              return subprocess.check_output(
+                  ['git', *args],
+                  text=True,
+              )
+
 
           def extract_func(text, signature):
               try:
                   start = text.index(signature)
                   brace = text.index('{', start)
               except ValueError:
-                  fail(f"missing function: {signature}")
+                  fail(
+                      f"missing function: "
+                      f"{signature}"
+                  )
+
               depth = 0
-              for index in range(brace, len(text)):
+
+              for index in range(
+                  brace,
+                  len(text),
+              ):
                   char = text[index]
+
                   if char == '{':
                       depth += 1
+
                   elif char == '}':
                       depth -= 1
-                      if depth == 0:
-                          return text[start:index + 1]
-              fail(f"unbalanced function: {signature}")
 
-          # CI/workflow metadata is intentionally outside the runtime feature
-          # write-set. This workflow lives only on the default branch; the source
-          # ref being audited does not need to carry any workflow file.
-          changed = set(git(
-              'diff', '--name-only', parent, 'HEAD', '--', '.',
-              ':(exclude).github/**',
-          ).splitlines())
+                      if depth == 0:
+                          return text[
+                              start:index + 1
+                          ]
+
+              fail(
+                  f"unbalanced function: "
+                  f"{signature}"
+              )
+
+
+          # CI/workflow metadata is intentionally outside
+          # the runtime feature write-set.
+          #
+          # The workflow lives only on the default branch.
+          # The source ref under audit therefore does not
+          # need to contain the workflow itself.
+
+          changed = set(
+              git(
+                  'diff',
+                  '--name-only',
+                  parent,
+                  'HEAD',
+                  '--',
+                  '.',
+                  ':(exclude).github/**',
+              ).splitlines()
+          )
 
           expected = {
               'README.md',
@@ -152,16 +201,30 @@ jobs:
               'protocol/multipath/capacity_scheduler_test.go',
           }
 
-          missing = sorted(expected - changed)
-          unexpected = sorted(changed - expected)
+          missing = sorted(
+              expected - changed
+          )
+
+          unexpected = sorted(
+              changed - expected
+          )
+
           if missing or unexpected:
               fail(
-                  f"functional write-set mismatch; missing={missing} "
+                  "functional write-set mismatch; "
+                  f"missing={missing} "
                   f"unexpected={unexpected}"
               )
-          ok('functional write-set is exactly the approved 10 files')
 
-          # Existing Mieru implementation must be inherited unchanged.
+          ok(
+              "functional write-set is exactly "
+              "the approved 10 files"
+          )
+
+
+          # Existing Mieru implementation must be
+          # inherited unchanged from the parent.
+
           for rel in (
               'constant/proxy.go',
               'option/mieru.go',
@@ -170,13 +233,32 @@ jobs:
               'go.mod',
               'go.sum',
           ):
-              if subprocess.run(
-                  ['git', 'diff', '--quiet', parent, 'HEAD', '--', rel]
-              ).returncode != 0:
-                  fail(f"existing Mieru baseline changed: {rel}")
-          ok('Mieru functional baseline unchanged')
+              result = subprocess.run(
+                  [
+                      'git',
+                      'diff',
+                      '--quiet',
+                      parent,
+                      'HEAD',
+                      '--',
+                      rel,
+                  ]
+              )
 
-          # These beta6 protocol/data-plane files are outside this feature.
+              if result.returncode != 0:
+                  fail(
+                      "existing Mieru baseline "
+                      f"changed: {rel}"
+                  )
+
+          ok(
+              "Mieru functional baseline unchanged"
+          )
+
+
+          # Frozen beta6 protocol/data-plane files
+          # are outside this feature.
+
           frozen = (
               'protocol/multipath/wire.go',
               'protocol/multipath/telemetry.go',
@@ -186,161 +268,478 @@ jobs:
               'protocol/multipath/protocol.go',
               'protocol/multipath/performance_test.go',
           )
-          for rel in frozen:
-              if subprocess.run(
-                  ['git', 'diff', '--quiet', parent, 'HEAD', '--', rel]
-              ).returncode != 0:
-                  fail(f"frozen multipath file changed: {rel}")
-          ok('wire/telemetry/activation/memory/path/protocol/performance fixture unchanged')
 
-          options = (root / 'option/multipath.go').read_text()
-          if options.count('json:"preferred_capacity_mbps,omitempty"') != 2:
-              fail('preferred_capacity_mbps must exist exactly once on outbound and once on inbound')
-          ok('single user field exposed on both Local-TX option surfaces')
+          for rel in frozen:
+              result = subprocess.run(
+                  [
+                      'git',
+                      'diff',
+                      '--quiet',
+                      parent,
+                      'HEAD',
+                      '--',
+                      rel,
+                  ]
+              )
+
+              if result.returncode != 0:
+                  fail(
+                      "frozen multipath file "
+                      f"changed: {rel}"
+                  )
+
+          ok(
+              "wire/telemetry/activation/"
+              "memory/path/protocol/"
+              "performance fixture unchanged"
+          )
+
+
+          options = (
+              root / 'option/multipath.go'
+          ).read_text()
+
+          field = (
+              'json:'
+              '"preferred_capacity_mbps,omitempty"'
+          )
+
+          if options.count(field) != 2:
+              fail(
+                  "preferred_capacity_mbps must "
+                  "exist exactly once on outbound "
+                  "and once on inbound"
+              )
+
+          ok(
+              "single user field exposed on both "
+              "Local-TX option surfaces"
+          )
+
 
           conversion = (
               'PreferredCapacityBytesPS:       '
-              'uint64(options.PreferredCapacityMbps) * 1_000_000 / 8'
+              'uint64('
+              'options.PreferredCapacityMbps'
+              ') * 1_000_000 / 8'
           )
+
           for rel in (
               'protocol/multipath/outbound.go',
               'protocol/multipath/inbound.go',
           ):
-              if conversion not in (root / rel).read_text():
-                  fail(f"capacity conversion missing: {rel}")
-          ok('Mbps-to-bytes/s conversion wired identically on client and server Local TX')
+              text = (
+                  root / rel
+              ).read_text()
 
-          status = (root / 'protocol/multipath/status.go').read_text()
-          if 'json:"preferred_capacity_mbps,omitempty"' not in status:
-              fail('status parameter is not additive/omitempty')
-          if 'PreferredCapacityBytesPS * 8 / 1_000_000' not in status:
-              fail('status preferred capacity conversion missing')
-          ok('status reports configured capacity and omits it when disabled')
+              if conversion not in text:
+                  fail(
+                      "capacity conversion "
+                      f"missing: {rel}"
+                  )
+
+          ok(
+              "Mbps-to-bytes/s conversion wired "
+              "identically on client and server "
+              "Local TX"
+          )
+
+
+          status = (
+              root /
+              'protocol/multipath/status.go'
+          ).read_text()
+
+          if (
+              'json:'
+              '"preferred_capacity_mbps,omitempty"'
+              not in status
+          ):
+              fail(
+                  "status parameter is not "
+                  "additive/omitempty"
+              )
+
+          if (
+              'PreferredCapacityBytesPS '
+              '* 8 / 1_000_000'
+              not in status
+          ):
+              fail(
+                  "status preferred capacity "
+                  "conversion missing"
+              )
+
+          ok(
+              "status reports configured capacity "
+              "and omits it when disabled"
+          )
+
 
           for rel in (
               'protocol/multipath/wire.go',
               'protocol/multipath/telemetry.go',
           ):
-              text = (root / rel).read_text()
-              if 'PreferredCapacity' in text or 'preferred_capacity' in text:
-                  fail(f"capacity leaked into wire/remote telemetry: {rel}")
-          ok('wire protocol and remote telemetry schema unchanged')
+              text = (
+                  root / rel
+              ).read_text()
 
-          parent_scheduler = git('show', f'{parent}:protocol/multipath/scheduler.go')
-          current_scheduler = (root / 'protocol/multipath/scheduler.go').read_text()
+              if (
+                  'PreferredCapacity' in text
+                  or
+                  'preferred_capacity' in text
+              ):
+                  fail(
+                      "capacity leaked into "
+                      "wire/remote telemetry: "
+                      f"{rel}"
+                  )
+
+          ok(
+              "wire protocol and remote telemetry "
+              "schema unchanged"
+          )
+
+
+          parent_scheduler = git(
+              'show',
+              (
+                  f'{parent}:'
+                  'protocol/multipath/'
+                  'scheduler.go'
+              ),
+          )
+
+          current_scheduler = (
+              root /
+              'protocol/multipath/scheduler.go'
+          ).read_text()
+
 
           original = extract_func(
               parent_scheduler,
-              'func (c *mpCore) choosePathLocked(length int) *mpLeg',
+              (
+                  'func (c *mpCore) '
+                  'choosePathLocked('
+                  'length int) *mpLeg'
+              ),
           )
+
           adaptive = extract_func(
               current_scheduler,
-              'func (c *mpCore) chooseAdaptivePathLocked(length int) *mpLeg',
+              (
+                  'func (c *mpCore) '
+                  'chooseAdaptivePathLocked('
+                  'length int) *mpLeg'
+              ),
           )
-          if original[original.index('{'):] != adaptive[adaptive.index('{'):]:
-              fail('direct-parent adaptive scheduler body changed')
-          ok('original beta6 adaptive scheduler body retained byte-for-byte')
+
+          if (
+              original[
+                  original.index('{'):
+              ]
+              !=
+              adaptive[
+                  adaptive.index('{'):
+              ]
+          ):
+              fail(
+                  "direct-parent adaptive "
+                  "scheduler body changed"
+              )
+
+          ok(
+              "original beta6 adaptive scheduler "
+              "body retained byte-for-byte"
+          )
+
 
           wrapper = extract_func(
               current_scheduler,
-              'func (c *mpCore) choosePathLockedAt(length int, now time.Time) *mpLeg',
+              (
+                  'func (c *mpCore) '
+                  'choosePathLockedAt('
+                  'length int, now time.Time) '
+                  '*mpLeg'
+              ),
           )
-          if 'chosen := c.chooseAdaptivePathLocked(length)' not in wrapper:
-              fail('capacity wrapper does not begin from original scheduler decision')
-          if not (
-              'if c.cfg.PreferredCapacityBytesPS == 0 {' in wrapper
-              and 'return chosen' in wrapper
+
+          if (
+              'chosen := '
+              'c.chooseAdaptivePathLocked(length)'
+              not in wrapper
           ):
-              fail('disabled capacity is not a strict guard bypass')
-          ok('preferred_capacity_mbps=0 returns original scheduler decision before guard')
+              fail(
+                  "capacity wrapper does not "
+                  "begin from original scheduler "
+                  "decision"
+              )
+
+          if not (
+              (
+                  'if c.cfg.'
+                  'PreferredCapacityBytesPS == 0 {'
+              ) in wrapper
+              and
+              'return chosen' in wrapper
+          ):
+              fail(
+                  "disabled capacity is not a "
+                  "strict guard bypass"
+              )
+
+          ok(
+              "preferred_capacity_mbps=0 returns "
+              "original scheduler decision "
+              "before guard"
+          )
+
 
           pump = extract_func(
               current_scheduler,
               'func (c *mpCore) pumpLoop()',
           )
-          if 'now := time.Now()' not in pump:
-              fail('pump no longer owns its loop timestamp')
-          if 'c.choosePathLockedAt(segment.Length, now)' not in pump:
-              fail('production pump does not reuse its existing timestamp')
-          if 'c.choosePathLocked(segment.Length)' in pump:
-              fail('production pump still uses wrapper that obtains another timestamp')
-          ok('production scheduler reuses the existing pump timestamp')
 
-          # No non-test production caller may call choosePathLocked(); that helper
-          # remains only for legacy tests. This prevents a hidden time.Now hot path.
+          if (
+              'now := time.Now()'
+              not in pump
+          ):
+              fail(
+                  "pump no longer owns its "
+                  "loop timestamp"
+              )
+
+          if (
+              'c.choosePathLockedAt('
+              'segment.Length, now)'
+              not in pump
+          ):
+              fail(
+                  "production pump does not "
+                  "reuse its existing timestamp"
+              )
+
+          if (
+              'c.choosePathLocked('
+              'segment.Length)'
+              in pump
+          ):
+              fail(
+                  "production pump still uses "
+                  "wrapper that obtains another "
+                  "timestamp"
+              )
+
+          ok(
+              "production scheduler reuses "
+              "the existing pump timestamp"
+          )
+
+
+          # No non-test production caller may call
+          # choosePathLocked().
+          #
+          # The compatibility helper remains only
+          # for legacy tests.
+
           production_calls = []
-          for path in (root / 'protocol/multipath').glob('*.go'):
-              if path.name.endswith('_test.go') or path.name == 'scheduler.go':
+
+          for path in (
+              root /
+              'protocol/multipath'
+          ).glob('*.go'):
+
+              if (
+                  path.name.endswith('_test.go')
+                  or
+                  path.name == 'scheduler.go'
+              ):
                   continue
-              if 'choosePathLocked(' in path.read_text():
-                  production_calls.append(str(path))
+
+              if (
+                  'choosePathLocked('
+                  in path.read_text()
+              ):
+                  production_calls.append(
+                      str(path)
+                  )
+
           if production_calls:
-              fail(f"unexpected production choosePathLocked callers: {production_calls}")
-          ok('no hidden production caller adds a second scheduler timestamp')
+              fail(
+                  "unexpected production "
+                  "choosePathLocked callers: "
+                  f"{production_calls}"
+              )
+
+          ok(
+              "no hidden production caller adds "
+              "a second scheduler timestamp"
+          )
+
 
           guard = extract_func(
               current_scheduler,
-              'func (c *mpCore) applyPreferredCapacityFloorLocked('
-              'chosen *mpLeg, length int, now time.Time) *mpLeg',
+              (
+                  'func (c *mpCore) '
+                  'applyPreferredCapacityFloorLocked('
+                  'chosen *mpLeg, length int, '
+                  'now time.Time) *mpLeg'
+              ),
           )
+
           for needle in (
               '!c.active.Load()',
               'preferred := c.getLeg(0)',
               'preferred.path.Stale',
               '!c.cfg.Recovery.allows(0)',
               'preferred.busy',
-              'preferred.path.Outstanding()+uint64(length) > pipeline',
+              (
+                  'preferred.path.Outstanding()'
+                  '+uint64(length) > pipeline'
+              ),
               'return preferred',
           ):
               if needle not in guard:
-                  fail(f"capacity guard missing safety condition: {needle}")
-          if 'getLeg(1)' in guard or 'return c.getLeg(1)' in guard:
-              fail('capacity guard directly controls booster selection')
-          ok('guard can only protect eligible preferred/leg0; remaining-leg policy stays original')
+                  fail(
+                      "capacity guard missing "
+                      f"safety condition: {needle}"
+                  )
+
+          if (
+              'getLeg(1)' in guard
+              or
+              'return c.getLeg(1)' in guard
+          ):
+              fail(
+                  "capacity guard directly "
+                  "controls booster selection"
+              )
+
+          ok(
+              "guard can only protect eligible "
+              "preferred/leg0; remaining-leg "
+              "policy stays original"
+          )
+
 
           for needle in (
-              'preferredCapacityDebtChunks    = 2',
-              'preferredCapacitySurplusChunks = 4',
+              (
+                  'preferredCapacityDebtChunks'
+                  '    = 2'
+              ),
+              (
+                  'preferredCapacitySurplusChunks'
+                  ' = 4'
+              ),
           ):
-              if needle not in current_scheduler:
-                  fail(f"bounded floor constant missing: {needle}")
-          ok('capacity catch-up debt and historical surplus are chunk-bounded')
+              if (
+                  needle
+                  not in current_scheduler
+              ):
+                  fail(
+                      "bounded floor constant "
+                      f"missing: {needle}"
+                  )
+
+          ok(
+              "capacity catch-up debt and "
+              "historical surplus are "
+              "chunk-bounded"
+          )
+
 
           submit = extract_func(
               current_scheduler,
-              'func (c *mpCore) submitLocked('
-              'leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error',
+              (
+                  'func (c *mpCore) submitLocked('
+                  'leg *mpLeg, '
+                  'segment stream.Segment, '
+                  'repair bool, '
+                  'now time.Time) error'
+              ),
           )
+
           accepted = (
               'case leg.send <- frame:\n'
-              '\t\tc.notePreferredCapacityAssignmentLocked('
+              '\t\t'
+              'c.notePreferredCapacityAssignmentLocked('
               'leg, segment.Length, now)\n'
               '\t\treturn nil'
           )
-          if accepted not in submit:
-              fail('capacity accounting is not after successful assignment enqueue')
-          ok('preferred assignment is accounted only after successful enqueue')
 
-          tests = (root / 'protocol/multipath/capacity_scheduler_test.go').read_text()
-          required_tests = (
-              'TestPreferredCapacityDisabledPreservesAdaptiveDecision',
-              'TestPreferredCapacityFloorOverridesUnderAllocation',
-              'TestPreferredCapacityNeverOverridesSafetyEligibility',
-              'TestPreferredCapacityDoesNotCapPreferredAboveTarget',
-              'TestPreferredCapacityFloorMaintainsConfiguredAverage',
-              'TestPreferredCapacityPreservesHealthyAdaptiveSplit',
-              'TestPreferredCapacityCorrectsStarvationWithinBoundedBurst',
+          if accepted not in submit:
+              fail(
+                  "capacity accounting is not "
+                  "after successful assignment "
+                  "enqueue"
+              )
+
+          ok(
+              "preferred assignment is accounted "
+              "only after successful enqueue"
           )
+
+
+          tests = (
+              root /
+              'protocol/multipath/'
+              'capacity_scheduler_test.go'
+          ).read_text()
+
+          required_tests = (
+              (
+                  'TestPreferredCapacityDisabled'
+                  'PreservesAdaptiveDecision'
+              ),
+              (
+                  'TestPreferredCapacityFloor'
+                  'OverridesUnderAllocation'
+              ),
+              (
+                  'TestPreferredCapacityNever'
+                  'OverridesSafetyEligibility'
+              ),
+              (
+                  'TestPreferredCapacityDoesNot'
+                  'CapPreferredAboveTarget'
+              ),
+              (
+                  'TestPreferredCapacityFloor'
+                  'MaintainsConfiguredAverage'
+              ),
+              (
+                  'TestPreferredCapacityPreserves'
+                  'HealthyAdaptiveSplit'
+              ),
+              (
+                  'TestPreferredCapacityCorrects'
+                  'StarvationWithinBoundedBurst'
+              ),
+          )
+
           for name in required_tests:
-              if f'func {name}' not in tests:
-                  fail(f"required capacity test missing: {name}")
-          ok('dedicated tests cover disabled/safety/floor/no-cap/healthy-split/starvation invariants')
+              if (
+                  f'func {name}'
+                  not in tests
+              ):
+                  fail(
+                      "required capacity test "
+                      f"missing: {name}"
+                  )
+
+          ok(
+              "dedicated tests cover "
+              "disabled/safety/floor/no-cap/"
+              "healthy-split/starvation "
+              "invariants"
+          )
           PY
 
       - name: Check formatting of approved Go write-set
         shell: bash
         run: |
           set -euo pipefail
+
           files=(
             option/multipath.go
             option/multipath_test.go
@@ -352,7 +751,11 @@ jobs:
             protocol/multipath/types.go
             protocol/multipath/capacity_scheduler_test.go
           )
-          unformatted="$(gofmt -l "${files[@]}")"
+
+          unformatted="$(
+            gofmt -l "${files[@]}"
+          )"
+
           if [[ -n "$unformatted" ]]; then
             printf '%s\n' "$unformatted"
             exit 1
@@ -362,126 +765,300 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from dataclasses import dataclass
+
 
           CHUNK = 64 * 1024
           TARGET_BPS = 80_000_000 / 8
           MAX_DEBT = 2 * CHUNK
           MAX_SURPLUS = 4 * CHUNK
 
+
           @dataclass
           class Floor:
               last: float | None = None
               credit: float = 0.0
 
-              def refill(self, now: float) -> None:
+              def refill(
+                  self,
+                  now: float,
+              ) -> None:
+
                   if self.last is None:
                       self.last = now
                       return
+
                   if now < self.last:
                       self.last = now
                       return
-                  self.credit += (now - self.last) * TARGET_BPS
-                  self.last = now
-                  self.credit = min(self.credit, MAX_DEBT)
-                  self.credit = max(self.credit, -MAX_SURPLUS)
 
-              def choose(self, candidate: int, now: float, eligible: bool = True) -> int:
+                  self.credit += (
+                      now - self.last
+                  ) * TARGET_BPS
+
+                  self.last = now
+
+                  self.credit = min(
+                      self.credit,
+                      MAX_DEBT,
+                  )
+
+                  self.credit = max(
+                      self.credit,
+                      -MAX_SURPLUS,
+                  )
+
+              def choose(
+                  self,
+                  candidate: int,
+                  now: float,
+                  eligible: bool = True,
+              ) -> int:
+
                   self.refill(now)
+
                   if candidate == 0:
                       return 0
-                  if eligible and self.credit >= CHUNK:
+
+                  if (
+                      eligible
+                      and
+                      self.credit >= CHUNK
+                  ):
                       return 0
+
                   return candidate
 
-              def accepted(self, leg: int, now: float) -> None:
+              def accepted(
+                  self,
+                  leg: int,
+                  now: float,
+              ) -> None:
+
                   if leg != 0:
                       return
-                  self.refill(now)
-                  self.credit -= CHUNK
-                  self.credit = max(self.credit, -MAX_SURPLUS)
 
-          def simulate(offered_mbps, seconds, candidate_fn, eligible_fn=lambda _t: True):
-              offered_bps = offered_mbps * 1_000_000 / 8
-              step = CHUNK / offered_bps
+                  self.refill(now)
+
+                  self.credit -= CHUNK
+
+                  self.credit = max(
+                      self.credit,
+                      -MAX_SURPLUS,
+                  )
+
+
+          def simulate(
+              offered_mbps,
+              seconds,
+              candidate_fn,
+              eligible_fn=lambda _t: True,
+          ):
+              offered_bps = (
+                  offered_mbps
+                  * 1_000_000
+                  / 8
+              )
+
+              step = (
+                  CHUNK
+                  / offered_bps
+              )
+
               floor = Floor()
-              counts = [0, 0]
+
+              counts = [
+                  0,
+                  0,
+              ]
+
               overrides = 0
               now = 0.0
               index = 0
+
               while now < seconds:
-                  candidate = candidate_fn(index, now)
-                  chosen = floor.choose(candidate, now, eligible_fn(now))
-                  overrides += int(chosen != candidate)
+
+                  candidate = candidate_fn(
+                      index,
+                      now,
+                  )
+
+                  chosen = floor.choose(
+                      candidate,
+                      now,
+                      eligible_fn(now),
+                  )
+
+                  overrides += int(
+                      chosen != candidate
+                  )
+
                   counts[chosen] += 1
-                  floor.accepted(chosen, now)
+
+                  floor.accepted(
+                      chosen,
+                      now,
+                  )
+
                   index += 1
                   now += step
+
               rates = [
-                  count * CHUNK * 8 / seconds / 1_000_000
+                  (
+                      count
+                      * CHUNK
+                      * 8
+                      / seconds
+                      / 1_000_000
+                  )
                   for count in counts
               ]
+
               return rates, overrides
 
+
           forced, forced_overrides = simulate(
-              140, 30, lambda _i, _t: 1
+              140,
+              30,
+              lambda _i, _t: 1,
           )
-          assert 79.5 <= forced[0] <= 80.5, forced
-          assert 59.5 <= forced[1] <= 60.5, forced
+
+          assert (
+              79.5
+              <= forced[0]
+              <= 80.5
+          ), forced
+
+          assert (
+              59.5
+              <= forced[1]
+              <= 60.5
+          ), forced
+
           assert forced_overrides > 0
 
+
           healthy, healthy_overrides = simulate(
-              130, 30, lambda i, _t: 0 if i % 13 < 9 else 1
+              130,
+              30,
+              (
+                  lambda i, _t:
+                  0
+                  if i % 13 < 9
+                  else 1
+              ),
           )
-          assert 89.5 <= healthy[0] <= 90.5, healthy
-          assert 39.5 <= healthy[1] <= 40.5, healthy
-          assert healthy_overrides == 0, healthy_overrides
+
+          assert (
+              89.5
+              <= healthy[0]
+              <= 90.5
+          ), healthy
+
+          assert (
+              39.5
+              <= healthy[1]
+              <= 40.5
+          ), healthy
+
+          assert (
+              healthy_overrides == 0
+          ), healthy_overrides
+
 
           below_target, _ = simulate(
-              60, 30, lambda _i, _t: 1
+              60,
+              30,
+              lambda _i, _t: 1,
           )
-          assert below_target[0] >= 59.5, below_target
-          assert below_target[1] <= 0.5, below_target
+
+          assert (
+              below_target[0]
+              >= 59.5
+          ), below_target
+
+          assert (
+              below_target[1]
+              <= 0.5
+          ), below_target
+
 
           above_target, _ = simulate(
-              200, 30, lambda _i, _t: 1
+              200,
+              30,
+              lambda _i, _t: 1,
           )
-          assert 79.5 <= above_target[0] <= 80.5, above_target
-          assert 119.5 <= above_target[1] <= 120.5, above_target
+
+          assert (
+              79.5
+              <= above_target[0]
+              <= 80.5
+          ), above_target
+
+          assert (
+              119.5
+              <= above_target[1]
+              <= 120.5
+          ), above_target
+
 
           unavailable, _ = simulate(
               140,
               10,
               lambda _i, _t: 1,
-              lambda t: not (2.0 <= t < 4.0),
+              lambda t: not (
+                  2.0 <= t < 4.0
+              ),
           )
-          assert unavailable[1] > 60, unavailable
+
+          assert (
+              unavailable[1] > 60
+          ), unavailable
+
 
           print(
-              'PASS forced-starvation correction '
-              f'A={forced[0]:.2f} B={forced[1]:.2f} Mbps'
+              'PASS forced-starvation '
+              'correction '
+              f'A={forced[0]:.2f} '
+              f'B={forced[1]:.2f} Mbps'
           )
+
           print(
-              'PASS healthy 90+40 preservation '
-              f'A={healthy[0]:.2f} B={healthy[1]:.2f} Mbps '
+              'PASS healthy 90+40 '
+              'preservation '
+              f'A={healthy[0]:.2f} '
+              f'B={healthy[1]:.2f} Mbps '
               f'overrides={healthy_overrides}'
           )
+
           print(
-              'PASS offered-below-target behavior '
-              f'A={below_target[0]:.2f} B={below_target[1]:.2f} Mbps'
+              'PASS offered-below-target '
+              'behavior '
+              f'A={below_target[0]:.2f} '
+              f'B={below_target[1]:.2f} Mbps'
           )
+
           print(
-              'PASS excess-capacity remainder behavior '
-              f'A={above_target[0]:.2f} B={above_target[1]:.2f} Mbps'
+              'PASS excess-capacity '
+              'remainder behavior '
+              f'A={above_target[0]:.2f} '
+              f'B={above_target[1]:.2f} Mbps'
           )
-          print('PASS preferred hard-unavailability overrides the floor')
+
+          print(
+              'PASS preferred '
+              'hard-unavailability '
+              'overrides the floor'
+          )
           PY
 
       - name: Go vet focused packages
         shell: bash
         run: |
           set -euo pipefail
+
           go vet \
             -tags "$BUILD_TAGS" \
             ./option \
@@ -492,6 +1069,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           go test \
             -count=100 \
             -tags "$BUILD_TAGS" \
@@ -502,6 +1080,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           CGO_ENABLED=1 go test \
             -race \
             -count=100 \
@@ -514,6 +1093,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           CGO_ENABLED=1 go test \
             -race \
             -count=1 \
@@ -529,6 +1109,7 @@ jobs:
 
           PARENT_DIR="${RUNNER_TEMP}/multipath-parent"
           LOG_DIR="${RUNNER_TEMP}/capacity-perf"
+
           mkdir -p "$LOG_DIR"
           rm -rf "$PARENT_DIR"
 
@@ -537,8 +1118,13 @@ jobs:
             "refs/remotes/origin/${PARENT_BRANCH}"
 
           cleanup() {
-            git worktree remove --force "$PARENT_DIR" >/dev/null 2>&1 || true
+            git worktree remove \
+              --force \
+              "$PARENT_DIR" \
+              >/dev/null 2>&1 \
+              || true
           }
+
           trap cleanup EXIT
 
           run_perf() {
@@ -548,8 +1134,10 @@ jobs:
             local log="$LOG_DIR/${label}-${run_id}.log"
 
             set +e
+
             (
               cd "$tree"
+
               CGO_ENABLED=1 go test \
                 -race \
                 -count=1 \
@@ -558,20 +1146,49 @@ jobs:
                 -tags "$BUILD_TAGS" \
                 -run '^TestPerformanceHealthyLinks$' \
                 ./protocol/multipath
+
             ) 2>&1 | tee "$log"
+
             local rc=${PIPESTATUS[0]}
+
             set -e
-            echo "${label}_run_${run_id}_go_test_rc=${rc}"
+
+            echo \
+              "${label}_run_${run_id}_go_test_rc=${rc}"
           }
 
-          # Two independent samples on each exact tree. The fixture may return
-          # non-zero because it embeds historical beta3 thresholds; that exit code
-          # is not used as the differential verdict. Safety errors and measured
-          # throughput are parsed below.
-          run_perf "$PARENT_DIR" parent 1
-          run_perf "$GITHUB_WORKSPACE" candidate 1
-          run_perf "$PARENT_DIR" parent 2
-          run_perf "$GITHUB_WORKSPACE" candidate 2
+          # Two independent samples on each exact
+          # source tree.
+          #
+          # The historical fixture can return
+          # non-zero because it still contains
+          # beta3 absolute performance thresholds.
+          #
+          # That exit code is deliberately not used
+          # as the candidate verdict.
+          #
+          # Safety failures and actual throughput
+          # measurements are independently parsed.
+
+          run_perf \
+            "$PARENT_DIR" \
+            parent \
+            1
+
+          run_perf \
+            "$GITHUB_WORKSPACE" \
+            candidate \
+            1
+
+          run_perf \
+            "$PARENT_DIR" \
+            parent \
+            2
+
+          run_perf \
+            "$GITHUB_WORKSPACE" \
+            candidate \
+            2
 
           python3 - "$LOG_DIR" <<'PY'
           from pathlib import Path
@@ -579,7 +1196,11 @@ jobs:
           import re
           import sys
 
-          log_dir = Path(sys.argv[1])
+
+          log_dir = Path(
+              sys.argv[1]
+          )
+
 
           expected = [
               '1_160+600Mbps_65+110ms',
@@ -595,17 +1216,35 @@ jobs:
               '1_1000+1000Mbps_65+110ms',
           ]
 
+
           run_re = re.compile(
-              r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$'
-          )
-          rate_re = re.compile(
-              r'performance_test\.go:\d+: '
-              r'flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)'
+              (
+                  r'^=== RUN\s+'
+                  r'TestPerformanceHealthyLinks/'
+                  r'(.+)$'
+              )
           )
 
+
+          rate_re = re.compile(
+              (
+                  r'performance_test\.go:\d+: '
+                  r'flows=\d+ .*?'
+                  r'Mbps='
+                  r'([0-9]+(?:\.[0-9]+)?)'
+              )
+          )
+
+
           forbidden = (
-              'healthy reliable legs triggered replay',
-              'unused window credit caused memory pressure',
+              (
+                  'healthy reliable legs '
+                  'triggered replay'
+              ),
+              (
+                  'unused window credit caused '
+                  'memory pressure'
+              ),
               'memory budget exceeded',
               'short stream:',
               'panic:',
@@ -613,102 +1252,249 @@ jobs:
               'test timed out',
               'DATA RACE',
           )
+
+
           diagnostic_re = re.compile(
-              r'performance_test\.go:\d+: (.*)$'
+              (
+                  r'performance_test\.go:\d+: '
+                  r'(.*)$'
+              )
           )
 
+
           def parse(path):
-              text = path.read_text(encoding='utf-8', errors='replace')
+              text = path.read_text(
+                  encoding='utf-8',
+                  errors='replace',
+              )
+
               for token in forbidden:
                   if token in text:
                       raise SystemExit(
-                          f'FAIL {path.name}: unsafe fixture result: {token}'
+                          (
+                              f'FAIL {path.name}: '
+                              'unsafe fixture result: '
+                              f'{token}'
+                          )
                       )
+
               current = None
               values = {}
+
               for line in text.splitlines():
-                  diagnostic = diagnostic_re.search(line)
+
+                  diagnostic = (
+                      diagnostic_re.search(line)
+                  )
+
                   if diagnostic:
-                      message = diagnostic.group(1)
+                      message = (
+                          diagnostic.group(1)
+                      )
+
                       if not (
-                          message.startswith('throughput regression:')
-                          or message.startswith('flows=')
+                          message.startswith(
+                              'throughput regression:'
+                          )
+                          or
+                          message.startswith(
+                              'flows='
+                          )
                       ):
                           raise SystemExit(
-                              f'FAIL {path.name}: unexpected performance diagnostic: '
-                              f'{message}'
+                              (
+                                  f'FAIL {path.name}: '
+                                  'unexpected '
+                                  'performance '
+                                  'diagnostic: '
+                                  f'{message}'
+                              )
                           )
 
-                  match = run_re.search(line)
+                  match = run_re.search(
+                      line
+                  )
+
                   if match:
                       current = match.group(1)
                       continue
-                  match = rate_re.search(line)
-                  if match and current:
-                      values[current] = float(match.group(1))
-              missing = sorted(set(expected) - set(values))
-              extra = sorted(set(values) - set(expected))
+
+                  match = rate_re.search(
+                      line
+                  )
+
+                  if (
+                      match
+                      and
+                      current
+                  ):
+                      values[current] = float(
+                          match.group(1)
+                      )
+
+              missing = sorted(
+                  set(expected)
+                  -
+                  set(values)
+              )
+
+              extra = sorted(
+                  set(values)
+                  -
+                  set(expected)
+              )
+
               if missing or extra:
                   raise SystemExit(
-                      f'FAIL {path.name}: missing={missing} extra={extra}'
+                      (
+                          f'FAIL {path.name}: '
+                          f'missing={missing} '
+                          f'extra={extra}'
+                      )
                   )
+
               return values
+
 
           samples = {
               'parent': [
-                  parse(log_dir / 'parent-1.log'),
-                  parse(log_dir / 'parent-2.log'),
+                  parse(
+                      log_dir /
+                      'parent-1.log'
+                  ),
+                  parse(
+                      log_dir /
+                      'parent-2.log'
+                  ),
               ],
               'candidate': [
-                  parse(log_dir / 'candidate-1.log'),
-                  parse(log_dir / 'candidate-2.log'),
+                  parse(
+                      log_dir /
+                      'candidate-1.log'
+                  ),
+                  parse(
+                      log_dir /
+                      'candidate-2.log'
+                  ),
               ],
           }
 
+
           failed = False
-          print('=== ZERO-CAPACITY PARENT VS CANDIDATE PERFORMANCE ===')
+
+          print(
+              '=== ZERO-CAPACITY '
+              'PARENT VS CANDIDATE '
+              'PERFORMANCE ==='
+          )
+
+
           for case in expected:
-              parent_values = [sample[case] for sample in samples['parent']]
-              candidate_values = [sample[case] for sample in samples['candidate']]
-              parent_median = statistics.median(parent_values)
-              candidate_median = statistics.median(candidate_values)
-              ratio = candidate_median / parent_median
-              status = 'PASS' if ratio >= 0.98 else 'FAIL'
+
+              parent_values = [
+                  sample[case]
+                  for sample
+                  in samples['parent']
+              ]
+
+              candidate_values = [
+                  sample[case]
+                  for sample
+                  in samples['candidate']
+              ]
+
+              parent_median = (
+                  statistics.median(
+                      parent_values
+                  )
+              )
+
+              candidate_median = (
+                  statistics.median(
+                      candidate_values
+                  )
+              )
+
+              ratio = (
+                  candidate_median
+                  /
+                  parent_median
+              )
+
+              status = (
+                  'PASS'
+                  if ratio >= 0.98
+                  else 'FAIL'
+              )
+
               print(
                   f'{status} {case}: '
-                  f'parent={parent_values} median={parent_median:.1f} '
-                  f'candidate={candidate_values} median={candidate_median:.1f} '
+                  f'parent={parent_values} '
+                  f'median={parent_median:.1f} '
+                  f'candidate={candidate_values} '
+                  f'median={candidate_median:.1f} '
                   f'ratio={ratio:.4f}'
               )
+
               if ratio < 0.98:
                   failed = True
 
+
           if failed:
               raise SystemExit(
-                  'FAIL capacity branch is below 98% of its direct parent '
-                  'with preferred_capacity_mbps disabled'
+                  (
+                      'FAIL capacity branch is '
+                      'below 98% of its direct '
+                      'parent with '
+                      'preferred_capacity_mbps '
+                      'disabled'
+                  )
               )
 
+
           print(
-              'PASS candidate retains at least 98% of direct-parent '
-              'performance for every deterministic fixture'
+              (
+                  'PASS candidate retains at '
+                  'least 98% of direct-parent '
+                  'performance for every '
+                  'deterministic fixture'
+              )
           )
           PY
 
-      - name: Compile all repository packages without running tests
+      # IMPORTANT:
+      #
+      # This is intentionally `go build`, not:
+      #
+      #   go test -run '^$' ./...
+      #
+      # `go test -run '^$'` suppresses test execution,
+      # but it still compiles test files and test
+      # binaries. That is not the semantic contract
+      # of this gate.
+      #
+      # The actual tests are already executed by the
+      # explicit gates above.
+      #
+      # This final repository-wide gate therefore
+      # validates production-package compilation only.
+
+      - name: Compile all repository production packages without tests
         shell: bash
         run: |
           set -euo pipefail
-          go test \
-            -run '^$' \
+
+          go build \
             -tags "$BUILD_TAGS" \
             ./...
 
   build_targets:
     name: Build ${{ matrix.label }}
     needs: audit_test
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - label: macOS Intel amd64
@@ -716,11 +1502,13 @@ jobs:
             goos: darwin
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
+
           - label: Windows amd64
             runner: windows-2025
             goos: windows
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
+
           - label: Linux amd64
             runner: ubuntu-24.04
             goos: linux
@@ -729,6 +1517,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+
     defaults:
       run:
         shell: bash
@@ -753,28 +1542,66 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.audit_test.outputs.candidate_sha }}"
-          test "$(go env GOVERSION)" = "go${GO_VERSION}"
-          test "$(go env GOHOSTARCH)" = "amd64"
-          test "$(go env GOHOSTOS)" = "${{ matrix.goos }}"
-          echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
-          echo "go=$(go version)"
-          echo "audited_commit=$(git rev-parse HEAD)"
+
+          test \
+            "$(git rev-parse HEAD)" \
+            = \
+            "${{ needs.audit_test.outputs.candidate_sha }}"
+
+          test \
+            "$(go env GOVERSION)" \
+            = \
+            "go${GO_VERSION}"
+
+          test \
+            "$(go env GOHOSTARCH)" \
+            = \
+            "amd64"
+
+          test \
+            "$(go env GOHOSTOS)" \
+            = \
+            "${{ matrix.goos }}"
+
+          echo \
+            "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+
+          echo \
+            "go=$(go version)"
+
+          echo \
+            "audited_commit=$(git rev-parse HEAD)"
 
       - name: Set build inputs
         shell: bash
         run: |
           set -euo pipefail
-          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
-          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+
+          BUILD_TAGS="$(
+            tr -d '\r\n' < \
+              release/DEFAULT_BUILD_TAGS_OTHERS
+          )"
+
+          LDFLAGS_SHARED="$(
+            tr -d '\r\n' < \
+              release/LDFLAGS
+          )"
+
           test -n "$BUILD_TAGS"
-          echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
-          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
+          echo \
+            "BUILD_TAGS=$BUILD_TAGS" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "LDFLAGS_SHARED=$LDFLAGS_SHARED" \
+            >> "$GITHUB_ENV"
 
       - name: Native target regression tests
         shell: bash
         run: |
           set -euo pipefail
+
           go test \
             -count=1 \
             -timeout=15m \
@@ -792,7 +1619,9 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
+
           mkdir -p dist
+
           go build \
             -v \
             -trimpath \
@@ -805,19 +1634,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           BIN="dist/${{ matrix.binary }}"
+
           if [[ "${{ matrix.goos }}" != "windows" ]]; then
             chmod +x "$BIN"
           fi
+
           test -s "$BIN"
-          ACTUAL_VERSION="$("./$BIN" version -n | tr -d '\r\n')"
-          test "$ACTUAL_VERSION" = "$VERSION"
-          VERSION_OUTPUT="$("./$BIN" version)"
-          printf '%s\n' "$VERSION_OUTPUT"
+
+          ACTUAL_VERSION="$(
+            "./$BIN" version -n |
+              tr -d '\r\n'
+          )"
+
+          test \
+            "$ACTUAL_VERSION" \
+            = \
+            "$VERSION"
+
+          VERSION_OUTPUT="$(
+            "./$BIN" version
+          )"
+
+          printf \
+            '%s\n' \
+            "$VERSION_OUTPUT"
+
           grep -F \
             "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" \
             <<< "$VERSION_OUTPUT"
-          grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
+
+          grep -F \
+            'CGO: disabled' \
+            <<< "$VERSION_OUTPUT"
 
       - name: Produce checksum and build provenance
         shell: bash
@@ -825,12 +1675,20 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
+
           BIN="dist/${{ matrix.binary }}"
+
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            shasum -a 256 "$BIN" > "${BIN}.sha256"
+            shasum \
+              -a 256 \
+              "$BIN" \
+              > "${BIN}.sha256"
           else
-            sha256sum "$BIN" > "${BIN}.sha256"
+            sha256sum \
+              "$BIN" \
+              > "${BIN}.sha256"
           fi
+
           {
             echo "version=${VERSION}"
             echo "source_ref=${SOURCE_REF}"
@@ -842,6 +1700,7 @@ jobs:
             echo "build_tags=${BUILD_TAGS}"
             echo "binary=${{ matrix.binary }}"
           } > "${BIN}.buildinfo.txt"
+
           cat "${BIN}.sha256"
           cat "${BIN}.buildinfo.txt"
 
