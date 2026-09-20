@@ -28,7 +28,6 @@ concurrency:
 env:
   GO_VERSION: '1.25.5'
   VERSION: '1.14.0-multipath-beta6'
-  BASE_REV: '31970756db5fd37d9e4080734dfeed9ffd5ceefd'
   PARENT_BRANCH: 'feature/mieru-outbound-beta6'
 
 jobs:
@@ -52,7 +51,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Verify branch, ancestry, and Go baseline
+      - name: Verify branch, parent source, and Go baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -61,17 +60,31 @@ jobs:
           echo "ref_name=${GITHUB_REF_NAME}"
           echo "sha=${GITHUB_SHA}"
 
+          test "${GITHUB_REF_NAME}" = \
+            "feature/multipath-capacity-scheduler-beta6"
+
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           grep -Fx "go ${GO_VERSION}" go.mod
 
-          git cat-file -e "${BASE_REV}^{commit}"
-          git merge-base --is-ancestor "${BASE_REV}" HEAD
-
           git fetch --no-tags origin \
-            "${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
+            "+refs/heads/${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
 
-          git merge-base --is-ancestor \
-            "origin/${PARENT_BRANCH}" HEAD
+          PARENT_SHA="$(
+            git rev-parse \
+              "origin/${PARENT_BRANCH}^{commit}"
+          )"
+
+          CURRENT_SHA="$(git rev-parse HEAD)"
+
+          test "${CURRENT_SHA}" = "${GITHUB_SHA}"
+
+          echo "parent_branch=${PARENT_BRANCH}"
+          echo "parent_sha=${PARENT_SHA}"
+          echo "candidate_sha=${CURRENT_SHA}"
+
+          echo "PASS branch/ref"
+          echo "PASS Go baseline"
+          echo "PASS parent source available"
 
       - name: Set audited build inputs
         shell: bash
@@ -127,11 +140,14 @@ jobs:
               fail(f"unbalanced function: {signature}")
 
           root = Path(".")
-          base = os.environ["BASE_REV"]
           parent = f"origin/{os.environ['PARENT_BRANCH']}"
 
           original_scheduler = subprocess.check_output(
-              ["git", "show", f"{base}:protocol/multipath/scheduler.go"],
+              [
+                  "git",
+                  "show",
+                  f"{parent}:protocol/multipath/scheduler.go",
+              ],
               text=True,
           )
 
@@ -150,9 +166,14 @@ jobs:
           )
 
           if original[original.index("{"):] != retained[retained.index("{"):]:
-              fail("original beta6 adaptive scheduler body changed")
+              fail(
+                  "original direct-parent adaptive scheduler body changed"
+              )
 
-          ok("original beta6 adaptive scheduler body retained byte-for-byte")
+          ok(
+              "direct-parent adaptive scheduler body "
+              "retained byte-for-byte"
+          )
 
           zero_bypass = (
               "chosen := c.chooseAdaptivePathLocked(length)\n"
@@ -272,13 +293,27 @@ jobs:
               "protocol/multipath/protocol.go",
           ):
               rc = subprocess.run(
-                  ["git", "diff", "--quiet", base, "--", rel]
+                  [
+                      "git",
+                      "diff",
+                      "--quiet",
+                      parent,
+                      "HEAD",
+                      "--",
+                      rel,
+                  ]
               ).returncode
 
               if rc != 0:
-                  fail(f"frozen beta6 file changed: {rel}")
+                  fail(
+                      "frozen multipath file changed "
+                      f"from direct parent: {rel}"
+                  )
 
-              ok(f"frozen beta6 file unchanged: {rel}")
+              ok(
+                  "frozen multipath file unchanged "
+                  f"from direct parent: {rel}"
+              )
 
           for rel in (
               "protocol/multipath/wire.go",
@@ -306,11 +341,21 @@ jobs:
               "go.sum",
           ):
               rc = subprocess.run(
-                  ["git", "diff", "--quiet", parent, "--", rel]
+                  [
+                      "git",
+                      "diff",
+                      "--quiet",
+                      parent,
+                      "HEAD",
+                      "--",
+                      rel,
+                  ]
               ).returncode
 
               if rc != 0:
-                  fail(f"existing Mieru baseline drifted: {rel}")
+                  fail(
+                      f"existing Mieru baseline drifted: {rel}"
+                  )
 
           ok("existing Mieru outbound baseline preserved")
 
@@ -334,7 +379,8 @@ jobs:
                       "git",
                       "diff",
                       "--name-only",
-                      f"{parent}...HEAD",
+                      parent,
+                      "HEAD",
                   ],
                   text=True,
               ).splitlines()
