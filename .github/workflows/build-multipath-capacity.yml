@@ -35,7 +35,8 @@ jobs:
   audit_test:
     name: Source audit + independent tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+
     steps:
       - name: Checkout exact source
         uses: actions/checkout@v7
@@ -55,25 +56,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           echo "ref=${GITHUB_REF}"
           echo "ref_name=${GITHUB_REF_NAME}"
           echo "sha=${GITHUB_SHA}"
+
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           grep -Fx "go ${GO_VERSION}" go.mod
+
           git cat-file -e "${BASE_REV}^{commit}"
           git merge-base --is-ancestor "${BASE_REV}" HEAD
-          git fetch --no-tags origin "${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
-          git merge-base --is-ancestor "origin/${PARENT_BRANCH}" HEAD
+
+          git fetch --no-tags origin \
+            "${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
+
+          git merge-base --is-ancestor \
+            "origin/${PARENT_BRANCH}" HEAD
 
       - name: Set audited build inputs
         shell: bash
         run: |
           set -euo pipefail
+
           BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+
           test -n "$BUILD_TAGS"
+
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
           echo "BUILD_TAGS=$BUILD_TAGS"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED"
 
@@ -81,9 +93,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
-          import os, subprocess, sys
+          import os
+          import subprocess
+          import sys
 
           def fail(msg):
               print(f"FAIL {msg}")
@@ -97,8 +112,10 @@ jobs:
                   start = text.index(signature)
               except ValueError:
                   fail(f"missing function: {signature}")
+
               brace = text.index("{", start)
               depth = 0
+
               for i in range(brace, len(text)):
                   if text[i] == "{":
                       depth += 1
@@ -106,130 +123,260 @@ jobs:
                       depth -= 1
                       if depth == 0:
                           return text[start:i + 1]
+
               fail(f"unbalanced function: {signature}")
 
-          root = Path('.')
-          base = os.environ['BASE_REV']
+          root = Path(".")
+          base = os.environ["BASE_REV"]
           parent = f"origin/{os.environ['PARENT_BRANCH']}"
 
           original_scheduler = subprocess.check_output(
-              ['git', 'show', f'{base}:protocol/multipath/scheduler.go'], text=True
+              ["git", "show", f"{base}:protocol/multipath/scheduler.go"],
+              text=True,
           )
-          current_scheduler = (root / 'protocol/multipath/scheduler.go').read_text()
 
-          original = extract_func(original_scheduler, 'func (c *mpCore) choosePathLocked(length int) *mpLeg')
-          retained = extract_func(current_scheduler, 'func (c *mpCore) chooseAdaptivePathLocked(length int) *mpLeg')
-          if original[original.index('{'):] != retained[retained.index('{'):]:
-              fail('original beta6 adaptive scheduler body changed')
-          ok('original beta6 adaptive scheduler body retained byte-for-byte')
+          current_scheduler = (
+              root / "protocol/multipath/scheduler.go"
+          ).read_text()
 
-          zero_bypass = '''chosen := c.chooseAdaptivePathLocked(length)\n\tif c.cfg.PreferredCapacityBytesPS == 0 {\n\t\treturn chosen\n\t}'''
+          original = extract_func(
+              original_scheduler,
+              "func (c *mpCore) choosePathLocked(length int) *mpLeg",
+          )
+
+          retained = extract_func(
+              current_scheduler,
+              "func (c *mpCore) chooseAdaptivePathLocked(length int) *mpLeg",
+          )
+
+          if original[original.index("{"):] != retained[retained.index("{"):]:
+              fail("original beta6 adaptive scheduler body changed")
+
+          ok("original beta6 adaptive scheduler body retained byte-for-byte")
+
+          zero_bypass = (
+              "chosen := c.chooseAdaptivePathLocked(length)\n"
+              "\tif c.cfg.PreferredCapacityBytesPS == 0 {\n"
+              "\t\treturn chosen\n"
+              "\t}"
+          )
+
           if zero_bypass not in current_scheduler:
-              fail('preferred_capacity_mbps=0 is not an immediate original-scheduler return')
-          ok('preferred_capacity_mbps=0 is a strict scheduler bypass')
+              fail(
+                  "preferred_capacity_mbps=0 is not an immediate "
+                  "original-scheduler return"
+              )
 
-          options = (root / 'option/multipath.go').read_text()
-          if options.count('json:"preferred_capacity_mbps,omitempty"') != 2:
-              fail('preferred_capacity_mbps must exist exactly once on outbound and once on inbound')
-          ok('single config field exposed on both Local-TX surfaces')
+          ok("preferred_capacity_mbps=0 is a strict scheduler bypass")
 
-          conversion = 'PreferredCapacityBytesPS:       uint64(options.PreferredCapacityMbps) * 1_000_000 / 8'
-          for rel in ('protocol/multipath/outbound.go', 'protocol/multipath/inbound.go'):
+          options = (root / "option/multipath.go").read_text()
+
+          if options.count(
+              'json:"preferred_capacity_mbps,omitempty"'
+          ) != 2:
+              fail(
+                  "preferred_capacity_mbps must exist exactly once "
+                  "on outbound and once on inbound"
+              )
+
+          ok("single config field exposed on both Local-TX surfaces")
+
+          conversion = (
+              "PreferredCapacityBytesPS:       "
+              "uint64(options.PreferredCapacityMbps) * 1_000_000 / 8"
+          )
+
+          for rel in (
+              "protocol/multipath/outbound.go",
+              "protocol/multipath/inbound.go",
+          ):
               if conversion not in (root / rel).read_text():
-                  fail(f'capacity conversion missing: {rel}')
-              ok(f'capacity wired into Local TX: {rel}')
+                  fail(f"capacity conversion missing: {rel}")
 
-          guard = extract_func(current_scheduler, 'func (c *mpCore) applyPreferredCapacityFloorLocked(chosen *mpLeg, length int, now time.Time) *mpLeg')
+              ok(f"capacity wired into Local TX: {rel}")
+
+          guard = extract_func(
+              current_scheduler,
+              "func (c *mpCore) applyPreferredCapacityFloorLocked("
+              "chosen *mpLeg, length int, now time.Time) *mpLeg",
+          )
+
           for needle in (
-              'preferred := c.getLeg(0)',
-              'preferred.path.Stale',
-              'preferred.busy',
-              'preferred.path.Outstanding()+uint64(length) > pipeline',
-              'return preferred',
+              "preferred := c.getLeg(0)",
+              "preferred.path.Stale",
+              "preferred.busy",
+              "preferred.path.Outstanding()+uint64(length) > pipeline",
+              "return preferred",
           ):
               if needle not in guard:
-                  fail(f'capacity guard missing safety predicate: {needle}')
-          if 'c.getLeg(1)' in guard or 'return c.getLeg(1)' in guard:
-              fail('capacity guard directly controls booster selection')
-          ok('guard protects only eligible preferred/leg0 and does not replace booster policy')
+                  fail(
+                      "capacity guard missing safety predicate: "
+                      f"{needle}"
+                  )
 
-          for needle in ('preferredCapacityDebtChunks    = 2', 'preferredCapacitySurplusChunks = 4'):
+          if (
+              "c.getLeg(1)" in guard
+              or "return c.getLeg(1)" in guard
+          ):
+              fail(
+                  "capacity guard directly controls booster selection"
+              )
+
+          ok(
+              "guard protects only eligible preferred/leg0 "
+              "and does not replace booster policy"
+          )
+
+          for needle in (
+              "preferredCapacityDebtChunks    = 2",
+              "preferredCapacitySurplusChunks = 4",
+          ):
               if needle not in current_scheduler:
-                  fail(f'missing bounded floor constant: {needle}')
-          ok('capacity debt/surplus are chunk-bounded')
+                  fail(
+                      f"missing bounded floor constant: {needle}"
+                  )
 
-          submit = extract_func(current_scheduler, 'func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error')
-          accepted = '''case leg.send <- frame:\n\t\tc.notePreferredCapacityAssignmentLocked(leg, segment.Length, now)\n\t\treturn nil'''
+          ok("capacity debt/surplus are chunk-bounded")
+
+          submit = extract_func(
+              current_scheduler,
+              "func (c *mpCore) submitLocked("
+              "leg *mpLeg, segment stream.Segment, "
+              "repair bool, now time.Time) error",
+          )
+
+          accepted = (
+              "case leg.send <- frame:\n"
+              "\t\tc.notePreferredCapacityAssignmentLocked("
+              "leg, segment.Length, now)\n"
+              "\t\treturn nil"
+          )
+
           if accepted not in submit:
-              fail('preferred accounting is not after successful queue acceptance')
-          ok('preferred assignment is accounted only after queue acceptance')
+              fail(
+                  "preferred accounting is not after "
+                  "successful queue acceptance"
+              )
+
+          ok(
+              "preferred assignment is accounted only "
+              "after queue acceptance"
+          )
 
           for rel in (
-              'protocol/multipath/wire.go',
-              'protocol/multipath/telemetry.go',
-              'protocol/multipath/activation.go',
-              'protocol/multipath/memory.go',
-              'protocol/multipath/stream/path.go',
-              'protocol/multipath/protocol.go',
+              "protocol/multipath/wire.go",
+              "protocol/multipath/telemetry.go",
+              "protocol/multipath/activation.go",
+              "protocol/multipath/memory.go",
+              "protocol/multipath/stream/path.go",
+              "protocol/multipath/protocol.go",
           ):
-              rc = subprocess.run(['git', 'diff', '--quiet', base, '--', rel]).returncode
-              if rc != 0:
-                  fail(f'frozen beta6 file changed: {rel}')
-              ok(f'frozen beta6 file unchanged: {rel}')
+              rc = subprocess.run(
+                  ["git", "diff", "--quiet", base, "--", rel]
+              ).returncode
 
-          for rel in ('protocol/multipath/wire.go', 'protocol/multipath/telemetry.go'):
+              if rc != 0:
+                  fail(f"frozen beta6 file changed: {rel}")
+
+              ok(f"frozen beta6 file unchanged: {rel}")
+
+          for rel in (
+              "protocol/multipath/wire.go",
+              "protocol/multipath/telemetry.go",
+          ):
               text = (root / rel).read_text()
-              if 'PreferredCapacity' in text or 'preferred_capacity' in text:
-                  fail(f'capacity leaked into wire/telemetry protocol: {rel}')
-          ok('capacity setting is not negotiated on wire')
+
+              if (
+                  "PreferredCapacity" in text
+                  or "preferred_capacity" in text
+              ):
+                  fail(
+                      "capacity leaked into wire/telemetry protocol: "
+                      f"{rel}"
+                  )
+
+          ok("capacity setting is not negotiated on wire")
 
           for rel in (
-              'constant/proxy.go', 'option/mieru.go', 'protocol/mieru/outbound.go',
-              'include/registry.go', 'go.mod', 'go.sum'
+              "constant/proxy.go",
+              "option/mieru.go",
+              "protocol/mieru/outbound.go",
+              "include/registry.go",
+              "go.mod",
+              "go.sum",
           ):
-              rc = subprocess.run(['git', 'diff', '--quiet', parent, '--', rel]).returncode
+              rc = subprocess.run(
+                  ["git", "diff", "--quiet", parent, "--", rel]
+              ).returncode
+
               if rc != 0:
-                  fail(f'existing Mieru baseline drifted: {rel}')
-          ok('existing Mieru outbound baseline preserved')
+                  fail(f"existing Mieru baseline drifted: {rel}")
+
+          ok("existing Mieru outbound baseline preserved")
 
           allowed = {
-              'README.md',
-              'option/multipath.go',
-              'option/multipath_test.go',
-              'protocol/multipath/types.go',
-              'protocol/multipath/outbound.go',
-              'protocol/multipath/inbound.go',
-              'protocol/multipath/scheduler.go',
-              'protocol/multipath/status.go',
-              'protocol/multipath/reorder_options_test.go',
-              'protocol/multipath/capacity_scheduler_test.go',
-              '.github/workflows/build-multipath-capacity.yml',
+              "README.md",
+              "option/multipath.go",
+              "option/multipath_test.go",
+              "protocol/multipath/types.go",
+              "protocol/multipath/outbound.go",
+              "protocol/multipath/inbound.go",
+              "protocol/multipath/scheduler.go",
+              "protocol/multipath/status.go",
+              "protocol/multipath/reorder_options_test.go",
+              "protocol/multipath/capacity_scheduler_test.go",
+              ".github/workflows/build-multipath-capacity.yml",
           }
-          changed = set(subprocess.check_output(
-              ['git', 'diff', '--name-only', f'{parent}...HEAD'], text=True
-          ).splitlines())
+
+          changed = set(
+              subprocess.check_output(
+                  [
+                      "git",
+                      "diff",
+                      "--name-only",
+                      f"{parent}...HEAD",
+                  ],
+                  text=True,
+              ).splitlines()
+          )
+
           unexpected = sorted(changed - allowed)
+
           if unexpected:
-              fail(f'unexpected write-set relative to {parent}: {unexpected}')
+              fail(
+                  f"unexpected write-set relative to {parent}: "
+                  f"{unexpected}"
+              )
+
           required = {
-              'option/multipath.go',
-              'protocol/multipath/types.go',
-              'protocol/multipath/outbound.go',
-              'protocol/multipath/inbound.go',
-              'protocol/multipath/scheduler.go',
-              'protocol/multipath/status.go',
-              'protocol/multipath/capacity_scheduler_test.go',
+              "option/multipath.go",
+              "protocol/multipath/types.go",
+              "protocol/multipath/outbound.go",
+              "protocol/multipath/inbound.go",
+              "protocol/multipath/scheduler.go",
+              "protocol/multipath/status.go",
+              "protocol/multipath/capacity_scheduler_test.go",
           }
+
           missing = sorted(required - changed)
+
           if missing:
-              fail(f'expected capacity implementation files not changed: {missing}')
-          ok(f'write-set closed: {len(changed)} files changed from Mieru parent')
+              fail(
+                  "expected capacity implementation files not changed: "
+                  f"{missing}"
+              )
+
+          ok(
+              f"write-set closed: {len(changed)} files changed "
+              "from Mieru parent"
+          )
           PY
 
       - name: Check formatting of capacity write-set
         shell: bash
         run: |
           set -euo pipefail
+
           files=(
             option/multipath.go
             option/multipath_test.go
@@ -241,7 +388,9 @@ jobs:
             protocol/multipath/reorder_options_test.go
             protocol/multipath/capacity_scheduler_test.go
           )
+
           unformatted="$(gofmt -l "${files[@]}")"
+
           if [[ -n "$unformatted" ]]; then
             echo "$unformatted"
             exit 1
@@ -251,6 +400,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from dataclasses import dataclass
 
@@ -264,138 +414,535 @@ jobs:
               credit: float = 0.0
               last: float | None = None
 
-              def choose(self, candidate: int, now: float, eligible: bool = True) -> int:
+              def choose(
+                  self,
+                  candidate: int,
+                  now: float,
+                  eligible: bool = True,
+              ) -> int:
                   if not self.enabled:
                       return candidate
+
                   if self.last is None:
                       self.last = now
                   else:
-                      self.credit += (now - self.last) * TARGET_BPS
+                      self.credit += (
+                          now - self.last
+                      ) * TARGET_BPS
+
                       self.last = now
-                      self.credit = min(self.credit, 2 * CHUNK)
-                      self.credit = max(self.credit, -4 * CHUNK)
+
+                      self.credit = min(
+                          self.credit,
+                          2 * CHUNK,
+                      )
+
+                      self.credit = max(
+                          self.credit,
+                          -4 * CHUNK,
+                      )
+
                   if candidate == 0:
                       return 0
+
                   if eligible and self.credit >= CHUNK:
                       return 0
+
                   return candidate
 
               def assigned(self, leg: int) -> None:
                   if self.enabled and leg == 0:
                       self.credit -= CHUNK
-                      self.credit = max(self.credit, -4 * CHUNK)
+                      self.credit = max(
+                          self.credit,
+                          -4 * CHUNK,
+                      )
 
-          def run(offered_mbps, candidate_fn, enabled=True, unavailable_fn=lambda _t: False):
-              offered_bps = offered_mbps * 1_000_000 / 8
+          def run(
+              offered_mbps,
+              candidate_fn,
+              enabled=True,
+              unavailable_fn=lambda _t: False,
+          ):
+              offered_bps = (
+                  offered_mbps * 1_000_000 / 8
+              )
+
               dt = CHUNK / offered_bps
+
               guard = Guard(enabled=enabled)
+
               counts = [0, 0]
               overrides = 0
               now = 0.0
               i = 0
+
               while now < DURATION:
                   candidate = candidate_fn(i)
-                  chosen = guard.choose(candidate, now, not unavailable_fn(now))
-                  overrides += int(chosen != candidate)
+
+                  chosen = guard.choose(
+                      candidate,
+                      now,
+                      not unavailable_fn(now),
+                  )
+
+                  overrides += int(
+                      chosen != candidate
+                  )
+
                   counts[chosen] += 1
                   guard.assigned(chosen)
+
                   i += 1
                   now += dt
-              mbps = [n * CHUNK * 8 / DURATION / 1_000_000 for n in counts]
+
+              mbps = [
+                  n * CHUNK * 8
+                  / DURATION
+                  / 1_000_000
+                  for n in counts
+              ]
+
               return mbps, overrides, counts
 
-          # Disabled mode must be an exact no-op.
           pattern = lambda i: 0 if i % 4 == 0 else 1
-          base, _, base_counts = run(140.0, pattern, enabled=False)
-          off, off_overrides, off_counts = run(140.0, pattern, enabled=False)
-          assert off_counts == base_counts and off_overrides == 0
 
-          # Pathological starvation: A must recover to ~80 Mbps, remainder stays on original candidate B.
-          forced, overrides, _ = run(140.0, lambda _i: 1, enabled=True)
+          base, _, base_counts = run(
+              140.0,
+              pattern,
+              enabled=False,
+          )
+
+          off, off_overrides, off_counts = run(
+              140.0,
+              pattern,
+              enabled=False,
+          )
+
+          assert off_counts == base_counts
+          assert off_overrides == 0
+
+          forced, overrides, _ = run(
+              140.0,
+              lambda _i: 1,
+              enabled=True,
+          )
+
           assert 79.0 <= forced[0] <= 81.0, forced
           assert 58.0 <= forced[1] <= 61.0, forced
           assert 138.0 <= sum(forced) <= 141.0, forced
           assert overrides > 0
 
-          # Known-good 90+40 split must remain untouched.
-          healthy_pattern = lambda i: 0 if (i % 13) < 9 else 1
-          healthy_base, _, healthy_counts = run(130.0, healthy_pattern, enabled=False)
-          healthy_new, healthy_overrides, healthy_new_counts = run(130.0, healthy_pattern, enabled=True)
-          assert 89.0 <= healthy_base[0] <= 91.0, healthy_base
-          assert 39.0 <= healthy_base[1] <= 41.0, healthy_base
-          assert healthy_new_counts == healthy_counts, (healthy_base, healthy_new)
+          healthy_pattern = (
+              lambda i: 0 if (i % 13) < 9 else 1
+          )
+
+          healthy_base, _, healthy_counts = run(
+              130.0,
+              healthy_pattern,
+              enabled=False,
+          )
+
+          healthy_new, healthy_overrides, healthy_new_counts = run(
+              130.0,
+              healthy_pattern,
+              enabled=True,
+          )
+
+          assert 89.0 <= healthy_base[0] <= 91.0
+          assert 39.0 <= healthy_base[1] <= 41.0
+
+          assert healthy_new_counts == healthy_counts
           assert healthy_overrides == 0
 
-          # Maximum allowed surplus must not mask starvation for more than 10 saturated assignments.
           offered_bps = 140.0 * 1_000_000 / 8
           dt = CHUNK / offered_bps
-          guard = Guard(enabled=True, credit=-4 * CHUNK, last=0.0)
+
+          guard = Guard(
+              enabled=True,
+              credit=-4 * CHUNK,
+              last=0.0,
+          )
+
           first_preferred = None
           now = 0.0
+
           for i in range(1, 11):
               now += dt
-              chosen = guard.choose(1, now, True)
+
+              chosen = guard.choose(
+                  1,
+                  now,
+                  True,
+              )
+
               if chosen == 0:
                   first_preferred = i
                   break
-              guard.assigned(chosen)
-          assert first_preferred is not None and first_preferred <= 10, first_preferred
 
-          # Hard unavailability always wins over the floor.
+              guard.assigned(chosen)
+
+          assert (
+              first_preferred is not None
+              and first_preferred <= 10
+          )
+
           guard = Guard(enabled=True)
           now = 0.0
           a_during_unavailable = 0
+
           while now < DURATION:
-              eligible = not (2.0 <= now < 4.0)
-              chosen = guard.choose(1, now, eligible)
-              if 2.0 <= now < 4.0 and chosen == 0:
+              eligible = not (
+                  2.0 <= now < 4.0
+              )
+
+              chosen = guard.choose(
+                  1,
+                  now,
+                  eligible,
+              )
+
+              if (
+                  2.0 <= now < 4.0
+                  and chosen == 0
+              ):
                   a_during_unavailable += 1
+
               guard.assigned(chosen)
               now += dt
+
           assert a_during_unavailable == 0
 
-          print('PASS disabled_noop')
-          print(f'PASS starvation_correction A={forced[0]:.2f} Mbps B={forced[1]:.2f} Mbps total={sum(forced):.2f} Mbps overrides={overrides}')
-          print(f'PASS healthy_preservation A={healthy_new[0]:.2f} Mbps B={healthy_new[1]:.2f} Mbps overrides={healthy_overrides}')
-          print(f'PASS bounded_starvation_correction first_preferred_assignment={first_preferred}')
-          print('PASS safety_unavailable_preferred_not_forced')
+          print("PASS disabled_noop")
+
+          print(
+              "PASS starvation_correction "
+              f"A={forced[0]:.2f} Mbps "
+              f"B={forced[1]:.2f} Mbps "
+              f"total={sum(forced):.2f} Mbps "
+              f"overrides={overrides}"
+          )
+
+          print(
+              "PASS healthy_preservation "
+              f"A={healthy_new[0]:.2f} Mbps "
+              f"B={healthy_new[1]:.2f} Mbps "
+              f"overrides={healthy_overrides}"
+          )
+
+          print(
+              "PASS bounded_starvation_correction "
+              f"first_preferred_assignment="
+              f"{first_preferred}"
+          )
+
+          print(
+              "PASS "
+              "safety_unavailable_preferred_not_forced"
+          )
           PY
 
       - name: Go vet focused packages
         shell: bash
         run: |
           set -euo pipefail
-          go vet -tags "$BUILD_TAGS" ./option ./protocol/multipath ./protocol/mieru
+
+          go vet \
+            -tags "$BUILD_TAGS" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
 
       - name: Capacity option tests x100
         shell: bash
         run: |
           set -euo pipefail
-          go test -count=100 -tags "$BUILD_TAGS" -run '^TestMultipathPreferredCapacityOption$' ./option
+
+          go test \
+            -count=100 \
+            -tags "$BUILD_TAGS" \
+            -run '^TestMultipathPreferredCapacityOption$' \
+            ./option
 
       - name: Capacity scheduler tests with race detector x100
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=100 -tags "$BUILD_TAGS" -run '^TestPreferredCapacity' ./protocol/multipath
 
-      - name: Full multipath package regression with race detector x10
+          CGO_ENABLED=1 go test \
+            -race \
+            -count=100 \
+            -timeout=10m \
+            -tags "$BUILD_TAGS" \
+            -run '^TestPreferredCapacity' \
+            ./protocol/multipath
+
+      - name: Full multipath correctness regression
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=10 -tags "$BUILD_TAGS" ./protocol/multipath
+
+          # TestPerformanceHealthyLinks is intentionally excluded here.
+          # It is a long performance fixture with beta3 historical
+          # thresholds and is tested independently in the next A/B gate.
+          CGO_ENABLED=1 go test \
+            -race \
+            -count=1 \
+            -timeout=15m \
+            -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" \
+            ./protocol/multipath
+
+      - name: Parent vs candidate performance differential
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PARENT_DIR="${RUNNER_TEMP}/multipath-parent"
+          PARENT_LOG="${RUNNER_TEMP}/performance-parent.log"
+          CURRENT_LOG="${RUNNER_TEMP}/performance-current.log"
+
+          rm -rf "$PARENT_DIR"
+
+          git worktree add \
+            --detach \
+            "$PARENT_DIR" \
+            "origin/${PARENT_BRANCH}"
+
+          cleanup() {
+            git worktree remove \
+              --force \
+              "$PARENT_DIR" \
+              >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          echo
+          echo "=== PARENT PERFORMANCE ==="
+          echo "branch=${PARENT_BRANCH}"
+          echo "commit=$(git -C "$PARENT_DIR" rev-parse HEAD)"
+          echo
+
+          set +e
+
+          (
+            cd "$PARENT_DIR"
+
+            CGO_ENABLED=1 go test \
+              -race \
+              -count=1 \
+              -timeout=5m \
+              -v \
+              -tags "$BUILD_TAGS" \
+              -run '^TestPerformanceHealthyLinks$' \
+              ./protocol/multipath
+          ) 2>&1 | tee "$PARENT_LOG"
+
+          parent_rc=${PIPESTATUS[0]}
+
+          echo
+          echo "parent_go_test_rc=${parent_rc}"
+          echo
+
+          echo
+          echo "=== CANDIDATE PERFORMANCE ==="
+          echo "branch=${GITHUB_REF_NAME}"
+          echo "commit=${GITHUB_SHA}"
+          echo
+
+          CGO_ENABLED=1 go test \
+            -race \
+            -count=1 \
+            -timeout=5m \
+            -v \
+            -tags "$BUILD_TAGS" \
+            -run '^TestPerformanceHealthyLinks$' \
+            ./protocol/multipath \
+            2>&1 | tee "$CURRENT_LOG"
+
+          current_rc=${PIPESTATUS[0]}
+
+          set -e
+
+          echo
+          echo "candidate_go_test_rc=${current_rc}"
+          echo
+
+          python3 - \
+            "$PARENT_LOG" \
+            "$CURRENT_LOG" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          parent_path = Path(sys.argv[1])
+          current_path = Path(sys.argv[2])
+
+          EXPECTED = [
+              "1_160+600Mbps_65+110ms",
+              "8_160+600Mbps_65+110ms",
+              "32_160+600Mbps_65+110ms",
+              "1_40+50Mbps_65+110ms",
+              "8_40+50Mbps_65+110ms",
+              "1_160+600Mbps_65+400ms",
+              "8_160+600Mbps_65+400ms",
+              "1_160+600Mbps_110+65ms",
+              "1_160+600Mbps_5+10ms",
+              "8_160+600Mbps_5+10ms",
+              "1_1000+1000Mbps_65+110ms",
+          ]
+
+          RUN_RE = re.compile(
+              r"^=== RUN\s+"
+              r"TestPerformanceHealthyLinks/(.+)$"
+          )
+
+          RATE_RE = re.compile(
+              r"performance_test\.go:\d+: "
+              r"flows=\d+ .*?"
+              r"Mbps=([0-9]+(?:\.[0-9]+)?)"
+          )
+
+          FORBIDDEN = (
+              "healthy reliable legs triggered replay",
+              "unused window credit caused memory pressure",
+              "memory budget exceeded",
+              "short stream:",
+              "panic:",
+              "fatal error:",
+              "test timed out",
+          )
+
+          def parse(path):
+              text = path.read_text(
+                  encoding="utf-8",
+                  errors="replace",
+              )
+
+              for token in FORBIDDEN:
+                  if token in text:
+                      raise SystemExit(
+                          f"FAIL {path.name}: "
+                          f"unsafe performance fixture result: "
+                          f"{token}"
+                      )
+
+              current_case = None
+              values = {}
+
+              for raw in text.splitlines():
+                  m = RUN_RE.search(raw)
+
+                  if m:
+                      current_case = m.group(1)
+                      continue
+
+                  m = RATE_RE.search(raw)
+
+                  if m and current_case:
+                      values[current_case] = float(
+                          m.group(1)
+                      )
+
+              missing = [
+                  case
+                  for case in EXPECTED
+                  if case not in values
+              ]
+
+              extra = [
+                  case
+                  for case in values
+                  if case not in EXPECTED
+              ]
+
+              if missing:
+                  raise SystemExit(
+                      f"FAIL {path.name}: "
+                      f"missing performance cases: "
+                      f"{missing}"
+                  )
+
+              if extra:
+                  raise SystemExit(
+                      f"FAIL {path.name}: "
+                      f"unexpected performance cases: "
+                      f"{extra}"
+                  )
+
+              return values
+
+          parent = parse(parent_path)
+          current = parse(current_path)
+
+          print()
+          print(
+              "=== PARENT VS CANDIDATE "
+              "PERFORMANCE DIFFERENTIAL ==="
+          )
+
+          failed = False
+
+          for case in EXPECTED:
+              base = parent[case]
+              candidate = current[case]
+
+              ratio = (
+                  candidate / base
+                  if base > 0
+                  else 1.0
+              )
+
+              status = (
+                  "PASS"
+                  if ratio >= 0.98
+                  else "FAIL"
+              )
+
+              print(
+                  f"{status} "
+                  f"{case}: "
+                  f"parent={base:.1f} Mbps "
+                  f"candidate={candidate:.1f} Mbps "
+                  f"ratio={ratio:.4f}"
+              )
+
+              if ratio < 0.98:
+                  failed = True
+
+          if failed:
+              raise SystemExit(
+                  "FAIL candidate performance is "
+                  "below 98% of its direct parent "
+                  "on at least one fixture"
+              )
+
+          print()
+          print(
+              "PASS candidate retains at least "
+              "98% of direct-parent performance "
+              "for all 11 fixtures"
+          )
+          PY
 
       - name: Compile all repository packages without running tests
         shell: bash
         run: |
           set -euo pipefail
-          go test -run '^$' -tags "$BUILD_TAGS" ./...
+
+          go test \
+            -run '^$' \
+            -tags "$BUILD_TAGS" \
+            ./...
 
   build_targets:
     name: Build ${{ matrix.label }}
     needs: audit_test
+
     strategy:
       fail-fast: false
+
       matrix:
         include:
           - label: macOS Intel amd64
@@ -403,21 +950,26 @@ jobs:
             goos: darwin
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
+
           - label: Windows amd64
             runner: windows-2025
             goos: windows
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
+
           - label: Linux amd64
             runner: ubuntu-24.04
             goos: linux
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-linux-amd64
+
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+
     defaults:
       run:
         shell: bash
+
     steps:
       - name: Checkout exact source
         uses: actions/checkout@v7
@@ -436,9 +988,11 @@ jobs:
       - name: Verify native runner and toolchain
         run: |
           set -euo pipefail
+
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           test "$(go env GOHOSTARCH)" = "amd64"
           test "$(go env GOHOSTOS)" = "${{ matrix.goos }}"
+
           echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
           echo "go=$(go version)"
           echo "commit=$(git rev-parse HEAD)"
@@ -446,16 +1000,31 @@ jobs:
       - name: Set build inputs
         run: |
           set -euo pipefail
+
           BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+
           test -n "$BUILD_TAGS"
+
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
       - name: Native target regression tests
         run: |
           set -euo pipefail
-          go test -count=3 -tags "$BUILD_TAGS" ./option ./protocol/multipath ./protocol/mieru
+
+          # The heavy HealthyLinks performance fixture is already
+          # validated once in the controlled Linux parent/candidate
+          # differential gate. Do not repeat its historical beta3
+          # threshold on every target OS.
+          go test \
+            -count=1 \
+            -timeout=15m \
+            -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
 
       - name: Build standalone core
         env:
@@ -464,8 +1033,12 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
+
           mkdir -p dist
-          go build -v -trimpath \
+
+          go build \
+            -v \
+            -trimpath \
             -tags "$BUILD_TAGS" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
             -o "dist/${{ matrix.binary }}" \
@@ -474,27 +1047,43 @@ jobs:
       - name: Smoke-test built binary and embedded version
         run: |
           set -euo pipefail
+
           BIN="dist/${{ matrix.binary }}"
+
           if [[ "${{ matrix.goos }}" != "windows" ]]; then
             chmod +x "$BIN"
           fi
+
           test -s "$BIN"
+
           ACTUAL_VERSION="$("./$BIN" version -n | tr -d '\r\n')"
+
           test "$ACTUAL_VERSION" = "$VERSION"
+
           VERSION_OUTPUT="$("./$BIN" version)"
+
           printf '%s\n' "$VERSION_OUTPUT"
-          grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$VERSION_OUTPUT"
-          grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
+
+          grep -F \
+            "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" \
+            <<< "$VERSION_OUTPUT"
+
+          grep -F \
+            'CGO: disabled' \
+            <<< "$VERSION_OUTPUT"
 
       - name: Produce checksum and build provenance
         run: |
           set -euo pipefail
+
           BIN="dist/${{ matrix.binary }}"
+
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             shasum -a 256 "$BIN" > "${BIN}.sha256"
           else
             sha256sum "$BIN" > "${BIN}.sha256"
           fi
+
           {
             echo "version=${VERSION}"
             echo "commit=${GITHUB_SHA}"
@@ -504,6 +1093,7 @@ jobs:
             echo "build_tags=${BUILD_TAGS}"
             echo "binary=${{ matrix.binary }}"
           } > "${BIN}.buildinfo.txt"
+
           cat "${BIN}.sha256"
           cat "${BIN}.buildinfo.txt"
 
