@@ -763,7 +763,8 @@ jobs:
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
-      - name: Native target regression tests
+      - name: Native target regression tests (Linux/macOS frozen)
+        if: matrix.goos != 'windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -772,6 +773,21 @@ jobs:
             -timeout=15m \
             -skip '^TestPerformanceHealthyLinks$' \
             -tags "$BUILD_TAGS" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
+
+      - name: Native target regression tests (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test \
+            -count=1 \
+            -timeout=15m \
+            -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" \
+            -ldflags "$LDFLAGS_SHARED" \
             ./option \
             ./protocol/multipath \
             ./protocol/mieru
