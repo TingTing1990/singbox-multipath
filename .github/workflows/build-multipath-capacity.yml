@@ -219,8 +219,9 @@ jobs:
 
           activation = (root / 'protocol/multipath/activation.go').read_text()
           for needle in (
-              'preferredWindowBase := c.legCounters[0].txBytes.Load()',
-              'preferredTX := c.legCounters[0].txBytes.Load()',
+              'preferredWindowBase := c.preferredDeliveredBytes()',
+              'preferredDelivered := c.preferredDeliveredBytes()',
+              'return preferred.path.Received',
               'preferredCapacityWindowReady(',
               'preferredCapacityReady := c.cfg.PreferredCapacityBytesPS == 0',
           ):
@@ -228,7 +229,9 @@ jobs:
                   fail(f'preferred-capacity activation gate missing: {needle}')
           if activation.count('&& preferredCapacityReady') < 3:
               fail('bytes/rate/queue activation paths are not all capacity-gated')
-          ok('positive capacity gates normal leg1 DATA activation on completed preferred TX; zero keeps original trigger behavior')
+          if 'legCounters[0].txBytes.Load()' in activation:
+              fail('activation capacity gate must not use local child Write counters')
+          ok('positive capacity gates normal leg1 DATA activation on peer-confirmed preferred delivery; zero keeps original trigger behavior')
 
           for rel in (
               'protocol/multipath/wire.go',
@@ -345,6 +348,7 @@ jobs:
           required_tests = (
               'TestPreferredCapacityWindowGate',
               'TestPreferredCapacityActivationGateIntegration',
+              'TestPreferredCapacityActivationIgnoresLocalWriteCompletion',
               'TestPreferredCapacityDisabledPreservesAdaptiveDecision',
               'TestPreferredCapacityBelowTargetIsStrictPreferredOnly',
               'TestPreferredCapacityAboveTargetUsesOnlyExcessOnBooster',
