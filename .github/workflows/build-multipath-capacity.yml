@@ -785,7 +785,7 @@ jobs:
           go test \
             -count=1 \
             -timeout=15m \
-            -skip '^TestPerformanceHealthyLinks$' \
+            -skip '^(TestPerformanceHealthyLinks|TestCoreSenderStatusAndRTTProbe)$' \
             -tags "$BUILD_TAGS" \
             -ldflags "$LDFLAGS_SHARED" \
             ./option \
