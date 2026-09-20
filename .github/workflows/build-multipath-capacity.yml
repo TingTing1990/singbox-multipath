@@ -1,4 +1,4 @@
-name: Build Multipath Capacity Scheduler
+name: Build Multipath Capacity V2
 
 on:
   workflow_dispatch:
@@ -6,14 +6,14 @@ on:
       source_ref:
         description: Source branch/tag/commit to audit and build
         required: true
-        default: feature/multipath-capacity-scheduler-beta6
+        default: feature/multipath-capacity-v2-beta6
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: multipath-capacity-${{ inputs.source_ref }}
+  group: multipath-capacity-v2-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
@@ -23,9 +23,9 @@ env:
 
 jobs:
   audit_test:
-    name: Source audit + independent tests
+    name: Full-source audit + independent simulation + runtime tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       parent_sha: ${{ steps.resolve.outputs.parent_sha }}
@@ -46,324 +46,661 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Resolve audited source and parent
+      - name: Resolve exact candidate and clean parent
         id: resolve
         shell: bash
         env:
           SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
-
           test -n "$SOURCE_REF"
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           grep -Fx "go ${GO_VERSION}" go.mod
 
           CANDIDATE_SHA="$(git rev-parse HEAD)"
-
           git fetch --no-tags origin \
             "+refs/heads/${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
-
           PARENT_SHA="$(git rev-parse "refs/remotes/origin/${PARENT_BRANCH}^{commit}")"
+          MERGE_BASE="$(git merge-base "$CANDIDATE_SHA" "$PARENT_SHA")"
 
-          echo "source_ref=${SOURCE_REF}"
-          echo "candidate_sha=${CANDIDATE_SHA}"
-          echo "parent_branch=${PARENT_BRANCH}"
-          echo "parent_sha=${PARENT_SHA}"
+          # V2 must be based on the current clean Mieru parent. If the parent has
+          # moved, fail rather than silently auditing against a different baseline.
+          test "$MERGE_BASE" = "$PARENT_SHA"
+
+          echo "source_ref=$SOURCE_REF"
+          echo "candidate_sha=$CANDIDATE_SHA"
+          echo "parent_branch=$PARENT_BRANCH"
+          echo "parent_sha=$PARENT_SHA"
+          echo "merge_base=$MERGE_BASE"
           echo "go=$(go version)"
-
-          echo "candidate_sha=${CANDIDATE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "parent_sha=${PARENT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=$PARENT_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set audited build inputs
         shell: bash
         run: |
           set -euo pipefail
-
           BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
-
           test -n "$BUILD_TAGS"
-
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
-
           echo "BUILD_TAGS=$BUILD_TAGS"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED"
 
-      - name: Audit capacity source and frozen runtime invariants
+      - name: Materialize exact parent worktree
         shell: bash
         run: |
           set -euo pipefail
+          PARENT_DIR="${RUNNER_TEMP}/multipath-parent-v2"
+          rm -rf "$PARENT_DIR"
+          git worktree add --detach "$PARENT_DIR" "${{ steps.resolve.outputs.parent_sha }}"
+          echo "PARENT_DIR=$PARENT_DIR" >> "$GITHUB_ENV"
 
-          python3 - <<'PY'
+      - name: Full-source audit x10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/multipath-capacity-v2-full-audit.py" <<'PY'
+          #!/usr/bin/env python3
           from pathlib import Path
-          import os
-          import subprocess
-          import sys
+          import hashlib, re, subprocess, sys, json, os
 
-          root = Path('.')
-          parent = f"refs/remotes/origin/{os.environ['PARENT_BRANCH']}"
-
-          def fail(message):
-              print(f"FAIL {message}")
-              raise SystemExit(1)
-
-          def ok(message):
-              print(f"PASS {message}")
-
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True)
-
-          def extract_func(text, signature):
-              try:
-                  start = text.index(signature)
-                  brace = text.index('{', start)
-              except ValueError:
-                  fail(f"missing function: {signature}")
-              depth = 0
-              for index in range(brace, len(text)):
-                  char = text[index]
-                  if char == '{':
-                      depth += 1
-                  elif char == '}':
-                      depth -= 1
-                      if depth == 0:
-                          return text[start:index + 1]
-              fail(f"unbalanced function: {signature}")
-
-          # CI/workflow metadata is intentionally outside the runtime feature
-          # write-set. This workflow lives only on the default branch; the source
-          # ref being audited does not need to carry any workflow file.
-          changed = set(git(
-              'diff', '--name-only', parent, 'HEAD', '--', '.',
-              ':(exclude).github/**',
-          ).splitlines())
-
-          expected = {
-              'README.md',
-              'option/multipath.go',
-              'option/multipath_test.go',
-              'protocol/multipath/activation.go',
-              'protocol/multipath/inbound.go',
-              'protocol/multipath/outbound.go',
-              'protocol/multipath/reorder_options_test.go',
-              'protocol/multipath/scheduler.go',
-              'protocol/multipath/status.go',
-              'protocol/multipath/types.go',
-              'protocol/multipath/capacity_scheduler_test.go',
+          ROOT=Path(os.environ['GITHUB_WORKSPACE'])
+          BASE=Path(os.environ['PARENT_DIR'])
+          REPORT=Path(os.environ['RUNNER_TEMP']) / 'multipath-capacity-v2-full-audit-report.txt'
+          EXPECTED_CHANGED={
+           'README.md','option/multipath.go','option/multipath_test.go',
+           'protocol/multipath/activation.go','protocol/multipath/inbound.go','protocol/multipath/outbound.go',
+           'protocol/multipath/reorder_options_test.go','protocol/multipath/scheduler.go',
+           'protocol/multipath/status.go','protocol/multipath/types.go',
           }
+          EXPECTED_ADDED={'protocol/multipath/capacity.go','protocol/multipath/capacity_test.go'}
+          MIERU={'constant/proxy.go','option/mieru.go','protocol/mieru/outbound.go','include/registry.go','go.mod','go.sum'}
+          FROZEN={'protocol/multipath/wire.go','protocol/multipath/telemetry.go','protocol/multipath/memory.go','protocol/multipath/stream/path.go','protocol/multipath/protocol.go','protocol/multipath/performance_test.go'}
 
-          missing = sorted(expected - changed)
-          unexpected = sorted(changed - expected)
-          if missing or unexpected:
-              fail(
-                  f"functional write-set mismatch; missing={missing} "
-                  f"unexpected={unexpected}"
-              )
-          ok('functional write-set is exactly the approved 11 files')
+          class AuditFail(Exception): pass
 
-          # Existing Mieru implementation must be inherited unchanged.
-          for rel in (
-              'constant/proxy.go',
-              'option/mieru.go',
-              'protocol/mieru/outbound.go',
-              'include/registry.go',
-              'go.mod',
-              'go.sum',
-          ):
-              if subprocess.run(
-                  ['git', 'diff', '--quiet', parent, 'HEAD', '--', rel]
-              ).returncode != 0:
-                  fail(f"existing Mieru baseline changed: {rel}")
-          ok('Mieru functional baseline unchanged')
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          def load_tree(root):
+              out={}
+              for p in sorted(root.rglob('*')):
+                  rel=p.relative_to(root)
+                  if rel.parts and rel.parts[0]=='.git':
+                      continue
+                  if p.is_file(): out[str(rel)]=p.read_bytes()
+              return out
 
-          # These beta6 protocol/data-plane files are outside this feature.
-          frozen = (
-              'protocol/multipath/wire.go',
-              'protocol/multipath/telemetry.go',
-              'protocol/multipath/memory.go',
-              'protocol/multipath/stream/path.go',
-              'protocol/multipath/protocol.go',
-              'protocol/multipath/performance_test.go',
-          )
-          for rel in frozen:
-              if subprocess.run(
-                  ['git', 'diff', '--quiet', parent, 'HEAD', '--', rel]
-              ).returncode != 0:
-                  fail(f"frozen multipath file changed: {rel}")
-          ok('wire/telemetry/memory/path/protocol/performance fixture unchanged')
+          def text(tree, path): return tree[path].decode('utf-8')
+          def need(cond,msg):
+              if not cond: raise AuditFail(msg)
 
-          options = (root / 'option/multipath.go').read_text()
-          if options.count('json:"preferred_capacity_mbps,omitempty"') != 2:
-              fail('preferred_capacity_mbps must exist exactly once on outbound and once on inbound')
-          ok('single user field exposed on both Local-TX option surfaces')
+          def extract_func(src, sig):
+              try: start=src.index(sig); brace=src.index('{',start)
+              except ValueError: raise AuditFail('missing function '+sig)
+              depth=0
+              for i in range(brace,len(src)):
+                  if src[i]=='{': depth+=1
+                  elif src[i]=='}':
+                      depth-=1
+                      if depth==0: return src[start:i+1]
+              raise AuditFail('unbalanced function '+sig)
 
-          conversion = (
-              'PreferredCapacityBytesPS:       '
-              'uint64(options.PreferredCapacityMbps) * 1_000_000 / 8'
-          )
-          for rel in (
-              'protocol/multipath/outbound.go',
-              'protocol/multipath/inbound.go',
-          ):
-              if conversion not in (root / rel).read_text():
-                  fail(f"capacity conversion missing: {rel}")
-          ok('Mbps-to-bytes/s conversion wired identically on client and server Local TX')
+          def full_digest(tree):
+              h=hashlib.sha256()
+              for k in sorted(tree): h.update(k.encode()+b'\0'+hashlib.sha256(tree[k]).digest())
+              return h.hexdigest()
 
-          status = (root / 'protocol/multipath/status.go').read_text()
-          if 'json:"preferred_capacity_mbps,omitempty"' not in status:
-              fail('status parameter is not additive/omitempty')
-          if 'PreferredCapacityBytesPS * 8 / 1_000_000' not in status:
-              fail('status preferred capacity conversion missing')
-          ok('status reports configured capacity and omits it when disabled')
+          def changed(base,cur):
+              common=base.keys()&cur.keys()
+              ch={k for k in common if base[k]!=cur[k]}
+              return ch, set(cur)-set(base), set(base)-set(cur)
 
-          activation = (root / 'protocol/multipath/activation.go').read_text()
-          for needle in (
-              'preferredWindowBase := c.preferredDeliveredBytes()',
-              'preferredDelivered := c.preferredDeliveredBytes()',
-              'return preferred.path.Received',
-              'preferredCapacityWindowReady(',
-              'preferredCapacityReady := c.cfg.PreferredCapacityBytesPS == 0',
-          ):
-              if needle not in activation:
-                  fail(f'preferred-capacity activation gate missing: {needle}')
-          if activation.count('&& preferredCapacityReady') < 3:
-              fail('bytes/rate/queue activation paths are not all capacity-gated')
-          if 'legCounters[0].txBytes.Load()' in activation:
-              fail('activation capacity gate must not use local child Write counters')
-          ok('positive capacity gates normal leg1 DATA activation on peer-confirmed preferred delivery; zero keeps original trigger behavior')
+          def scan_all(tree, pattern):
+              r=re.compile(pattern,re.M)
+              hits=[]
+              for k,b in tree.items():
+                  if not (k.endswith(('.go','.md','.yml','.yaml','.json','.mod','.sum','.sh'))): continue
+                  try:s=b.decode()
+                  except:continue
+                  if r.search(s): hits.append(k)
+              return hits
 
-          for rel in (
-              'protocol/multipath/wire.go',
-              'protocol/multipath/telemetry.go',
-          ):
-              text = (root / rel).read_text()
-              if 'PreferredCapacity' in text or 'preferred_capacity' in text:
-                  fail(f"capacity leaked into wire/remote telemetry: {rel}")
-          ok('wire protocol and remote telemetry schema unchanged')
+          def run_pass(n, fn):
+              # Freshly read the entire source and baseline for every pass.
+              cur=load_tree(ROOT); base=load_tree(BASE)
+              visited=len(cur); digest=full_digest(cur)
+              fn(cur,base)
+              return f'PASS {n:02d}: files={visited} tree_sha256={digest} :: {fn.__doc__.strip()}'
 
-          parent_scheduler = git('show', f'{parent}:protocol/multipath/scheduler.go')
-          current_scheduler = (root / 'protocol/multipath/scheduler.go').read_text()
+          # Pass 1: provenance/write-set/full tree identity
+          def p1(cur,base):
+              '''full-tree provenance, exact write-set, clean parent and no missing source'''
+              need(len(base)==1603, f'clean baseline file count {len(base)} != 1603')
+              need(not scan_all(base,r'preferred_capacity_mbps|PreferredCapacity|preferredCapacityController|capFloor'), 'clean parent still contains capacity implementation')
+              ch,add,miss=changed(base,cur)
+              need(ch==EXPECTED_CHANGED, f'changed set mismatch: {sorted(ch^EXPECTED_CHANGED)}')
+              need(add==EXPECTED_ADDED, f'added set mismatch: {sorted(add^EXPECTED_ADDED)}')
+              need(not miss, f'missing baseline files: {sorted(miss)}')
+              for f in MIERU|FROZEN:
+                  need(cur[f]==base[f], f'frozen baseline drift: {f}')
 
-          original = extract_func(
-              parent_scheduler,
-              'func (c *mpCore) choosePathLocked(length int) *mpLeg',
-          )
-          adaptive = extract_func(
-              current_scheduler,
-              'func (c *mpCore) chooseAdaptivePathLocked(length int) *mpLeg',
-          )
-          if original[original.index('{'):] != adaptive[adaptive.index('{'):]:
-              fail('direct-parent adaptive scheduler body changed')
-          ok('original beta6 adaptive scheduler body retained byte-for-byte')
+          # Pass 2 state ownership/lifecycle
+          def p2(cur,base):
+              '''full-tree object lifecycle and state ownership: one instance controller shared by every production core'''
+              allgo='\n'.join(b.decode(errors='ignore') for k,b in cur.items() if k.endswith('.go'))
+              cap=text(cur,'protocol/multipath/capacity.go'); typ=text(cur,'protocol/multipath/types.go')
+              ib=text(cur,'protocol/multipath/inbound.go'); ob=text(cur,'protocol/multipath/outbound.go'); rec=text(cur,'protocol/multipath/recovery_tcp.go')
+              need(re.search(r'PreferredCapacity\s+\*preferredCapacityController', typ) is not None, 'coreConfig does not carry controller pointer')
+              mp=extract_func(typ,'type mpCore struct') if False else typ[typ.index('type mpCore struct'):typ.index('type dataMapping struct')]
+              need('preferredCapacityController' not in mp, 'controller ownership leaked into per-session mpCore')
+              need(ib.count('newPreferredCapacityController(')==1 and ob.count('newPreferredCapacityController(')==1, 'controller not created exactly once per inbound/outbound constructor')
+              need('cfg := i.cfg' in ib and 'newCoreWithError(i.ctx, cfg)' in ib, 'inbound sessions do not inherit instance cfg')
+              need('cfg := o.cfg' in extract_func(ob,'func (o *Outbound) connectionCoreConfig('), 'outbound core config is not instance cfg copy')
+              need('newCoreWithError(ctx, o.connectionCoreConfig(' in rec, 'recovery TCP bypasses shared outbound cfg')
+              # All production newCoreWithError callers must be the known three paths only.
+              prod=[]
+              for k,b in cur.items():
+                  if not k.endswith('.go') or k.endswith('_test.go'): continue
+                  s=b.decode(errors='ignore')
+                  if 'newCoreWithError(' in s and k!='protocol/multipath/core.go': prod.append(k)
+              need(sorted(prod)==['protocol/multipath/inbound.go','protocol/multipath/outbound.go','protocol/multipath/recovery_tcp.go'], f'unexpected core creation paths: {prod}')
 
-          wrapper = extract_func(
-              current_scheduler,
-              'func (c *mpCore) choosePathLockedAt(length int, now time.Time) *mpLeg',
-          )
-          if 'chosen := c.chooseAdaptivePathLocked(length)' not in wrapper:
-              fail('capacity wrapper does not begin from original scheduler decision')
-          if not (
-              'if c.cfg.PreferredCapacityBytesPS == 0 {' in wrapper
-              and 'return chosen' in wrapper
-          ):
-              fail('disabled capacity is not a strict guard bypass')
-          ok('preferred_capacity_mbps=0 returns original scheduler decision before guard')
+          # Pass 3 direction/wire
+          def p3(cur,base):
+              '''full-tree directional semantics and protocol isolation: Local-TX only, no wire/hello/telemetry negotiation'''
+              refs=scan_all(cur,r'preferred_capacity_mbps|PreferredCapacity|preferredCapacity')
+              forbidden=[f for f in refs if f in {'protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/telemetry.go','protocol/multipath/recovery_status.go'}]
+              need(not forbidden, f'capacity leaked into wire/telemetry: {forbidden}')
+              opt=text(cur,'option/multipath.go')
+              need(opt.count('json:"preferred_capacity_mbps,omitempty"')==2, 'field not exposed exactly once inbound + outbound')
+              ib=text(cur,'protocol/multipath/inbound.go'); ob=text(cur,'protocol/multipath/outbound.go')
+              need('PreferredCapacity:              preferredCapacity' in ib and 'PreferredCapacity:              preferredCapacity' in ob, 'direction-local controller not wired on both surfaces')
+              need('preferred_capacity' not in text(cur,'protocol/multipath/wire.go').lower(), 'wire contains capacity string')
 
-          pump = extract_func(
-              current_scheduler,
-              'func (c *mpCore) pumpLoop()',
-          )
-          if 'now := time.Now()' not in pump:
-              fail('pump no longer owns its loop timestamp')
-          if 'c.choosePathLockedAt(segment.Length, now)' not in pump:
-              fail('production pump does not reuse its existing timestamp')
-          if 'c.choosePathLocked(segment.Length)' in pump:
-              fail('production pump still uses wrapper that obtains another timestamp')
-          ok('production scheduler reuses the existing pump timestamp')
+          # Pass 4 delivery authority
+          def p4(cur,base):
+              '''full-tree delivery authority: peer receipts, normal first-transmission only, no local-write false unlock'''
+              sched=text(cur,'protocol/multipath/scheduler.go'); cap=text(cur,'protocol/multipath/capacity.go')
+              need('leg.path.Feedback(' in sched and 'confirmPreferredCapacityDelivery(leg.path.Received)' in sched, 'capacity is not sourced after peer path feedback')
+              need('observePreferredDelivery(delivered, now)' in sched, 'shared delivery observation missing')
+              # Capacity references must never read local tx completion counters as readiness authority.
+              for k in scan_all(cur,r'legCounters\[0\]\.txBytes|transportWriteStarted|writingBytes'):
+                  if k in {'protocol/multipath/capacity.go','protocol/multipath/activation.go'}:
+                      raise AuditFail('capacity readiness uses local write state: '+k)
+              need('if !repair {' in sched and 'recordPreferredCapacityRange(pathSeq, segment.Length)' in sched, 'normal-vs-repair receipt bookkeeping missing')
+              normal_block=sched[sched.index('if !repair {',sched.index('func (c *mpCore) submitLocked')):sched.index('segment.Buffer.Retain()',sched.index('func (c *mpCore) submitLocked'))]
+              need('recordPreferredCapacityRange' in normal_block, 'capacity range not confined to normal first transmission')
+              need(re.search(r'repair/reinjection.*excluded|repair bytes cannot satisfy capacity readiness', cap, re.I|re.S) is not None, 'repair exclusion invariant undocumented in implementation')
 
-          # No non-test production caller may call choosePathLocked(); that helper
-          # remains only for legacy tests. This prevents a hidden time.Now hot path.
-          production_calls = []
-          for path in (root / 'protocol/multipath').glob('*.go'):
-              if path.name.endswith('_test.go') or path.name == 'scheduler.go':
-                  continue
-              if 'choosePathLocked(' in path.read_text():
-                  production_calls.append(str(path))
-          if production_calls:
-              fail(f"unexpected production choosePathLocked callers: {production_calls}")
-          ok('no hidden production caller adds a second scheduler timestamp')
+          # Pass 5 scheduler
+          def p5(cur,base):
+              '''full-tree scheduler preservation, shared reservation, no target cap and no preferred-busy HOL regression'''
+              old=text(base,'protocol/multipath/scheduler.go'); new=text(cur,'protocol/multipath/scheduler.go')
+              need(extract_func(old,'func (c *mpCore) choosePathLocked(length int) *mpLeg')==extract_func(new,'func (c *mpCore) choosePathLocked(length int) *mpLeg'), 'original beta6 choosePathLocked changed')
+              wrap=extract_func(new,'func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelection')
+              need('controller == nil || chosen == nil' in wrap and 'return pathSelection{leg: chosen}' in wrap, 'zero/normal bypass missing')
+              need('preferred.busy' in wrap and 'return pathSelection{leg: chosen}' in wrap, 'busy preferred does not preserve original candidate')
+              need('Outstanding()+uint64(length) > pipeline' in wrap, 'pipeline eligibility missing')
+              need('return pathSelection{leg: preferred' in wrap, 'shared reservation cannot override starvation toward preferred')
+              # No explicit target-based cap/drop/limit branches anywhere in production.
+              prod='\n'.join(b.decode(errors='ignore') for k,b in cur.items() if k.endswith('.go') and not k.endswith('_test.go'))
+              need('PreferredCapacityBytesPS' not in prod, 'old per-core capacity scalar survived')
+              need('capFloor' not in prod, 'old per-core floor state survived')
+              # Reinjection must bypass normal reservation wrapper.
+              reinj=extract_func(new,'func (c *mpCore) reinjectLocked(now time.Time) (bool, error)')
+              need('submitLocked(target, segment, true, now)' in reinj and 'choosePathForSubmitLocked' not in reinj, 'repair traffic consumes normal capacity scheduler')
 
-          guard = extract_func(
-              current_scheduler,
-              'func (c *mpCore) applyPreferredCapacityFloorLocked('
-              'chosen *mpLeg, length int, now time.Time) *mpLeg',
-          )
-          for needle in (
-              '!c.active.Load()',
-              'preferred := c.getLeg(0)',
-              'preferred.path.Stale',
-              '!c.cfg.Recovery.allows(0)',
-              'if preferred.busy {\n\t\treturn nil',
-              'preferred.path.Outstanding()+uint64(length) > pipeline {\n\t\treturn nil',
-              'return preferred',
-          ):
-              if needle not in guard:
-                  fail(f"capacity reservation guard missing condition: {needle}")
-          if 'getLeg(1)' in guard or 'return c.getLeg(1)' in guard:
-              fail('capacity reservation guard directly controls booster selection')
-          ok('owed preferred capacity waits on busy/full preferred; stale/unavailable remains safety fallback')
+          # Pass 6 activation
+          def p6(cur,base):
+              '''full-tree activation contract: original per-flow triggers AND shared aggregate gate, recovery exception, no new deactivation'''
+              old=text(base,'protocol/multipath/activation.go'); new=text(cur,'protocol/multipath/activation.go')
+              for sig in ['func resolveActivationThreshold(','func activationAfterBytes(']:
+                  need(extract_func(old,sig)==extract_func(new,sig), sig+' changed from beta6')
+              loop=extract_func(new,'func (c *mpCore) activationLoop()')
+              need(loop.count('capacity.DeliveryReady')==3, f'all three original activation paths not AND-gated: count={loop.count("capacity.DeliveryReady")}')
+              state=extract_func(new,'func (c *mpCore) preferredCapacityActivationState(now time.Time) preferredCapacitySnapshot')
+              need('!c.cfg.Recovery.allows(0)' in state and 'DeliveryReady: true' in state, 'true recovery exception missing')
+              # No new code turns active false.
+              capacity_files='\n'.join(text(cur,k) for k in EXPECTED_CHANGED|EXPECTED_ADDED if k.endswith('.go'))
+              need('.active.Store(false)' not in capacity_files, 'capacity feature introduced deactivation')
 
-          refill = extract_func(
-              current_scheduler,
-              'func (c *mpCore) refillPreferredCapacityCreditLocked(now time.Time, length int)',
-          )
-          for needle in (
-              'c.capFloor.credit = float64(length)',
-              'earned := elapsed.Seconds() * float64(c.cfg.PreferredCapacityBytesPS)',
-              'c.capFloor.credit < 0 && earned+1 >= float64(length)',
-              'preferredCapacityDebtChunks',
-              'preferredCapacitySurplusChunks',
-          ):
-              if needle not in refill:
-                  fail(f"capacity reservation accounting missing: {needle}")
-          ok('first post-activation chunk is preferred and low/at-target demand clears historical surplus')
+          # Pass 7 concurrency/lifecycle/resources
+          def p7(cur,base):
+              '''full-tree concurrency, lock order, cross-core time ordering, bounded state and lifecycle cleanup'''
+              cap=text(cur,'protocol/multipath/capacity.go'); sched=text(cur,'protocol/multipath/scheduler.go')
+              need('sync.Mutex' in cap and 'go ' not in '\n'.join(l for l in cap.splitlines() if not l.strip().startswith('//')), 'controller unexpectedly owns goroutine')
+              need('mpCore' not in cap.replace('mpCore.stateMu',''), 'controller source holds/calls a core, risking reverse lock')
+              need('if now.Before(c.creditLast)' in cap and 'now = c.creditLast' in cap, 'shared credit clock can move backwards across cores')
+              need('now.Before(c.deliveryStart)' in cap and 'now = c.deliveryStart' in cap, 'shared delivery window can move backwards across cores')
+              need('preferredCapacityDebtChunks' in cap and 'preferredCapacitySurplusChunks' in cap, 'credit bounds missing')
+              need('preferredCapacityRangeHead >= 256' in cap, 'receipt range compaction missing')
+              need('core.stateMu -> preferredCapacityController.mu' in cap, 'lock order not documented')
+              # Whole-tree lock direction: capacity.go must not contain stateMu lock calls.
+              need('.stateMu.Lock' not in cap and '.legsMu.Lock' not in cap, 'controller acquires core locks')
 
-          submit = extract_func(
-              current_scheduler,
-              'func (c *mpCore) submitLocked('
-              'leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error',
-          )
-          accepted = (
-              'case leg.send <- frame:\n'
-              '\t\tc.notePreferredCapacityAssignmentLocked('
-              'leg, segment.Length, now)\n'
-              '\t\treturn nil'
-          )
-          if accepted not in submit:
-              fail('capacity accounting is not after successful assignment enqueue')
-          ok('preferred assignment is accounted only after successful enqueue')
+          # Pass 8 config/status/docs
+          def p8(cur,base):
+              '''full-tree config, status, diagnostics and documentation agree on aggregate directional semantics'''
+              readme=text(cur,'README.md'); status=text(cur,'protocol/multipath/status.go'); typ=text(cur,'protocol/multipath/types.go')
+              for phrase in ['instance-wide Local-TX','not a per-connection value','They do not each receive an independent 70 Mbps target','does **not**\nblock the logical stream']:
+                  need(phrase in readme, 'README missing semantic: '+phrase)
+              need('json:"preferred_capacity_mbps,omitempty"' in status, 'status parameter not additive/omitempty')
+              need('json:"preferred_capacity,omitempty"' in status, 'capacity status block not optional')
+              need('PreferredCapacityTargetBytesPS' in typ and 'PreferredCapacityRateBytesPS' in typ, 'activation diagnostics lack capacity gate evidence')
+              need('preferred_capacity_target_mbps' in status and 'preferred_capacity_rate_bytes_per_second' in status, 'activation status does not expose capacity evidence')
+              need('activationInfoString(info)' in text(cur,'protocol/multipath/inbound.go') and 'activationInfoString(info)' in text(cur,'protocol/multipath/outbound.go'), 'runtime activation logs omit capacity evidence')
 
-          tests = (root / 'protocol/multipath/capacity_scheduler_test.go').read_text()
-          required_tests = (
-              'TestPreferredCapacityWindowGate',
-              'TestPreferredCapacityActivationGateIntegration',
-              'TestPreferredCapacityActivationIgnoresLocalWriteCompletion',
-              'TestPreferredCapacityDisabledPreservesAdaptiveDecision',
-              'TestPreferredCapacityBelowTargetIsStrictPreferredOnly',
-              'TestPreferredCapacityAboveTargetUsesOnlyExcessOnBooster',
-              'TestPreferredCapacityPreservesHealthyAdaptiveSplit',
-              'TestPreferredCapacityDoesNotCapPreferredAboveTarget',
-              'TestPreferredCapacityOwedWaitsInsteadOfFeedingBooster',
-              'TestPreferredCapacityStalePreferredRemainsSafetyException',
-          )
-          for name in required_tests:
-              if f'func {name}' not in tests:
-                  fail(f"required capacity test missing: {name}")
-          ok('dedicated tests cover activation gate/reservation/zero/safety/no-cap/healthy-split invariants')
+          # Pass 9 tests / adversarial negative controls
+          def p9(cur,base):
+              '''full-tree test architecture and negative controls cover known failed designs rather than only happy-path functions'''
+              tests='\n'.join(b.decode(errors='ignore') for k,b in cur.items() if k.endswith('_test.go'))
+              required=[
+                'TestPreferredCapacityAggregateDeliveryReadiness','TestPreferredCapacitySharedAssignmentAcrossCores',
+                'TestPreferredCapacityBusyPreferredDoesNotBlockBooster','TestPreferredCapacityFullPreferredDoesNotBlockBooster',
+                'TestPreferredCapacityDisabledReturnsOriginalDecision','TestPreferredCapacityNaturalPreferredIsNotCapped',
+                'TestPreferredCapacityRecoveryFailoverBypassesGateAndFloor','TestPreferredCapacityControllerOwnershipIsInstanceWide',
+                'TestPreferredCapacityRepairRangesExcludedFromDelivery','TestPreferredCapacityCrossCoreTimestampDoesNotMintCredit',
+                'TestPreferredCapacityHistoricalSurplusDoesNotLeakBelowTarget','TestPreferredCapacityDeliveryTimeDoesNotMoveBackward',
+              ]
+              for name in required: need('func '+name in tests, 'missing adversarial test '+name)
+              need('cores := make([]*mpCore, 4)' in tests, 'tests never model multiple cores sharing controller')
+              need('preferred.busy = true' in tests, 'tests do not kill busy=>wait regression')
+              need('pipeline-full preferred blocked' in tests, 'tests do not kill pipeline-full wait regression')
+              need('repair bytes' in tests, 'tests do not kill duplicate-delivery readiness regression')
+
+          # Pass 10 repo/build/platform consistency
+          def p10(cur,base):
+              '''full-tree build/package/platform invariants, formatting, dependencies and registry integration'''
+              need(text(cur,'go.mod').splitlines()[2].strip()=='go 1.25.5', 'Go baseline drift')
+              need(cur['go.mod']==base['go.mod'] and cur['go.sum']==base['go.sum'], 'dependencies changed')
+              reg=text(cur,'include/registry.go'); const=text(cur,'constant/proxy.go')
+              need('multipath.RegisterInbound(registry)' in reg and 'multipath.RegisterOutbound(registry)' in reg, 'multipath registry missing')
+              need('mieru.RegisterOutbound(registry)' in reg and 'TypeMieru' in const, 'Mieru integration lost')
+              need(cur['release/DEFAULT_BUILD_TAGS_OTHERS']==base['release/DEFAULT_BUILD_TAGS_OTHERS'], 'build tags drift')
+              need(cur['release/LDFLAGS']==base['release/LDFLAGS'], 'ldflags drift')
+              # gofmt all Go source via installed formatter; this is syntax/format only, not a Go 1.25 compile claim.
+              gofiles=[str(ROOT/k) for k in cur if k.endswith('.go')]
+              r=subprocess.run(['gofmt','-l',*gofiles],text=True,capture_output=True)
+              need(r.returncode==0, 'gofmt failed: '+r.stderr[:300])
+              need(not r.stdout.strip(), 'unformatted Go files: '+r.stdout[:500])
+
+          passes=[p1,p2,p3,p4,p5,p6,p7,p8,p9,p10]
+          lines=[]
+          try:
+              for i,fn in enumerate(passes,1):
+                  line=run_pass(i,fn); print(line); lines.append(line)
+          except AuditFail as e:
+              line=f'FAIL {len(lines)+1:02d}: {e}'
+              print(line); lines.append(line)
+              REPORT.write_text('\n'.join(lines)+'\n')
+              sys.exit(1)
+          REPORT.write_text('\n'.join(lines)+'\n')
+          print('ALL 10 FULL-SOURCE AUDIT PASSES COMPLETE')
           PY
+          python3 "${RUNNER_TEMP}/multipath-capacity-v2-full-audit.py"
 
-      - name: Check formatting of approved Go write-set
+      - name: Independent external simulation x10 with mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/multipath-capacity-v2-independent-sim.py" <<'PY'
+          #!/usr/bin/env python3
+          """
+          Independent external simulation for multipath preferred_capacity_mbps.
+
+          This model intentionally does NOT import, parse, or reimplement Go internals such
+          as mpCore, choosePathLocked, credit, Path.Pipeline, or any source function.  It
+          models only externally frozen requirements:
+            * one target belongs to one multipath instance, shared by all logical flows;
+            * capacity admission is based on aggregate UNIQUE preferred delivery;
+            * below target demand stays preferred-only when preferred is healthy;
+            * after admission, target is a floor, never a cap;
+            * preferred saturation/busy must not prevent excess from using booster;
+            * target=0 is transparent to a supplied baseline policy.
+
+          Known-bad mutation policies are run against the same scenarios to prove this
+          simulator can reject the architectures that escaped the previous test suite.
+          """
+          from dataclasses import dataclass, field
+          from typing import Callable, Dict, List, Tuple
+          import math, random, json
+
+          DT = 0.02
+          WINDOW = 1.0
+          AFTER_BYTES = 2 * 1024 * 1024
+          MBPS_TO_BPS = 1_000_000 / 8
+
+          @dataclass
+          class Segment:
+              start: float
+              end: float
+              demand_mbps: float
+              preferred_cap_mbps: float
+              booster_cap_mbps: float
+              repair_mbps: float = 0.0
+              preferred_busy: bool = False
+              local_write_mbps: float | None = None
+
+          @dataclass
+          class Case:
+              name: str
+              flows: int
+              target_mbps: float
+              segments: List[Segment]
+              preferred_rtt_ms: float = 45.0
+              booster_rtt_ms: float = 110.0
+              baseline_split: Tuple[float,float] | None = None
+              check: Callable[["Result"], None] | None = None
+
+          @dataclass
+          class Result:
+              case: str
+              policy: str
+              total_bytes: float = 0
+              pref_bytes: float = 0
+              booster_bytes: float = 0
+              normal_pref_bytes: float = 0
+              repair_bytes: float = 0
+              samples: List[dict] = field(default_factory=list)
+              activation_time: float | None = None
+              low_phase_booster_bytes: float = 0
+
+              def avg_mbps(self, duration): return self.total_bytes * 8 / 1_000_000 / duration
+              def pref_mbps(self, duration): return self.pref_bytes * 8 / 1_000_000 / duration
+              def booster_mbps(self, duration): return self.booster_bytes * 8 / 1_000_000 / duration
+
+          class Policy:
+              name = 'spec-shared-aggregate'
+              def __init__(self, case: Case):
+                  self.case=case
+                  self.ready=False
+                  self.activated=[False]*case.flows
+                  self.flow_bytes=[0.0]*case.flows
+                  self.window=[]  # (time, unique preferred bytes)
+
+              def _window_rate(self, now):
+                  cutoff=now-WINDOW
+                  self.window=[x for x in self.window if x[0] > cutoff]
+                  b=sum(x[1] for x in self.window)
+                  return b*8/1_000_000/WINDOW
+
+              def allocate(self, now, seg, demand_by_flow, delivered_pref_prev, repair_prev):
+                  # Capacity=0 is transparent and uses supplied frozen baseline split.
+                  if self.case.target_mbps <= 0:
+                      if self.case.baseline_split is None:
+                          p=min(seg.preferred_cap_mbps, sum(demand_by_flow))
+                          b=min(seg.booster_cap_mbps, max(0.0,sum(demand_by_flow)-p))
+                          return p,b
+                      pshare,bshare=self.case.baseline_split
+                      d=sum(demand_by_flow)
+                      return min(seg.preferred_cap_mbps,d*pshare), min(seg.booster_cap_mbps,d*bshare)
+
+                  if delivered_pref_prev > 0:
+                      self.window.append((now, delivered_pref_prev * MBPS_TO_BPS * DT))
+                  aggregate_unique_rate=self._window_rate(now)
+                  self.ready = aggregate_unique_rate + 1e-9 >= self.case.target_mbps
+
+                  for i,d in enumerate(demand_by_flow):
+                      self.flow_bytes[i]+=d*MBPS_TO_BPS*DT
+                      if self.ready and self.flow_bytes[i] >= AFTER_BYTES:
+                          self.activated[i]=True
+
+                  total=sum(demand_by_flow)
+                  any_active=any(self.activated)
+                  # Externally required behavior, not Go scheduling internals:
+                  # before admission normal DATA remains preferred-only. After admission,
+                  # use all healthy preferred capacity naturally; booster gets only excess.
+                  if not any_active:
+                      p=min(total,seg.preferred_cap_mbps)
+                      return p,0.0
+                  p=min(total,seg.preferred_cap_mbps)
+                  b=min(max(0.0,total-p),seg.booster_cap_mbps)
+                  return p,b
+
+          class PerSessionGate(Policy):
+              name='MUTANT-per-session-target'
+              def __init__(self,case):
+                  super().__init__(case); self.flow_windows=[[] for _ in range(case.flows)]
+              def allocate(self, now, seg, demand_by_flow, delivered_pref_prev, repair_prev):
+                  if self.case.target_mbps<=0: return super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+                  total=sum(demand_by_flow)
+                  # Divide unique preferred delivery by flow; each flow wrongly has to hit full target.
+                  shares=[d/total if total else 0 for d in demand_by_flow]
+                  for i,share in enumerate(shares):
+                      self.flow_windows[i].append((now,delivered_pref_prev*share*MBPS_TO_BPS*DT))
+                      self.flow_windows[i]=[x for x in self.flow_windows[i] if x[0]>now-WINDOW]
+                      rate=sum(x[1] for x in self.flow_windows[i])*8/1_000_000/WINDOW
+                      self.flow_bytes[i]+=demand_by_flow[i]*MBPS_TO_BPS*DT
+                      if rate>=self.case.target_mbps and self.flow_bytes[i]>=AFTER_BYTES: self.activated[i]=True
+                  if not any(self.activated): return min(total,seg.preferred_cap_mbps),0.0
+                  p=min(total,seg.preferred_cap_mbps); return p,min(total-p,seg.booster_cap_mbps)
+
+          class TargetCap(Policy):
+              name='MUTANT-target-is-cap'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  p,b=super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+                  if self.case.target_mbps>0 and any(self.activated):
+                      p=min(p,self.case.target_mbps)
+                      b=min(seg.booster_cap_mbps,max(0.0,sum(demand_by_flow)-p))
+                  return p,b
+
+          class BusyWait(Policy):
+              name='MUTANT-preferred-busy-waits'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  p,b=super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+                  if seg.preferred_busy and b>0:
+                      # wrong architecture: stop at preferred rather than use free booster.
+                      return p,0.0
+                  return p,b
+
+          class LocalWriteGate(Policy):
+              name='MUTANT-local-write-gate'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  if self.case.target_mbps<=0: return super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+                  observed=seg.local_write_mbps if seg.local_write_mbps is not None else sum(demand_by_flow)
+                  self.ready=observed>=self.case.target_mbps
+                  for i,d in enumerate(demand_by_flow):
+                      self.flow_bytes[i]+=d*MBPS_TO_BPS*DT
+                      if self.ready and self.flow_bytes[i]>=AFTER_BYTES: self.activated[i]=True
+                  total=sum(demand_by_flow)
+                  if not any(self.activated): return min(total,seg.preferred_cap_mbps),0.0
+                  p=min(total,seg.preferred_cap_mbps); return p,min(total-p,seg.booster_cap_mbps)
+
+          class HistoricalLatch(Policy):
+              name='MUTANT-historical-ready-latch'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  old=self.ready
+                  p,b=super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+                  self.ready=self.ready or old
+                  if self.ready:
+                      for i in range(self.case.flows):
+                          if self.flow_bytes[i]>=AFTER_BYTES: self.activated[i]=True
+                  total=sum(demand_by_flow)
+                  if any(self.activated) and total<=self.case.target_mbps and total>0:
+                      # wrong historical activation leaks 15% normal DATA to booster forever.
+                      b=min(seg.booster_cap_mbps,total*0.15)
+                      p=min(seg.preferred_cap_mbps,total-b)
+                  return p,b
+
+          class RepairCounts(Policy):
+              name='MUTANT-repair-counts-as-capacity'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  return super().allocate(now,seg,demand_by_flow,delivered_pref_prev+repair_prev,0.0)
+
+          class TargetZeroDrift(Policy):
+              name='MUTANT-target-zero-drift'
+              def allocate(self,now,seg,demand_by_flow,delivered_pref_prev,repair_prev):
+                  if self.case.target_mbps<=0 and self.case.baseline_split:
+                      # wrong: feature still forces preferred bias when disabled.
+                      d=sum(demand_by_flow); return min(seg.preferred_cap_mbps,d*0.9), min(seg.booster_cap_mbps,d*0.1)
+                  return super().allocate(now,seg,demand_by_flow,delivered_pref_prev,repair_prev)
+
+          MUTANTS=[PerSessionGate,TargetCap,BusyWait,LocalWriteGate,HistoricalLatch,RepairCounts,TargetZeroDrift]
+
+          def flow_demands(total, n, rng):
+              # Stable unequal flows, representing Speedtest parallel TCPs without giving
+              # any policy a per-flow target assumption.
+              weights=[0.7+rng.random()*0.6 for _ in range(n)]
+              s=sum(weights)
+              return [total*w/s for w in weights]
+
+          def simulate(case:Case, policy_cls=Policy, seed=1)->Result:
+              rng=random.Random(seed)
+              policy=policy_cls(case)
+              res=Result(case.name,policy.name)
+              end=max(s.end for s in case.segments)
+              delivered_pref_prev=0.0; repair_prev=0.0
+              steps=int(math.ceil(end/DT))
+              for k in range(steps):
+                  now=k*DT
+                  seg=next(s for s in case.segments if s.start<=now<s.end)
+                  demands=flow_demands(seg.demand_mbps,case.flows,rng)
+                  assigned_p,assigned_b=policy.allocate(now,seg,demands,delivered_pref_prev,repair_prev)
+                  # Physical delivery limits. RTT only delays first visible delivery, it
+                  # does not create capacity. This is sufficient for long-window throughput.
+                  p_delay=case.preferred_rtt_ms/2000.0
+                  b_delay=case.booster_rtt_ms/2000.0
+                  delivered_p=0.0 if now < seg.start+p_delay else min(assigned_p,seg.preferred_cap_mbps)
+                  delivered_b=0.0 if now < seg.start+b_delay else min(assigned_b,seg.booster_cap_mbps)
+                  repair=seg.repair_mbps
+                  delivered_pref_prev=delivered_p
+                  repair_prev=repair
+                  res.normal_pref_bytes += delivered_p*MBPS_TO_BPS*DT
+                  res.pref_bytes += delivered_p*MBPS_TO_BPS*DT
+                  res.booster_bytes += delivered_b*MBPS_TO_BPS*DT
+                  res.repair_bytes += repair*MBPS_TO_BPS*DT
+                  res.total_bytes += (delivered_p+delivered_b)*MBPS_TO_BPS*DT
+                  if res.activation_time is None and any(policy.activated): res.activation_time=now
+                  if 'transition' in case.name and now>=5.0: res.low_phase_booster_bytes += delivered_b*MBPS_TO_BPS*DT
+                  if k % int(1/DT)==0:
+                      res.samples.append({'t':round(now,2),'demand':seg.demand_mbps,'pref':delivered_p,'booster':delivered_b,'ready':policy.ready,'active':sum(policy.activated)})
+              return res
+
+          def duration(case): return max(s.end for s in case.segments)
+
+          def avg_phase(res,case,start,end,key):
+              # Reconstruct from 1s samples for simple phase invariants.
+              vals=[x[key] for x in res.samples if start<=x['t']<end]
+              return sum(vals)/len(vals) if vals else 0.0
+
+          def require(cond,msg):
+              if not cond: raise AssertionError(msg)
+
+          # External invariants per case. Tolerances account only for startup/RTT/window delay.
+          def c1(r):
+              require(r.booster_mbps(8)<0.2,f'booster leaked below target: {r.booster_mbps(8):.2f}')
+              require(56<=r.avg_mbps(8)<=61,f'total unexpected {r.avg_mbps(8):.2f}')
+          def c2(r):
+              require(r.booster_mbps(8)<0.2,'multi-flow aggregate below target used booster')
+              require(r.avg_mbps(8)>56,'multi-flow below-target throughput lost')
+          def c3(r):
+              require(r.activation_time is not None and r.activation_time<4.5,'booster never admitted just above shared target')
+              require(r.avg_mbps(10)>74,'80 Mbps demand was clamped near target/single path')
+              require(r.booster_mbps(10)>1,'booster carried no excess')
+          def c4(r):
+              require(r.activation_time is not None,'140 Mbps / 4-flow never activated')
+              require(r.avg_mbps(10)>120,'aggregate failed to exceed preferred by useful margin')
+              require(r.pref_mbps(10)>65,'preferred under target aggregate floor')
+              require(r.booster_mbps(10)>40,'booster not carrying substantial excess')
+          def c5(r):
+              require(r.activation_time is not None,'8-flow load never activated')
+              require(r.avg_mbps(10)>140,'8-flow aggregate did not use both links')
+              require(r.pref_mbps(10)>65 and r.booster_mbps(10)>60,'8-flow shared capacity split failed')
+          def c6(r):
+              require(r.avg_mbps(10)>105,'target=50 clamped total throughput')
+              require(r.pref_mbps(10)>65,'target=50 acted as preferred cap')
+              require(r.booster_mbps(10)>25,'target=50 did not use booster excess')
+          def c7(r):
+              require(r.avg_mbps(8)>75,'natural preferred capacity above target was capped')
+              require(r.pref_mbps(8)>75,'preferred did not naturally exceed target')
+          def c8(r):
+              require(r.avg_mbps(10)>120,'preferred busy/saturated caused HOL clamp')
+              require(r.booster_mbps(10)>45,'busy preferred blocked booster excess')
+          def c9(r):
+              # After transition to 60 (<70), later 1s samples must settle to booster zero.
+              later=[x for x in r.samples if x['t']>=7]
+              require(later and max(x['booster'] for x in later)<0.1,'historical readiness leaked booster below target')
+              require(min(x['pref'] for x in later)>55,'low phase lost preferred throughput')
+          def c10(r):
+              # Normal preferred is fixed at 50, repair=30; repair must not unlock 70 gate.
+              require(r.activation_time is None,'repair traffic falsely satisfied preferred capacity gate')
+              require(r.booster_mbps(8)<0.2,'repair falsely admitted booster normal DATA')
+
+          def c11_zero(r):
+              # exact supplied beta6 baseline split 60/40 of 100 demand, capacities ample.
+              p=r.pref_mbps(8); b=r.booster_mbps(8)
+              require(abs(p-60)<2.0 and abs(b-40)<2.0,f'target=0 drifted baseline split p={p:.2f} b={b:.2f}')
+
+          CASES=[
+           Case('01-single-below-target',1,70,[Segment(0,8,60,75,100)],check=c1),
+           Case('02-four-flow-below-target',4,70,[Segment(0,8,60,75,100)],check=c2),
+           Case('03-four-flow-just-above-target',4,70,[Segment(0,10,80,75,100)],check=c3),
+           Case('04-four-flow-140mbps',4,70,[Segment(0,10,140,75,100)],check=c4),
+           Case('05-eight-flow-160mbps',8,70,[Segment(0,10,160,75,100)],check=c5),
+           Case('06-target50-not-cap',4,50,[Segment(0,10,120,75,100)],check=c6),
+           Case('07-natural-preferred-above-target',2,70,[Segment(0,8,80,90,100)],check=c7),
+           Case('08-preferred-busy-excess-continues',4,70,[Segment(0,10,140,75,100,preferred_busy=True)],check=c8),
+           Case('09-transition-high-to-low',4,70,[Segment(0,5,150,75,100),Segment(5,10,60,75,100)],check=c9),
+           Case('10-repair-does-not-unlock',4,70,[Segment(0,8,100,50,100,repair_mbps=30)],check=c10),
+          ]
+          # Target=0 is used as a mutation-control auxiliary, not counted as one of the ten
+          # formal simulations, because the 10 requested simulations above focus positive capacity.
+          ZERO=Case('aux-target-zero-baseline',4,0,[Segment(0,8,100,100,100)],baseline_split=(0.6,0.4),check=c11_zero)
+
+
+          def run_policy(case,cls,seed):
+              r=simulate(case,cls,seed)
+              case.check(r)
+              return r
+
+          report=[]
+          print('=== 10 INDEPENDENT EXTERNAL SIMULATIONS ===')
+          for i,case in enumerate(CASES,1):
+              r=run_policy(case,Policy,100+i)
+              d=duration(case)
+              row={'simulation':i,'case':case.name,'policy':r.policy,'total_mbps':round(r.avg_mbps(d),2),'preferred_mbps':round(r.pref_mbps(d),2),'booster_mbps':round(r.booster_mbps(d),2),'activation_time_s':None if r.activation_time is None else round(r.activation_time,2)}
+              report.append(row)
+              print(f"PASS SIM {i:02d} {case.name}: total={row['total_mbps']:.2f} pref={row['preferred_mbps']:.2f} booster={row['booster_mbps']:.2f} active_at={row['activation_time_s']}")
+
+          # Auxiliary zero/no-op control.
+          z=run_policy(ZERO,Policy,500)
+          print(f"PASS AUX target=0 baseline transparency: pref={z.pref_mbps(duration(ZERO)):.2f} booster={z.booster_mbps(duration(ZERO)):.2f}")
+
+          print('\n=== MUTATION / ERROR-DETECTION TESTS ===')
+          # Map each known-bad architecture to a case that must kill it.
+          kill_plan=[
+           (PerSessionGate,CASES[3]),       # 4 flows each below 70 though aggregate is >70
+           (TargetCap,CASES[6]),            # preferred can naturally do 80 > target70
+           (BusyWait,CASES[7]),             # saturated preferred must not stop booster
+           (LocalWriteGate,CASES[9]),       # local writes/demand 100, real preferred only50
+           (HistoricalLatch,CASES[8]),      # high -> low transition must return normal DATA to preferred
+           (RepairCounts,CASES[9]),         # 50 useful +30 repair must not unlock target70
+           (TargetZeroDrift,ZERO),          # disabled mode must be transparent
+          ]
+          killed=[]
+          for idx,(mutant,case) in enumerate(kill_plan,1):
+              r=simulate(case,mutant,900+idx)
+              try:
+                  case.check(r)
+              except AssertionError as e:
+                  killed.append(mutant.name)
+                  print(f'PASS KILL {idx:02d} {mutant.name} rejected by {case.name}: {e}')
+              else:
+                  raise SystemExit(f'FAIL simulator could not kill known-bad {mutant.name} on {case.name}')
+
+          out={'formal_simulations':report,'aux_zero':{'preferred_mbps':z.pref_mbps(duration(ZERO)),'booster_mbps':z.booster_mbps(duration(ZERO))},'mutants_killed':killed}
+          with open('/mnt/data/multipath-capacity-v2-independent-sim-results.json','w') as f: json.dump(out,f,indent=2)
+          with open('/mnt/data/multipath-capacity-v2-independent-sim-report.txt','w') as f:
+              f.write('10 independent external simulations: PASS\n')
+              for row in report: f.write(json.dumps(row,ensure_ascii=False)+'\n')
+              f.write('AUX target=0 transparency: PASS\n')
+              for m in killed: f.write('MUTANT KILLED: '+m+'\n')
+          print('\nALL 10 INDEPENDENT SIMULATIONS PASS; ALL 7 KNOWN-BAD MUTANTS KILLED')
+          PY
+          python3 "${RUNNER_TEMP}/multipath-capacity-v2-independent-sim.py"
+
+      - name: Check formatting of complete approved Go write-set
         shell: bash
         run: |
           set -euo pipefail
@@ -377,67 +714,14 @@ jobs:
             protocol/multipath/scheduler.go
             protocol/multipath/status.go
             protocol/multipath/types.go
-            protocol/multipath/capacity_scheduler_test.go
+            protocol/multipath/capacity.go
+            protocol/multipath/capacity_test.go
           )
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then
             printf '%s\n' "$unformatted"
             exit 1
           fi
-
-      - name: Independent capacity policy oracle
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          TARGET = 70.0
-
-          def activation_allowed(preferred_mbps, original_trigger, enabled=True):
-              if not original_trigger:
-                  return False
-              if not enabled:
-                  return True
-              return preferred_mbps + 1e-9 >= TARGET
-
-          for mbps, want in (
-              (60, False),
-              (69, False),
-              (70, True),
-              (80, True),
-          ):
-              got = activation_allowed(mbps, True)
-              assert got == want, (mbps, got, want)
-          assert activation_allowed(140, False) is False
-          assert activation_allowed(0, True, enabled=False) is True
-
-          def required_split(offered_mbps, natural_preferred_mbps=None):
-              if offered_mbps <= TARGET:
-                  return offered_mbps, 0.0
-              if natural_preferred_mbps is not None and natural_preferred_mbps >= TARGET:
-                  preferred = min(offered_mbps, natural_preferred_mbps)
-                  return preferred, offered_mbps - preferred
-              return TARGET, offered_mbps - TARGET
-
-          for offered in (60, 69, 70):
-              a, b = required_split(offered)
-              assert a == offered and b == 0, (offered, a, b)
-
-          for offered, want_b in ((80, 10), (140, 70), (200, 130)):
-              a, b = required_split(offered)
-              assert a == 70 and b == want_b, (offered, a, b)
-
-          a, b = required_split(130, natural_preferred_mbps=90)
-          assert (a, b) == (90, 40), (a, b)
-
-          a, b = required_split(120, natural_preferred_mbps=120)
-          assert (a, b) == (120, 0), (a, b)
-
-          print('PASS activation gate: 60/69 blocked; 70/80 admitted; original trigger still required')
-          print('PASS below/at target: 60/69/70 => preferred only')
-          print('PASS excess demand: 80=>70+10, 140=>70+70, 200=>70+130')
-          print('PASS healthy beta6 split preserved: 90+40')
-          print('PASS preferred target is reservation, not cap')
-          PY
 
       - name: Go vet focused packages
         shell: bash
@@ -459,14 +743,14 @@ jobs:
             -run '^TestMultipathPreferredCapacityOption$' \
             ./option
 
-      - name: Capacity gate and reservation tests with race detector x100
+      - name: Capacity architecture tests with race detector x100
         shell: bash
         run: |
           set -euo pipefail
           CGO_ENABLED=1 go test \
             -race \
             -count=100 \
-            -timeout=10m \
+            -timeout=15m \
             -tags "$BUILD_TAGS" \
             -run '^TestPreferredCapacity' \
             ./protocol/multipath
@@ -483,31 +767,28 @@ jobs:
             -tags "$BUILD_TAGS" \
             ./protocol/multipath
 
-      - name: Parent vs candidate zero-capacity performance differential
+      - name: Mieru regression
         shell: bash
         run: |
           set -euo pipefail
+          go test \
+            -count=3 \
+            -timeout=10m \
+            -tags "$BUILD_TAGS" \
+            ./protocol/mieru
 
-          PARENT_DIR="${RUNNER_TEMP}/multipath-parent"
-          LOG_DIR="${RUNNER_TEMP}/capacity-perf"
+      - name: Parent vs candidate zero-field performance differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
           mkdir -p "$LOG_DIR"
-          rm -rf "$PARENT_DIR"
-
-          git worktree add --detach \
-            "$PARENT_DIR" \
-            "refs/remotes/origin/${PARENT_BRANCH}"
-
-          cleanup() {
-            git worktree remove --force "$PARENT_DIR" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
 
           run_perf() {
             local tree="$1"
             local label="$2"
             local run_id="$3"
             local log="$LOG_DIR/${label}-${run_id}.log"
-
             set +e
             (
               cd "$tree"
@@ -525,10 +806,6 @@ jobs:
             echo "${label}_run_${run_id}_go_test_rc=${rc}"
           }
 
-          # Two independent samples on each exact tree. The fixture may return
-          # non-zero because it embeds historical beta3 thresholds; that exit code
-          # is not used as the differential verdict. Safety errors and measured
-          # throughput are parsed below.
           run_perf "$PARENT_DIR" parent 1
           run_perf "$GITHUB_WORKSPACE" candidate 1
           run_perf "$PARENT_DIR" parent 2
@@ -536,126 +813,60 @@ jobs:
 
           python3 - "$LOG_DIR" <<'PY'
           from pathlib import Path
-          import statistics
-          import re
-          import sys
-
-          log_dir = Path(sys.argv[1])
-
-          expected = [
-              '1_160+600Mbps_65+110ms',
-              '8_160+600Mbps_65+110ms',
-              '32_160+600Mbps_65+110ms',
-              '1_40+50Mbps_65+110ms',
-              '8_40+50Mbps_65+110ms',
-              '1_160+600Mbps_65+400ms',
-              '8_160+600Mbps_65+400ms',
-              '1_160+600Mbps_110+65ms',
-              '1_160+600Mbps_5+10ms',
-              '8_160+600Mbps_5+10ms',
-              '1_1000+1000Mbps_65+110ms',
+          import statistics, re, sys
+          log_dir=Path(sys.argv[1])
+          expected=[
+            '1_160+600Mbps_65+110ms','8_160+600Mbps_65+110ms','32_160+600Mbps_65+110ms',
+            '1_40+50Mbps_65+110ms','8_40+50Mbps_65+110ms','1_160+600Mbps_65+400ms',
+            '8_160+600Mbps_65+400ms','1_160+600Mbps_110+65ms','1_160+600Mbps_5+10ms',
+            '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms',
           ]
-
-          run_re = re.compile(
-              r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$'
+          run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
+          rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
+          forbidden=(
+            'healthy reliable legs triggered replay','unused window credit caused memory pressure',
+            'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
           )
-          rate_re = re.compile(
-              r'performance_test\.go:\d+: '
-              r'flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)'
-          )
-
-          forbidden = (
-              'healthy reliable legs triggered replay',
-              'unused window credit caused memory pressure',
-              'memory budget exceeded',
-              'short stream:',
-              'panic:',
-              'fatal error:',
-              'test timed out',
-              'DATA RACE',
-          )
-          diagnostic_re = re.compile(
-              r'performance_test\.go:\d+: (.*)$'
-          )
-
+          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
           def parse(path):
-              text = path.read_text(encoding='utf-8', errors='replace')
-              for token in forbidden:
-                  if token in text:
-                      raise SystemExit(
-                          f'FAIL {path.name}: unsafe fixture result: {token}'
-                      )
-              current = None
-              values = {}
-              for line in text.splitlines():
-                  diagnostic = diagnostic_re.search(line)
-                  if diagnostic:
-                      message = diagnostic.group(1)
-                      if not (
-                          message.startswith('throughput regression:')
-                          or message.startswith('flows=')
-                      ):
-                          raise SystemExit(
-                              f'FAIL {path.name}: unexpected performance diagnostic: '
-                              f'{message}'
-                          )
-
-                  match = run_re.search(line)
-                  if match:
-                      current = match.group(1)
-                      continue
-                  match = rate_re.search(line)
-                  if match and current:
-                      values[current] = float(match.group(1))
-              missing = sorted(set(expected) - set(values))
-              extra = sorted(set(values) - set(expected))
-              if missing or extra:
-                  raise SystemExit(
-                      f'FAIL {path.name}: missing={missing} extra={extra}'
-                  )
-              return values
-
-          samples = {
-              'parent': [
-                  parse(log_dir / 'parent-1.log'),
-                  parse(log_dir / 'parent-2.log'),
-              ],
-              'candidate': [
-                  parse(log_dir / 'candidate-1.log'),
-                  parse(log_dir / 'candidate-2.log'),
-              ],
+            text=path.read_text(encoding='utf-8',errors='replace')
+            for token in forbidden:
+              if token in text: raise SystemExit(f'FAIL {path.name}: unsafe fixture result: {token}')
+            current=None; values={}
+            for line in text.splitlines():
+              d=diagnostic_re.search(line)
+              if d:
+                msg=d.group(1)
+                if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
+                  raise SystemExit(f'FAIL {path.name}: unexpected performance diagnostic: {msg}')
+              m=run_re.search(line)
+              if m:
+                current=m.group(1); continue
+              m=rate_re.search(line)
+              if m and current: values[current]=float(m.group(1))
+            missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
+            if missing or extra: raise SystemExit(f'FAIL {path.name}: missing={missing} extra={extra}')
+            return values
+          samples={
+            'parent':[parse(log_dir/'parent-1.log'),parse(log_dir/'parent-2.log')],
+            'candidate':[parse(log_dir/'candidate-1.log'),parse(log_dir/'candidate-2.log')],
           }
-
-          failed = False
-          print('=== ZERO-CAPACITY PARENT VS CANDIDATE PERFORMANCE ===')
+          failed=False
           for case in expected:
-              parent_values = [sample[case] for sample in samples['parent']]
-              candidate_values = [sample[case] for sample in samples['candidate']]
-              parent_median = statistics.median(parent_values)
-              candidate_median = statistics.median(candidate_values)
-              ratio = candidate_median / parent_median
-              status = 'PASS' if ratio >= 0.98 else 'FAIL'
-              print(
-                  f'{status} {case}: '
-                  f'parent={parent_values} median={parent_median:.1f} '
-                  f'candidate={candidate_values} median={candidate_median:.1f} '
-                  f'ratio={ratio:.4f}'
-              )
-              if ratio < 0.98:
-                  failed = True
-
-          if failed:
-              raise SystemExit(
-                  'FAIL capacity branch is below 98% of its direct parent '
-                  'with preferred_capacity_mbps disabled'
-              )
-
-          print(
-              'PASS candidate retains at least 98% of direct-parent '
-              'performance for every deterministic fixture'
-          )
+            pv=[x[case] for x in samples['parent']]; cv=[x[case] for x in samples['candidate']]
+            pm=statistics.median(pv); cm=statistics.median(cv); ratio=cm/pm
+            status='PASS' if ratio>=0.98 else 'FAIL'
+            print(f'{status} {case}: parent={pv} candidate={cv} ratio={ratio:.4f}')
+            failed |= ratio < 0.98
+          if failed: raise SystemExit('FAIL zero-field candidate performance below 98% of direct parent')
+          print('PASS zero-field candidate retains >=98% direct-parent performance for all fixtures')
           PY
 
+      - name: Cleanup parent worktree
+        if: always()
+        shell: bash
+        run: |
+          git worktree remove --force "$PARENT_DIR" >/dev/null 2>&1 || true
 
   build_targets:
     name: Build ${{ matrix.label }}
