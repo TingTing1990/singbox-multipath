@@ -54,28 +54,40 @@ application data stays on leg 0, except during optional failover. Leg 1 can stil
 peer enables aggregation, and the selected UDP outbound is unaffected.
 
 `preferred_capacity_mbps` is an optional **instance-wide Local-TX preferred-path
-capacity target**. It is not a per-connection value, not a bandwidth cap, and is
-not negotiated on the multipath wire. All logical TCP sessions created by one
-multipath outbound share one controller for client upload; all sessions accepted
-by one multipath inbound share one controller for server download. When omitted
-or set to `0`, no controller is created and beta6 activation/scheduling behavior
-is unchanged.
+minimum admission target**. It is not a per-connection value, not a bandwidth cap,
+and is not negotiated on the multipath wire. All logical TCP sessions created by
+one multipath outbound share one controller for client upload; all sessions
+accepted by one multipath inbound share one controller for server download. When
+omitted or set to `0`, no controller is created and beta6 activation/scheduling
+behavior is unchanged.
 
 When positive, ordinary leg 1 DATA still requires one of the existing per-flow
-activation conditions below. In addition, aggregate peer-confirmed leg 0 delivery
-for the whole local multipath instance must reach the configured target over a
-complete activation window. After aggregation, the same instance-wide controller
-prevents adaptive scheduling from persistently starving leg 0 below the target
-assignment cadence while leaving natural leg 0 traffic above the target untouched.
+activation conditions below. In addition, aggregate **peer-confirmed normal
+first-transmission** leg 0 delivery for the whole local multipath instance must
+reach the configured target over a complete activation window. The completed
+window also establishes the preferred path's currently proven sustainable rate.
+After aggregation, the controller protects that proven rate, not merely the
+configured target: booster DATA is additive excess and must not displace healthy
+preferred throughput that was already demonstrated before booster admission.
+Natural preferred delivery above the protected rate remains uncapped and can raise
+the protected rate. A protected rate may decay only after several complete windows
+where the preferred path was actually assigned enough normal DATA but peer-confirmed
+delivery remained materially lower, preventing scheduler under-assignment or low
+demand from being misread as physical degradation.
+
 If leg 0 is temporarily busy or its pipeline is full, the controller does **not**
 block the logical stream merely to repay preferred credit; the original beta6
 candidate remains usable so excess demand can continue on leg 1. True recovery
 failover also bypasses the target when leg 0 has been declared unavailable.
+Repair/reinjection delivery never establishes or raises the protected rate.
 
-For example, with a roughly 70--80 Mbps preferred path, a roughly 100 Mbps
-booster, and `preferred_capacity_mbps: 70`, multiple Speedtest TCP connections
-share one 70 Mbps target. They do not each receive an independent 70 Mbps target.
-The setting does not cap the preferred path at 70 Mbps.
+For example, with `preferred_capacity_mbps: 70`, if leg 0 proves that it can
+sustain 90 Mbps before booster DATA is admitted and demand remains high, post-
+activation scheduling protects roughly that 90 Mbps preferred contribution and
+uses leg 1 for excess. A 70+80 split under 150 Mbps demand would violate the
+feature contract even though total throughput is high. Multiple Speedtest TCP
+connections share one instance-wide target/protected rate; they do not each
+receive an independent reservation.
 
 With aggregation enabled, the following triggers are independent alternatives
 (OR), evaluated separately for each connection and sending direction:
@@ -452,7 +464,7 @@ All fields below are available on both sides.
 | Field | Scope and peer interaction | Description | Accepted format / example |
 | --- | --- | --- | --- |
 | `aggregation_enabled` | **Local TX**, independent on each side; not negotiated. | `false` keeps local application data on leg 0 except during optional failover, without disabling peer TX aggregation, local RX over leg 1, or UDP. Default: `true`. | `true` or `false` |
-| `preferred_capacity_mbps` | **Aggregate Local TX preferred/leg0 target for one multipath inbound/outbound instance; not negotiated.** | `0`/omitted preserves beta6. Positive values add an aggregate peer-delivery activation gate and a shared post-activation preferred reservation. It is not per-flow and not a cap. | Non-negative integer Mbps, e.g. `70` or `0` |
+| `preferred_capacity_mbps` | **Aggregate Local TX preferred/leg0 minimum admission target for one multipath inbound/outbound instance; not negotiated.** | `0`/omitted preserves beta6. Positive values gate booster DATA on aggregate peer-confirmed normal delivery, then protect the preferred rate actually proven at admission (and any later higher proven rate). Booster is additive excess: the configured value is neither per-flow nor a post-activation cap/goal. | Non-negative integer Mbps, e.g. `70` or `0` |
 | `activation_on_queue` | **Local TX**; not negotiated. | **Condition 1**, an independent OR trigger: primary path in-flight plus local unsent bytes stay at least 80% of `chunk_size * queue_frames` for `activation_window`. Default: `true`. | `true` or `false` |
 | `activation_threshold_mbps` | **Local TX** ingress rate per connection; not negotiated. | **Condition 2**, an independent OR trigger measured over `activation_window`. Explicit `0` disables it. If omitted, defaults to `150` when the byte trigger is disabled, otherwise `0`. | Non-negative integer Mbps, e.g. `120` or `0` |
 | `activation_after_bytes` | **Local TX** cumulative application bytes per connection; not negotiated. | **Condition 3**, an independent OR trigger. Counts bytes accepted into the local multipath sender, not peer delivery or combined RX/TX traffic. `0` or omitted disables it. | Non-negative integer or memory string, e.g. `2097152`, `"2MB"`, or `0` |
