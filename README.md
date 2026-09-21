@@ -89,6 +89,28 @@ feature contract even though total throughput is high. Multiple Speedtest TCP
 connections share one instance-wide target/protected rate; they do not each
 receive an independent reservation.
 
+For server-side FIELD validation, a positive inbound `preferred_capacity_mbps`
+enables a local, read-only `CAP_AUDIT` event stream through the normal server
+logger. It does not enter the wire protocol and does not change activation or
+scheduler decisions. The server emits `CAP_AUDIT_READY`, `CAP_GATE_BLOCKED`,
+`CAP_GATE_OPENED`, `CAP_PROTECTION_ARMED`, `CAP_WINDOW`, and
+`CAP_PROTECTION_CHANGED`. Gate events include the original beta6 trigger
+evidence, capacity readiness, session/destination correlation, and whether the
+admission was a normal booster decision or a recovery bypass. Window events
+include target, peer-confirmed preferred delivery, protected rate, preferred
+assignment rate, protection state, and degradation evidence. Audit buffering is
+bounded; any overflow is emitted as `CAP_AUDIT_DROPPED evidence_complete=false`
+so missing evidence cannot silently pass FIELD acceptance.
+
+Before a FIELD run, confirm that `CAP_AUDIT_READY side=server` is visible for the
+inbound. If the configured log level suppresses INFO events, raise the server log
+level for the validation run; do not infer controller decisions from client
+throughput alone. A below-target byte-trigger test passes only when the server
+records `CAP_GATE_BLOCKED` with `original_trigger=bytes`,
+`original_trigger_satisfied=true`, `current_bytes >= threshold_bytes`,
+`delivery_ready=false`, `normal_booster_admitted=false`, and
+`recovery_bypass=false`.
+
 With aggregation enabled, the following triggers are independent alternatives
 (OR), evaluated separately for each connection and sending direction:
 
