@@ -2,18 +2,24 @@ name: Build Multipath Memory v1 beta6
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source branch to audit and build
+        required: true
+        default: feature/multipath-capacity-v2-beta6
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: multipath-memory-v1-feature-multipath-capacity-v2-beta6
+  group: multipath-memory-v1-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
   GO_VERSION: '1.25.5'
   VERSION: '1.14.0-multipath-beta6'
-  SOURCE_BRANCH: 'feature/multipath-capacity-v2-beta6'
+  SOURCE_BRANCH: ${{ inputs.source_ref }}
 
 jobs:
   audit_test:
@@ -28,7 +34,7 @@ jobs:
       - name: Checkout frozen source branch
         uses: actions/checkout@v7
         with:
-          ref: feature/multipath-capacity-v2-beta6
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 0
           persist-credentials: false
 
