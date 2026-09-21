@@ -124,7 +124,7 @@ jobs:
             'protocol/multipath/capacity_test.go':'77771f4ba211dd193da82a47ef8b051e0b7255660242c6b7e408e37f8d219c9d',
             'protocol/multipath/core.go':'7c1954b34a8a8169c0e0a3de1eecff704ddeeb766b0c1ed3c879d8e3f0526c04',
             'protocol/multipath/memory.go':'ae6b042491830b0b771675a6918f8adbd5e56a2eaa917f2c46e05a3a65001fb0',
-            'protocol/multipath/memory_test.go':'31273d264c6eee28b54eedd96b61e513c8bfa3eff0957b6f24edd4a946e09b67',
+            'protocol/multipath/memory_test.go':'3640928af9507da2bba6fc80069a282966000a1acd6d8ca9c778ec212e44016e',
             'protocol/multipath/scheduler.go':'41bfafbb745466107b3d6bbd594c52575881c5c3382f7889633f9e8d36a1169e',
             'protocol/multipath/stream/path.go':'c1a7d58f03424ad99c0464f6ada7a85b751339cdb7e06c061f7a07223222a2ac',
             'protocol/multipath/stream/receive.go':'4f1b2e12df35b249c8061d4e74aebbcc142c99ad7915c765c982c9fd0da6e10e',
