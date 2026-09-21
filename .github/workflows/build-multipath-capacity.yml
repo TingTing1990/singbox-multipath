@@ -364,7 +364,7 @@ jobs:
           """
           from dataclasses import dataclass, field
           from typing import Callable, Dict, List, Tuple
-          import math, random, json
+          import math, random, json, os
 
           DT = 0.02
           WINDOW = 1.0
@@ -690,8 +690,9 @@ jobs:
                   raise SystemExit(f'FAIL simulator could not kill known-bad {mutant.name} on {case.name}')
 
           out={'formal_simulations':report,'aux_zero':{'preferred_mbps':z.pref_mbps(duration(ZERO)),'booster_mbps':z.booster_mbps(duration(ZERO))},'mutants_killed':killed}
-          with open('/mnt/data/multipath-capacity-v2-independent-sim-results.json','w') as f: json.dump(out,f,indent=2)
-          with open('/mnt/data/multipath-capacity-v2-independent-sim-report.txt','w') as f:
+          output_dir = os.environ.get('RUNNER_TEMP', '.')
+          with open(os.path.join(output_dir, 'multipath-capacity-v2-independent-sim-results.json'),'w') as f: json.dump(out,f,indent=2)
+          with open(os.path.join(output_dir, 'multipath-capacity-v2-independent-sim-report.txt'),'w') as f:
               f.write('10 independent external simulations: PASS\n')
               for row in report: f.write(json.dumps(row,ensure_ascii=False)+'\n')
               f.write('AUX target=0 transparency: PASS\n')
