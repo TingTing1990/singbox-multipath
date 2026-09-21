@@ -68,6 +68,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if chunkSize < 1024 || chunkSize > maxFramePayload {
 		return nil, E.New("invalid chunk_size")
 	}
+	preferredCapacity := newPreferredCapacityController(options.PreferredCapacityMbps, window, chunkSize)
 	queueFrames := int(options.QueueFrames)
 	if queueFrames == 0 {
 		queueFrames = 256
@@ -127,6 +128,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		handshakeTimeout: handshakeTimeout,
 		recoveryGroups:   make(map[[16]byte]*recoveryServerGroup),
 		cfg: coreConfig{
+			PreferredCapacity:              preferredCapacity,
 			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
 			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
 			ChunkSize:                      chunkSize,
@@ -300,7 +302,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			ctx,
 			"multipath leg1 joined data path: side=server destination=", destination,
 			" reconnect=", reconnect,
-			" ", info.String(),
+			" ", activationInfoString(info),
 		)
 	}
 	if group != nil {

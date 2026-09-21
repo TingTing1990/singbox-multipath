@@ -71,6 +71,46 @@ func TestReorderFrameOptionsIndependent(t *testing.T) {
 	}
 }
 
+func TestPreferredCapacityOptionsAreInstanceLocalAndOptional(t *testing.T) {
+	for _, side := range []string{"client", "server"} {
+		cfg, err := reorderOptionsConfig(t, side, `{"preferred_capacity_mbps":70}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.PreferredCapacity == nil || cfg.PreferredCapacity.target() != 8_750_000 {
+			t.Fatalf("%s preferred target=%v, want 8750000 B/s", side, cfg.PreferredCapacity)
+		}
+		baseline, err := reorderOptionsConfig(t, side, `{}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if baseline.PreferredCapacity != nil {
+			t.Fatalf("%s omitted preferred capacity created a controller", side)
+		}
+	}
+
+	client, err := reorderOptionsConfig(t, "client", `{"preferred_capacity_mbps":50}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := reorderOptionsConfig(t, "server", `{"preferred_capacity_mbps":70}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.PreferredCapacity == server.PreferredCapacity {
+		t.Fatal("client and server local-TX capacity controllers must be independent")
+	}
+	if client.PreferredCapacity.target() != 6_250_000 || server.PreferredCapacity.target() != 8_750_000 {
+		t.Fatal("client/server capacity targets are not direction-local")
+	}
+
+	status := newOutboundStatus("", outboundStatusConfig{cfg: client})
+	doc := status.buildDocument(time.Now())
+	if doc.Node.Parameters.PreferredCapacityMbps != 50 || doc.Node.Logical.PreferredCapacity == nil {
+		t.Fatalf("capacity status missing: %+v", doc.Node)
+	}
+}
+
 func TestBandwidthOptionIgnoredWithWarning(t *testing.T) {
 	for _, side := range []string{"client", "server"} {
 		baseline, err := reorderOptionsConfig(t, side, `{"memory_limit":"512MB"}`)

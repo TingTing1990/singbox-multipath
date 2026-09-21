@@ -12,6 +12,7 @@ import (
 
 type coreConfig struct {
 	Recovery                       *recoveryPolicy
+	PreferredCapacity              *preferredCapacityController
 	AggregationEnabled             bool
 	ActivationOnQueue              bool
 	ChunkSize                      int
@@ -52,17 +53,19 @@ const (
 )
 
 type activationInfo struct {
-	Reason           activationReason
-	CurrentBytes     uint64
-	ThresholdBytes   uint64
-	WindowBytes      uint64
-	RateBytesPS      uint64
-	ThresholdBytesPS uint64
-	MinRateBytesPS   uint64
-	Elapsed          time.Duration
-	BacklogBytes     int64
-	QueueBytes       int64
-	RequiredDuration time.Duration
+	Reason                         activationReason
+	CurrentBytes                   uint64
+	ThresholdBytes                 uint64
+	WindowBytes                    uint64
+	RateBytesPS                    uint64
+	ThresholdBytesPS               uint64
+	MinRateBytesPS                 uint64
+	Elapsed                        time.Duration
+	BacklogBytes                   int64
+	QueueBytes                     int64
+	RequiredDuration               time.Duration
+	PreferredCapacityTargetBytesPS uint64
+	PreferredCapacityRateBytesPS   uint64
 }
 
 func (i activationInfo) String() string {
@@ -108,6 +111,19 @@ func (i activationInfo) String() string {
 	}
 }
 
+func activationInfoString(i activationInfo) string {
+	base := i.String()
+	if i.PreferredCapacityTargetBytesPS == 0 {
+		return base
+	}
+	return fmt.Sprintf(
+		"%s preferred_capacity_target_mbps=%.2f preferred_capacity_delivery_mbps=%.2f",
+		base,
+		float64(i.PreferredCapacityTargetBytesPS)*8/1_000_000,
+		float64(i.PreferredCapacityRateBytesPS)*8/1_000_000,
+	)
+}
+
 type mpLegCounters struct {
 	joins    atomic.Uint64 // Successfully attached transports, independent of TX activation.
 	txBytes  atomic.Uint64
@@ -123,37 +139,39 @@ type legShutdownRequest struct {
 }
 
 type mpLeg struct {
-	id                    uint8
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	conn                  net.Conn
-	readPreamble          func(net.Conn) error
-	send                  chan wireFrame
-	queueMu               sync.Mutex
-	ready                 atomic.Bool
-	control               chan wireFrame
-	telemetry             chan struct{}
-	telemetryMu           sync.Mutex
-	telemetryFrame        wireFrame
-	telemetryPending      bool
-	shutdown              chan legShutdownRequest
-	onClose               func(error)
-	done                  chan struct{}
-	writerDone            chan struct{}
-	readerDone            chan struct{}
-	closeOne              sync.Once
-	queuedBytes           atomic.Int64
-	writingBytes          atomic.Int64
-	writeStarted          atomic.Int64
-	transportWriteStarted atomic.Int64
-	feedback              chan wireFrame
-	startupFeedback       *wireFrame
-	path                  stream.Path
-	busy                  bool
-	received              stream.Receipt
-	inflight              atomic.Int64
-	prepaidFlights        int
-	peerTerminal          atomic.Bool
+	id                         uint8
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	conn                       net.Conn
+	readPreamble               func(net.Conn) error
+	send                       chan wireFrame
+	queueMu                    sync.Mutex
+	ready                      atomic.Bool
+	control                    chan wireFrame
+	telemetry                  chan struct{}
+	telemetryMu                sync.Mutex
+	telemetryFrame             wireFrame
+	telemetryPending           bool
+	shutdown                   chan legShutdownRequest
+	onClose                    func(error)
+	done                       chan struct{}
+	writerDone                 chan struct{}
+	readerDone                 chan struct{}
+	closeOne                   sync.Once
+	queuedBytes                atomic.Int64
+	writingBytes               atomic.Int64
+	writeStarted               atomic.Int64
+	transportWriteStarted      atomic.Int64
+	feedback                   chan wireFrame
+	startupFeedback            *wireFrame
+	path                       stream.Path
+	busy                       bool
+	received                   stream.Receipt
+	inflight                   atomic.Int64
+	prepaidFlights             int
+	peerTerminal               atomic.Bool
+	preferredCapacityRanges    []preferredCapacityPathRange
+	preferredCapacityRangeHead int
 }
 
 type mpCore struct {

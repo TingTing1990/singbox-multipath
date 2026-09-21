@@ -448,21 +448,24 @@ type statusFrames struct {
 }
 
 type statusActivation struct {
-	Reason             string `json:"reason"`
-	At                 string `json:"at"`
-	CurrentBytes       uint64 `json:"current_bytes,omitempty"`
-	ThresholdBytes     uint64 `json:"threshold_bytes,omitempty"`
-	WindowBytes        uint64 `json:"window_bytes,omitempty"`
-	RateBytesPS        uint64 `json:"rate_bytes_per_second,omitempty"`
-	ThresholdBytesPS   uint64 `json:"threshold_bytes_per_second,omitempty"`
-	MinRateBytesPS     uint64 `json:"min_rate_bytes_per_second,omitempty"`
-	ElapsedMS          int64  `json:"elapsed_ms,omitempty"`
-	BacklogBytes       int64  `json:"backlog_bytes,omitempty"`
-	QueueBytes         int64  `json:"queue_bytes,omitempty"`
-	RequiredDurationMS int64  `json:"required_duration_ms,omitempty"`
+	Reason                       string `json:"reason"`
+	At                           string `json:"at"`
+	CurrentBytes                 uint64 `json:"current_bytes,omitempty"`
+	ThresholdBytes               uint64 `json:"threshold_bytes,omitempty"`
+	WindowBytes                  uint64 `json:"window_bytes,omitempty"`
+	RateBytesPS                  uint64 `json:"rate_bytes_per_second,omitempty"`
+	ThresholdBytesPS             uint64 `json:"threshold_bytes_per_second,omitempty"`
+	MinRateBytesPS               uint64 `json:"min_rate_bytes_per_second,omitempty"`
+	ElapsedMS                    int64  `json:"elapsed_ms,omitempty"`
+	BacklogBytes                 int64  `json:"backlog_bytes,omitempty"`
+	QueueBytes                   int64  `json:"queue_bytes,omitempty"`
+	RequiredDurationMS           int64  `json:"required_duration_ms,omitempty"`
+	PreferredCapacityTargetMbps  uint64 `json:"preferred_capacity_target_mbps,omitempty"`
+	PreferredCapacityRateBytesPS uint64 `json:"preferred_capacity_rate_bytes_per_second,omitempty"`
 }
 
 type statusParameters struct {
+	PreferredCapacityMbps       uint64 `json:"preferred_capacity_mbps,omitempty"`
 	AggregationEnabled          bool   `json:"aggregation_enabled"`
 	ActivationOnQueue           bool   `json:"activation_on_queue"`
 	ActivationThresholdMbps     uint64 `json:"activation_threshold_mbps"`
@@ -478,6 +481,14 @@ type statusParameters struct {
 	Leg1ReplayTimeoutMS         int64  `json:"leg1_replay_timeout_ms"`
 	MemoryLimitBytes            int64  `json:"memory_limit_bytes"`
 	HandshakeTimeoutMS          int64  `json:"handshake_timeout_ms"`
+}
+
+type statusPreferredCapacity struct {
+	TargetMbps              uint64 `json:"target_mbps"`
+	PreferredDeliveredBytes uint64 `json:"preferred_delivered_bytes"`
+	DeliveryBytesPS         uint64 `json:"delivery_bytes_per_second"`
+	Ready                   bool   `json:"ready"`
+	AssignmentCreditBytes   int64  `json:"assignment_credit_bytes"`
 }
 
 type statusMemory struct {
@@ -517,24 +528,25 @@ type statusSenderDiagnostics struct {
 }
 
 type statusLogical struct {
-	State                    string                  `json:"state"`
-	Connections              int                     `json:"connections"`
-	ConnectionsTotal         uint64                  `json:"connections_total"`
-	PreferredOnlyConnections int                     `json:"preferred_only_connections"`
-	TXAggregatingConnections int                     `json:"tx_aggregating_connections"`
-	RXAggregatingConnections int                     `json:"rx_aggregating_connections"`
-	BoosterDegraded          int                     `json:"booster_degraded_connections"`
-	Current                  statusRate              `json:"current"`
-	Peak                     statusPeakRate          `json:"peak"`
-	Cumulative               statusTraffic           `json:"cumulative"`
-	ReplayBytes              int64                   `json:"replay_bytes"`
-	ReorderBytes             int64                   `json:"reorder_bytes"`
-	ReorderFrames            int64                   `json:"reorder_pages"`
-	ReorderPeakBytes         int64                   `json:"reorder_peak_bytes"`
-	ReorderPeakFrames        int64                   `json:"reorder_peak_pages"`
-	LocalSender              statusSenderDiagnostics `json:"local_sender"`
-	RemoteSender             statusSenderDiagnostics `json:"remote_sender"`
-	LastActivation           *statusActivation       `json:"last_activation,omitempty"`
+	State                    string                   `json:"state"`
+	Connections              int                      `json:"connections"`
+	ConnectionsTotal         uint64                   `json:"connections_total"`
+	PreferredOnlyConnections int                      `json:"preferred_only_connections"`
+	TXAggregatingConnections int                      `json:"tx_aggregating_connections"`
+	RXAggregatingConnections int                      `json:"rx_aggregating_connections"`
+	BoosterDegraded          int                      `json:"booster_degraded_connections"`
+	Current                  statusRate               `json:"current"`
+	Peak                     statusPeakRate           `json:"peak"`
+	Cumulative               statusTraffic            `json:"cumulative"`
+	ReplayBytes              int64                    `json:"replay_bytes"`
+	ReorderBytes             int64                    `json:"reorder_bytes"`
+	ReorderFrames            int64                    `json:"reorder_pages"`
+	ReorderPeakBytes         int64                    `json:"reorder_peak_bytes"`
+	ReorderPeakFrames        int64                    `json:"reorder_peak_pages"`
+	LocalSender              statusSenderDiagnostics  `json:"local_sender"`
+	RemoteSender             statusSenderDiagnostics  `json:"remote_sender"`
+	PreferredCapacity        *statusPreferredCapacity `json:"preferred_capacity,omitempty"`
+	LastActivation           *statusActivation        `json:"last_activation,omitempty"`
 }
 
 type statusFlow struct {
@@ -683,18 +695,20 @@ func activationStatus(info activationInfo, at time.Time) *statusActivation {
 		return nil
 	}
 	return &statusActivation{
-		Reason:             string(info.Reason),
-		At:                 at.Format(time.RFC3339Nano),
-		CurrentBytes:       info.CurrentBytes,
-		ThresholdBytes:     info.ThresholdBytes,
-		WindowBytes:        info.WindowBytes,
-		RateBytesPS:        info.RateBytesPS,
-		ThresholdBytesPS:   info.ThresholdBytesPS,
-		MinRateBytesPS:     info.MinRateBytesPS,
-		ElapsedMS:          info.Elapsed.Milliseconds(),
-		BacklogBytes:       info.BacklogBytes,
-		QueueBytes:         info.QueueBytes,
-		RequiredDurationMS: info.RequiredDuration.Milliseconds(),
+		Reason:                       string(info.Reason),
+		At:                           at.Format(time.RFC3339Nano),
+		CurrentBytes:                 info.CurrentBytes,
+		ThresholdBytes:               info.ThresholdBytes,
+		WindowBytes:                  info.WindowBytes,
+		RateBytesPS:                  info.RateBytesPS,
+		ThresholdBytesPS:             info.ThresholdBytesPS,
+		MinRateBytesPS:               info.MinRateBytesPS,
+		ElapsedMS:                    info.Elapsed.Milliseconds(),
+		BacklogBytes:                 info.BacklogBytes,
+		QueueBytes:                   info.QueueBytes,
+		RequiredDurationMS:           info.RequiredDuration.Milliseconds(),
+		PreferredCapacityTargetMbps:  info.PreferredCapacityTargetBytesPS * 8 / 1_000_000,
+		PreferredCapacityRateBytesPS: info.PreferredCapacityRateBytesPS,
 	}
 }
 
@@ -760,6 +774,7 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 
 	memorySnapshot := s.config.cfg.Memory.snapshot()
 	parameters := statusParameters{
+		PreferredCapacityMbps:       s.config.cfg.PreferredCapacity.targetMbps(),
 		AggregationEnabled:          s.config.cfg.AggregationEnabled,
 		ActivationOnQueue:           s.config.cfg.ActivationOnQueue,
 		ActivationThresholdMbps:     s.config.cfg.ThresholdBytesPS * 8 / 1_000_000,
@@ -825,6 +840,16 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 			BackpressureEvents:     remoteSenderTotals.backpressureEvents,
 			BackpressureDurationMS: remoteSenderTotals.backpressureNanos / uint64(time.Millisecond),
 		},
+	}
+	if controller := s.config.cfg.PreferredCapacity; controller != nil {
+		capacity := controller.snapshot()
+		logical.PreferredCapacity = &statusPreferredCapacity{
+			TargetMbps:              capacity.TargetBytesPS * 8 / 1_000_000,
+			PreferredDeliveredBytes: capacity.DeliveredBytes,
+			DeliveryBytesPS:         capacity.DeliveryRate,
+			Ready:                   capacity.DeliveryReady,
+			AssignmentCreditBytes:   capacity.CreditBytes,
+		}
 	}
 	legs := []statusLeg{
 		{

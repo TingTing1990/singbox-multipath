@@ -77,11 +77,13 @@ func (c *mpCore) pumpLoop() {
 			if !ok {
 				break
 			}
-			leg := c.choosePathLocked(segment.Length)
-			if leg == nil {
+			selection := c.choosePathForSubmitLocked(segment.Length, now)
+			if selection.leg == nil {
 				break
 			}
-			if pumpErr = c.submitLocked(leg, segment, false, now); pumpErr != nil {
+			pumpErr = c.submitLocked(selection.leg, segment, false, now)
+			selection.finish(pumpErr)
+			if pumpErr != nil {
 				break
 			}
 		}
@@ -149,6 +151,11 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 		if err := leg.path.Feedback(message.Paths[leg.id], now); err != nil {
 			return err
 		}
+		if leg.id == 0 && c.cfg.PreferredCapacity != nil {
+			if delivered := leg.confirmPreferredCapacityDelivery(leg.path.Received); delivered > 0 {
+				c.cfg.PreferredCapacity.observePreferredDelivery(delivered, now)
+			}
+		}
 		leg.inflight.Store(int64(leg.path.Outstanding()))
 	}
 	for c.mappingHead < len(c.mappings) && c.mappings[c.mappingHead].end <= c.tx.Una {
@@ -210,6 +217,63 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	return chosen
 }
 
+type pathSelection struct {
+	leg         *mpLeg
+	reservation *preferredCapacityReservation
+}
+
+func (s pathSelection) finish(err error) {
+	if err != nil && s.reservation != nil {
+		s.reservation.refund()
+	}
+}
+
+// choosePathForSubmitLocked starts from the unchanged beta6 scheduler and adds
+// only an instance-shared aggregate preferred reservation. It never waits solely
+// to satisfy the reservation: if preferred is busy/full/unavailable, the
+// original candidate remains usable so booster can carry excess demand.
+func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelection {
+	chosen := c.choosePathLocked(length)
+	controller := c.cfg.PreferredCapacity
+	if controller == nil || chosen == nil {
+		return pathSelection{leg: chosen}
+	}
+
+	// Every normal preferred assignment, including preferred-only connections,
+	// consumes the one shared instance target. This is what prevents N logical
+	// sessions from each receiving an independent N x target reservation.
+	if chosen.id == 0 {
+		_, reservation := controller.reserveAssignment(now, length, true, false)
+		return pathSelection{leg: chosen, reservation: reservation}
+	}
+
+	// Before this connection's original beta6 activation condition fires, the
+	// capacity feature must not create a second path decision of its own. A leg1
+	// candidate here can only be an existing recovery/failover decision.
+	if !c.active.Load() {
+		return pathSelection{leg: chosen}
+	}
+	if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(0) {
+		return pathSelection{leg: chosen}
+	}
+
+	preferred := c.getLeg(0)
+	if preferred == nil || preferred.path.Stale || preferred.busy || !preferred.ready.Load() {
+		return pathSelection{leg: chosen}
+	}
+	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
+	pipeline := preferred.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
+	if preferred.path.Outstanding()+uint64(length) > pipeline {
+		return pathSelection{leg: chosen}
+	}
+
+	force, reservation := controller.reserveAssignment(now, length, false, true)
+	if force {
+		return pathSelection{leg: preferred, reservation: reservation}
+	}
+	return pathSelection{leg: chosen}
+}
+
 func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, now time.Time) error {
 	prepaid := false
 	essential := leg.id == 0 || (c.cfg.Recovery != nil && c.controlLeg() == leg)
@@ -234,6 +298,9 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 			seq: segment.Seq, end: segment.End(), path: leg.id, generation: leg.path.Generation,
 			pathEnd: pathSeq + uint64(segment.Length), sentAt: now,
 		})
+		if leg.id == 0 && c.cfg.PreferredCapacity != nil {
+			leg.recordPreferredCapacityRange(pathSeq, segment.Length)
+		}
 	}
 	segment.Buffer.Retain()
 	frame := wireFrame{typ: frameTypeData, seq: segment.Seq, pathSeq: pathSeq, generation: leg.path.Generation, data: segment.Data(), buffer: segment.Buffer, replay: repair}

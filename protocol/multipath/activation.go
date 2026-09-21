@@ -37,8 +37,10 @@ func (c *mpCore) activationLoop() {
 			if c.active.Load() {
 				return
 			}
+			capacity := c.preferredCapacityActivationState(now)
 			bytesNow := c.ingressBytes.Load()
-			if info, ok := activationAfterBytes(c.cfg, bytesNow, windowBase, now.Sub(windowStart)); ok {
+			if info, ok := activationAfterBytes(c.cfg, bytesNow, windowBase, now.Sub(windowStart)); ok && capacity.DeliveryReady {
+				c.attachPreferredCapacityActivation(&info, capacity)
 				c.activate(info)
 				return
 			}
@@ -49,14 +51,16 @@ func (c *mpCore) activationLoop() {
 				if elapsed > 0 {
 					rate = uint64(float64(delta) / elapsed.Seconds())
 				}
-				if c.cfg.ThresholdBytesPS > 0 && rate >= c.cfg.ThresholdBytesPS {
-					c.activate(activationInfo{
+				if c.cfg.ThresholdBytesPS > 0 && rate >= c.cfg.ThresholdBytesPS && capacity.DeliveryReady {
+					info := activationInfo{
 						Reason:           activationReasonThroughput,
 						WindowBytes:      delta,
 						RateBytesPS:      rate,
 						ThresholdBytesPS: c.cfg.ThresholdBytesPS,
 						Elapsed:          elapsed,
-					})
+					}
+					c.attachPreferredCapacityActivation(&info, capacity)
+					c.activate(info)
 					return
 				}
 				windowStart = now
@@ -75,14 +79,16 @@ func (c *mpCore) activationLoop() {
 			if backlogBytes*5 >= c.cfg.QueueBytes*4 {
 				if queueHighSince.IsZero() {
 					queueHighSince = now
-				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow {
-					c.activate(activationInfo{
+				} else if now.Sub(queueHighSince) >= c.cfg.ActivationWindow && capacity.DeliveryReady {
+					info := activationInfo{
 						Reason:           activationReasonLeg0Queue,
 						BacklogBytes:     backlogBytes,
 						QueueBytes:       c.cfg.QueueBytes,
 						Elapsed:          now.Sub(queueHighSince),
 						RequiredDuration: c.cfg.ActivationWindow,
-					})
+					}
+					c.attachPreferredCapacityActivation(&info, capacity)
+					c.activate(info)
 					return
 				}
 			} else {
@@ -90,6 +96,31 @@ func (c *mpCore) activationLoop() {
 			}
 		}
 	}
+}
+
+func (c *mpCore) preferredCapacityActivationState(now time.Time) preferredCapacitySnapshot {
+	controller := c.cfg.PreferredCapacity
+	if controller == nil {
+		return preferredCapacitySnapshot{DeliveryReady: true}
+	}
+	// A true failover state must not wait for a path the recovery policy has
+	// already declared unavailable. Normal busy/backpressure is not failover.
+	if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(0) {
+		return preferredCapacitySnapshot{DeliveryReady: true}
+	}
+	return controller.capacityState(now)
+}
+
+func (c *mpCore) preferredCapacityActivationReady(now time.Time) bool {
+	return c.preferredCapacityActivationState(now).DeliveryReady
+}
+
+func (c *mpCore) attachPreferredCapacityActivation(info *activationInfo, capacity preferredCapacitySnapshot) {
+	if info == nil || c.cfg.PreferredCapacity == nil {
+		return
+	}
+	info.PreferredCapacityTargetBytesPS = capacity.TargetBytesPS
+	info.PreferredCapacityRateBytesPS = capacity.DeliveryRate
 }
 
 func activationAfterBytes(cfg coreConfig, bytesNow, windowBase uint64, elapsed time.Duration) (activationInfo, bool) {

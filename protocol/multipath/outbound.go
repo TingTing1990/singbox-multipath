@@ -92,6 +92,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if chunkSize < 1024 || chunkSize > maxFramePayload {
 		return nil, E.New("invalid chunk_size")
 	}
+	preferredCapacity := newPreferredCapacityController(options.PreferredCapacityMbps, window, chunkSize)
 	queueFrames := int(options.QueueFrames)
 	if queueFrames == 0 {
 		queueFrames = 256
@@ -160,6 +161,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		failoverTimeout:  failoverTimeout,
 		failbackDelay:    failbackDelay,
 		cfg: coreConfig{
+			PreferredCapacity:              preferredCapacity,
 			AggregationEnabled:             options.AggregationEnabled == nil || *options.AggregationEnabled,
 			ActivationOnQueue:              options.ActivationOnQueue == nil || *options.ActivationOnQueue,
 			ChunkSize:                      chunkSize,
@@ -382,7 +384,7 @@ func (o *Outbound) connectionCoreConfig(ctx context.Context, destination M.Socks
 			"multipath leg1 joined data path: side=client destination=", destination,
 			" outbound=", o.tags[1],
 			" reconnect=", reconnect,
-			" ", info.String(),
+			" ", activationInfoString(info),
 		)
 	}
 	cfg.OnLegFailure = func(legID uint8, stage legFailureStage, err error) {
