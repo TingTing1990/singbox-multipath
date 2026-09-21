@@ -11,20 +11,28 @@ func automaticBufferLimit(b *memoryBudget, chunk int) int64 {
 }
 
 func (b *memoryBudget) reservePage(size int64, head bool) bool {
-	b.access.Lock()
-	defer b.access.Unlock()
-	limit := b.boosterLimit
-	if head {
-		limit = b.limit
+	for {
+		b.access.Lock()
+		now := time.Now()
+		b.noteActivityLocked(now)
+		limit := b.boosterLimit
+		if head {
+			limit = b.limit
+		}
+		if b.used+size <= limit {
+			b.used += size
+			b.updatePressureLocked(now)
+			b.access.Unlock()
+			return true
+		}
+		detached := b.detachCachedBytesLocked(b.used + size - limit)
+		pending := b.pendingReclaim
+		if detached == 0 && pending == 0 {
+			b.enterPressureLocked(now)
+			b.access.Unlock()
+			return false
+		}
+		b.access.Unlock()
+		b.scavengePending(false)
 	}
-	if b.used+size > limit && b.cached > 0 {
-		b.dropCacheLocked()
-	}
-	if b.used+size > limit {
-		b.enterPressureLocked(time.Now())
-		return false
-	}
-	b.used += size
-	b.updatePressureLocked(time.Now())
-	return true
 }

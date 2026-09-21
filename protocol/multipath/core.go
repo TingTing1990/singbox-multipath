@@ -102,7 +102,7 @@ func (c *mpCore) Release(head bool) {
 			return
 		}
 	}
-	c.memory.releaseSession(stream.PageCharge)
+	c.memory.releasePage(stream.PageCharge)
 }
 
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
