@@ -120,13 +120,39 @@ jobs:
           class Fail(Exception): pass
           
           def tracked(root):
-              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-z'])
-              return [root/x.decode() for x in raw.split(b'\0') if x]
+              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
+              entries=[]
+              for record in raw.split(b'\0'):
+                  if not record:
+                      continue
+                  meta,path_b=record.split(b'\t',1)
+                  mode_b,oid_b,stage_b=meta.split()
+                  if stage_b != b'0':
+                      raise Fail(f'unmerged index entry: {os.fsdecode(path_b)} stage={stage_b.decode()}')
+                  entries.append((os.fsdecode(path_b),mode_b.decode(),oid_b.decode()))
+              return sorted(entries,key=lambda x:x[0])
+          def tracked_payload(root,rel,mode,oid):
+              p=root/rel
+              if mode == '160000':
+                  # Git submodule/gitlink: the tracked source is the commit OID, while the
+                  # checkout path is a directory. Never call read_bytes() on that directory.
+                  return b'gitlink:' + oid.encode()
+              if mode == '120000':
+                  if not p.is_symlink():
+                      raise Fail(f'tracked symlink missing or materialized incorrectly: {rel}')
+                  return os.readlink(p).encode('utf-8','surrogateescape')
+              if not p.is_file():
+                  raise Fail(f'tracked regular file is not a file: {rel} mode={mode}')
+              return p.read_bytes()
           def tree_digest(root):
               h=hashlib.sha256(); n=0; total=0
-              for p in sorted(tracked(root), key=lambda p:p.relative_to(root).as_posix()):
-                  rel=p.relative_to(root).as_posix().encode(); b=p.read_bytes(); n+=1; total+=len(b)
-                  h.update(len(rel).to_bytes(8,'big')); h.update(rel); h.update(len(b).to_bytes(8,'big')); h.update(b)
+              for rel,mode,oid in tracked(root):
+                  rel_b=rel.encode('utf-8','surrogateescape'); mode_b=mode.encode(); b=tracked_payload(root,rel,mode,oid)
+                  n+=1
+                  if mode != '160000': total+=len(b)
+                  h.update(len(rel_b).to_bytes(8,'big')); h.update(rel_b)
+                  h.update(len(mode_b).to_bytes(8,'big')); h.update(mode_b)
+                  h.update(len(b).to_bytes(8,'big')); h.update(b)
               return n,total,h.hexdigest()
           def scan_full_tree(): return tree_digest(ROOT)
           def text(rel): return (ROOT/rel).read_text(encoding='utf-8')
@@ -134,8 +160,8 @@ jobs:
           def require(c,msg):
               if not c: raise Fail(msg)
           def diffsets(a,b):
-              af={p.relative_to(a).as_posix():p for p in tracked(a)}; bf={p.relative_to(b).as_posix():p for p in tracked(b)}
-              added=set(bf)-set(af); removed=set(af)-set(bf); modified={k for k in set(af)&set(bf) if af[k].read_bytes()!=bf[k].read_bytes()}
+              af={rel:(mode,oid) for rel,mode,oid in tracked(a)}; bf={rel:(mode,oid) for rel,mode,oid in tracked(b)}
+              added=set(bf)-set(af); removed=set(af)-set(bf); modified={k for k in set(af)&set(bf) if af[k]!=bf[k]}
               return modified,added,removed
           def extract_func(src,sig):
               start=src.index(sig); brace=src.index('{',start); depth=0
