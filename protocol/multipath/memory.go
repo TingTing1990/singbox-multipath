@@ -97,6 +97,7 @@ type memoryBudget struct {
 	pendingReclaim    int64
 	garbageHintBytes  int64
 	scavenging        bool
+	scavengeQueued    bool
 
 	changed chan struct{}
 	events  chan memoryPressureEvent
@@ -243,11 +244,26 @@ func (b *memoryBudget) detachCachedBytesLocked(requested int64) int64 {
 // scavengePending performs the expensive process-wide GC/scavenge without
 // holding the memory-budget mutex. Detached slabs remain charged in b.used for
 // the entire scavenge, so concurrent callers cannot spend their credit early.
+// queueScavengeLocked schedules a reclaim cycle without blocking the caller.
+// It is used by data-plane admission paths which may execute while another
+// protocol lock is held. At most one queued cycle exists per budget.
+// Caller holds b.access.
+func (b *memoryBudget) queueScavengeLocked() {
+	if b == nil || b.scavengeQueued || b.scavenging || b.pendingReclaim == 0 {
+		return
+	}
+	b.scavengeQueued = true
+	go b.scavengePending(false)
+}
+
 func (b *memoryBudget) scavengePending(includeGarbageHint bool) int64 {
 	if b == nil {
 		return 0
 	}
 	b.access.Lock()
+	// A queued worker owns this flag until it reaches this critical section,
+	// eliminating duplicate process-wide scavenges before b.scavenging is visible.
+	b.scavengeQueued = false
 	if b.scavenging || b.pendingReclaim == 0 && (!includeGarbageHint || b.garbageHintBytes == 0) {
 		b.access.Unlock()
 		return 0
@@ -297,37 +313,39 @@ func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
 	if b == nil || size <= 0 {
 		return nil, nil
 	}
-	for {
-		b.access.Lock()
-		now := time.Now()
-		b.noteActivityLocked(now)
-		if buffer := b.takeCachedLocked(size); buffer != nil {
-			b.updatePressureLocked(now)
-			b.access.Unlock()
-			return buffer, nil
-		}
-		if b.used+int64(size) <= b.limit {
-			b.used += int64(size)
-			b.freshAllocations++
-			b.updatePressureLocked(now)
-			b.access.Unlock()
-			return make([]byte, size), nil
-		}
-		// Size-class fragmentation may leave charged reusable slabs which cannot
-		// satisfy this request. Detach enough of them, but keep their credit charged
-		// until scavenge completes.
-		detached := b.detachCachedBytesLocked(b.used + int64(size) - b.limit)
-		pending := b.pendingReclaim
-		if detached == 0 && pending == 0 {
-			b.waitCount++
-			b.enterPressureLocked(now)
-			changed := b.changed
-			b.access.Unlock()
-			return nil, changed
-		}
+	b.access.Lock()
+	now := time.Now()
+	b.noteActivityLocked(now)
+	if buffer := b.takeCachedLocked(size); buffer != nil {
+		b.updatePressureLocked(now)
 		b.access.Unlock()
-		b.scavengePending(false)
+		return buffer, nil
 	}
+	if b.used+int64(size) <= b.limit {
+		b.used += int64(size)
+		b.freshAllocations++
+		b.updatePressureLocked(now)
+		b.access.Unlock()
+		return make([]byte, size), nil
+	}
+
+	// Data-plane allocation must not run a process-wide forced GC inline. This
+	// function is also used by recovery assembly while its own mutex is held.
+	// Detach incompatible cached slabs, queue one background reclaim cycle, and
+	// return the existing change notification so blocking callers sleep instead
+	// of spinning. Best-effort callers may drop this attempt and rely on protocol
+	// retransmission/recovery.
+	if !b.scavenging {
+		b.detachCachedBytesLocked(b.used + int64(size) - b.limit)
+	}
+	if b.pendingReclaim > 0 {
+		b.queueScavengeLocked()
+	}
+	b.waitCount++
+	b.enterPressureLocked(now)
+	changed := b.changed
+	b.access.Unlock()
+	return nil, changed
 }
 
 // The caller has already charged a reusable session scratch/TX reservation.
@@ -392,6 +410,12 @@ func (b *memoryBudget) reserveSession(bytes int64) bool {
 			b.updatePressureLocked(now)
 			b.access.Unlock()
 			return true
+		}
+		if b.scavenging {
+			changed := b.changed
+			b.access.Unlock()
+			<-changed
+			continue
 		}
 		detached := b.detachCachedBytesLocked(b.used + bytes - b.limit)
 		pending := b.pendingReclaim
