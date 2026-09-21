@@ -1,14 +1,17 @@
 package multipath
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
 
 const (
-	preferredCapacityDebtChunks     = 2
-	preferredCapacitySurplusChunks  = 4
-	preferredCapacityDegradeWindows = 3
+	preferredCapacityDebtChunks      = 2
+	preferredCapacitySurplusChunks   = 4
+	preferredCapacityDegradeWindows  = 3
+	preferredCapacityAuditSchema     = 1
+	preferredCapacityAuditQueueLimit = 1024
 )
 
 // preferredCapacityController belongs to exactly one configured multipath
@@ -76,6 +79,16 @@ type preferredCapacityController struct {
 	// post-activation floor after genuine physical degradation.
 	creditLast time.Time
 	credit     float64
+
+	// Server FIELD audit is observability-only. It is enabled only by the
+	// multipath inbound and stores bounded decision/window evidence for the
+	// inbound's existing status goroutine to drain into the normal server log.
+	// No audit callback is invoked while the controller lock is held.
+	auditEnabled        bool
+	auditSequence       uint64
+	auditWindowSequence uint64
+	auditDropped        uint64
+	auditEvents         []preferredCapacityAuditEvent
 }
 
 type preferredCapacityReservation struct {
@@ -95,6 +108,90 @@ type preferredCapacitySnapshot struct {
 	ProtectionActive bool
 	DegradeWindows   int
 	CreditBytes      int64
+	WindowSequence   uint64
+	RecoveryBypass   bool
+}
+
+type preferredCapacityAuditEventKind string
+
+const (
+	preferredCapacityAuditReady             preferredCapacityAuditEventKind = "CAP_AUDIT_READY"
+	preferredCapacityAuditGateBlocked       preferredCapacityAuditEventKind = "CAP_GATE_BLOCKED"
+	preferredCapacityAuditGateOpened        preferredCapacityAuditEventKind = "CAP_GATE_OPENED"
+	preferredCapacityAuditProtectionArmed   preferredCapacityAuditEventKind = "CAP_PROTECTION_ARMED"
+	preferredCapacityAuditWindow            preferredCapacityAuditEventKind = "CAP_WINDOW"
+	preferredCapacityAuditProtectionChanged preferredCapacityAuditEventKind = "CAP_PROTECTION_CHANGED"
+)
+
+type preferredCapacityAuditEvent struct {
+	Sequence              uint64
+	Kind                  preferredCapacityAuditEventKind
+	At                    time.Time
+	SessionID             string
+	Destination           string
+	OriginalTrigger       activationReason
+	OriginalTriggerOK     bool
+	RecoveryBypass        bool
+	CurrentBytes          uint64
+	ThresholdBytes        uint64
+	WindowBytes           uint64
+	TriggerRateBytesPS    uint64
+	TriggerThresholdBPS   uint64
+	BacklogBytes          int64
+	QueueBytes            int64
+	TargetBytesPS         uint64
+	DeliveryRate          uint64
+	DeliveryReady         bool
+	ProtectedBytesPS      uint64
+	ProtectionValid       bool
+	ProtectionActive      bool
+	AssignmentRate        uint64
+	DegradeWindows        int
+	NormalBoosterAdmitted bool
+	OldProtectedBytesPS   uint64
+	NewProtectedBytesPS   uint64
+	ChangeReason          string
+	WindowSequence        uint64
+}
+
+func (e preferredCapacityAuditEvent) logLine(instance string) string {
+	trigger := string(e.OriginalTrigger)
+	if trigger == "" {
+		trigger = "none"
+	}
+	return fmt.Sprintf(
+		"CAP_AUDIT schema_version=%d event_seq=%d event=%s side=server instance=%q session_id=%q destination=%q at=%s original_trigger=%s original_trigger_satisfied=%t recovery_bypass=%t target_mbps=%.2f delivery_mbps=%.2f delivery_ready=%t protected_mbps=%.2f protection_valid=%t protection_active=%t preferred_assignment_mbps=%.2f degrade_windows=%d normal_booster_admitted=%t current_bytes=%d threshold_bytes=%d trigger_window_bytes=%d trigger_rate_mbps=%.2f trigger_threshold_mbps=%.2f backlog_bytes=%d queue_bytes=%d old_protected_mbps=%.2f new_protected_mbps=%.2f change_reason=%s controller_window_seq=%d",
+		preferredCapacityAuditSchema,
+		e.Sequence,
+		e.Kind,
+		instance,
+		e.SessionID,
+		e.Destination,
+		e.At.Format(time.RFC3339Nano),
+		trigger,
+		e.OriginalTriggerOK,
+		e.RecoveryBypass,
+		float64(e.TargetBytesPS)*8/1_000_000,
+		float64(e.DeliveryRate)*8/1_000_000,
+		e.DeliveryReady,
+		float64(e.ProtectedBytesPS)*8/1_000_000,
+		e.ProtectionValid,
+		e.ProtectionActive,
+		float64(e.AssignmentRate)*8/1_000_000,
+		e.DegradeWindows,
+		e.NormalBoosterAdmitted,
+		e.CurrentBytes,
+		e.ThresholdBytes,
+		e.WindowBytes,
+		float64(e.TriggerRateBytesPS)*8/1_000_000,
+		float64(e.TriggerThresholdBPS)*8/1_000_000,
+		e.BacklogBytes,
+		e.QueueBytes,
+		float64(e.OldProtectedBytesPS)*8/1_000_000,
+		float64(e.NewProtectedBytesPS)*8/1_000_000,
+		e.ChangeReason,
+		e.WindowSequence,
+	)
 }
 
 // preferredCapacityPathRange is per-leg receipt bookkeeping, not capacity
@@ -103,6 +200,127 @@ type preferredCapacitySnapshot struct {
 type preferredCapacityPathRange struct {
 	next uint64
 	end  uint64
+}
+
+func (c *preferredCapacityController) enableAudit() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.auditEnabled = true
+	c.mu.Unlock()
+}
+
+func (c *preferredCapacityController) auditEventLocked(kind preferredCapacityAuditEventKind, now time.Time, snapshot preferredCapacitySnapshot) preferredCapacityAuditEvent {
+	return preferredCapacityAuditEvent{
+		Kind:                  kind,
+		At:                    now,
+		RecoveryBypass:        snapshot.RecoveryBypass,
+		TargetBytesPS:         snapshot.TargetBytesPS,
+		DeliveryRate:          snapshot.DeliveryRate,
+		DeliveryReady:         snapshot.DeliveryReady,
+		ProtectedBytesPS:      snapshot.ProtectedBytesPS,
+		ProtectionValid:       snapshot.ProtectionValid,
+		ProtectionActive:      snapshot.ProtectionActive,
+		AssignmentRate:        snapshot.AssignmentRate,
+		DegradeWindows:        snapshot.DegradeWindows,
+		NormalBoosterAdmitted: snapshot.ProtectionActive,
+		WindowSequence:        snapshot.WindowSequence,
+	}
+}
+
+func (c *preferredCapacityController) appendAuditLocked(event preferredCapacityAuditEvent) {
+	if !c.auditEnabled {
+		return
+	}
+	if event.At.IsZero() {
+		event.At = time.Now()
+	}
+	if len(c.auditEvents) >= preferredCapacityAuditQueueLimit {
+		c.auditDropped++
+		return
+	}
+	c.auditSequence++
+	event.Sequence = c.auditSequence
+	c.auditEvents = append(c.auditEvents, event)
+}
+
+func (c *preferredCapacityController) recordAuditReady(now time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	snapshot := c.snapshotLocked()
+	c.appendAuditLocked(c.auditEventLocked(preferredCapacityAuditReady, now, snapshot))
+	c.mu.Unlock()
+}
+
+func (c *preferredCapacityController) recordGateDecision(now time.Time, info activationInfo, snapshot preferredCapacitySnapshot, opened bool, sessionID, destination string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	kind := preferredCapacityAuditGateBlocked
+	if opened {
+		kind = preferredCapacityAuditGateOpened
+	}
+	event := c.auditEventLocked(kind, now, snapshot)
+	event.SessionID = sessionID
+	event.Destination = destination
+	event.OriginalTrigger = info.Reason
+	event.OriginalTriggerOK = true
+	event.CurrentBytes = info.CurrentBytes
+	event.ThresholdBytes = info.ThresholdBytes
+	event.WindowBytes = info.WindowBytes
+	event.TriggerRateBytesPS = info.RateBytesPS
+	event.TriggerThresholdBPS = info.ThresholdBytesPS
+	if info.MinRateBytesPS > event.TriggerThresholdBPS {
+		event.TriggerThresholdBPS = info.MinRateBytesPS
+	}
+	event.BacklogBytes = info.BacklogBytes
+	event.QueueBytes = info.QueueBytes
+	event.NormalBoosterAdmitted = opened && !snapshot.RecoveryBypass
+	c.appendAuditLocked(event)
+	c.mu.Unlock()
+}
+
+func (c *preferredCapacityController) recordProtectionArmed(now time.Time, info activationInfo, snapshot preferredCapacitySnapshot, sessionID, destination string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	event := c.auditEventLocked(preferredCapacityAuditProtectionArmed, now, snapshot)
+	event.SessionID = sessionID
+	event.Destination = destination
+	event.OriginalTrigger = info.Reason
+	event.OriginalTriggerOK = true
+	event.CurrentBytes = info.CurrentBytes
+	event.ThresholdBytes = info.ThresholdBytes
+	event.WindowBytes = info.WindowBytes
+	event.TriggerRateBytesPS = info.RateBytesPS
+	event.TriggerThresholdBPS = info.ThresholdBytesPS
+	if info.MinRateBytesPS > event.TriggerThresholdBPS {
+		event.TriggerThresholdBPS = info.MinRateBytesPS
+	}
+	event.BacklogBytes = info.BacklogBytes
+	event.QueueBytes = info.QueueBytes
+	event.NormalBoosterAdmitted = true
+	c.appendAuditLocked(event)
+	c.mu.Unlock()
+}
+
+func (c *preferredCapacityController) drainAuditEvents() ([]preferredCapacityAuditEvent, uint64) {
+	if c == nil {
+		return nil, 0
+	}
+	c.mu.Lock()
+	events := append([]preferredCapacityAuditEvent(nil), c.auditEvents...)
+	clear(c.auditEvents)
+	c.auditEvents = c.auditEvents[:0]
+	dropped := c.auditDropped
+	c.auditDropped = 0
+	c.mu.Unlock()
+	return events, dropped
 }
 
 func newPreferredCapacityController(mbps uint32, window time.Duration, chunkSize int) *preferredCapacityController {
@@ -207,7 +425,18 @@ func (c *preferredCapacityController) rollDeliveryLocked(now time.Time) {
 		c.deliveryRate = uint64(float64(c.delivered-c.deliveryBase) / seconds)
 		c.assignmentRate = uint64(float64(c.assigned-c.assignmentBase) / seconds)
 		c.deliveryReady = c.deliveryRate >= c.targetBytesPS
+		// Advance audit-only window identity before adaptation so any protection
+		// change caused by this exact completed sample carries the same window id
+		// as the CAP_WINDOW event that proves its delivery/assignment evidence.
+		if c.auditEnabled {
+			c.auditWindowSequence++
+		}
 		c.updateProtectedRateLocked(now)
+	}
+	if c.auditEnabled {
+		snapshot := c.snapshotLocked()
+		snapshot.WindowSequence = c.auditWindowSequence
+		c.appendAuditLocked(c.auditEventLocked(preferredCapacityAuditWindow, now, snapshot))
 	}
 	c.deliveryStart = now
 	c.deliveryBase = c.delivered
@@ -220,9 +449,14 @@ func (c *preferredCapacityController) updateProtectedRateLocked(now time.Time) {
 	// admission target. After protection exists, any higher peer-confirmed normal
 	// delivery is new evidence of sustainable preferred capacity and may raise the
 	// protected rate even while recovering from a real degradation below target.
-	if (!c.protectionValid && c.deliveryRate >= c.targetBytesPS) ||
-		(c.protectionValid && c.deliveryRate > c.protectedBytesPS) {
-		c.setProtectedRateLocked(now, c.deliveryRate, true)
+	if !c.protectionValid && c.deliveryRate >= c.targetBytesPS {
+		c.setProtectedRateLocked(now, c.deliveryRate, true, "delivery_proven_initial")
+	} else if c.protectionValid && c.deliveryRate > c.protectedBytesPS {
+		reason := "delivery_proven_raise"
+		if c.protectedBytesPS < c.targetBytesPS {
+			reason = "delivery_recovery_raise"
+		}
+		c.setProtectedRateLocked(now, c.deliveryRate, true, reason)
 	}
 
 	if !c.protectionActive || !c.protectionValid {
@@ -268,29 +502,39 @@ func (c *preferredCapacityController) updateProtectedRateLocked(now time.Time) {
 	// configured value is an admission threshold, not a permanent post-activation
 	// floor, so a genuinely degraded path may fall below it rather than queueing
 	// impossible preferred work forever.
-	c.setProtectedRateLocked(now, c.deliveryRate, true)
+	c.setProtectedRateLocked(now, c.deliveryRate, true, "physical_delivery_degradation")
 	c.degradeWindows = 0
 }
 
-func (c *preferredCapacityController) setProtectedRateLocked(now time.Time, rate uint64, valid bool) {
+func (c *preferredCapacityController) setProtectedRateLocked(now time.Time, rate uint64, valid bool, reason string) {
 	oldRate := c.reservationRateLocked()
+	oldProtected := c.protectedBytesPS
+	oldValid := c.protectionValid
 	c.protectedBytesPS = rate
 	c.protectionValid = valid
 	newRate := c.reservationRateLocked()
-	if newRate == oldRate {
-		return
+
+	if newRate != oldRate {
+		// Do not carry credit earned at one rate into another rate epoch. When the
+		// proven rate increases, owe one chunk immediately so booster admission cannot
+		// create a transition dip from the just-proven preferred throughput.
+		c.creditLast = now
+		if newRate > oldRate && c.protectionActive {
+			c.credit = float64(max(c.chunkSize, 1))
+		} else {
+			c.credit = 0
+		}
+		c.clampCreditLocked()
 	}
 
-	// Do not carry credit earned at one rate into another rate epoch. When the
-	// proven rate increases, owe one chunk immediately so booster admission cannot
-	// create a transition dip from the just-proven preferred throughput.
-	c.creditLast = now
-	if newRate > oldRate && c.protectionActive {
-		c.credit = float64(max(c.chunkSize, 1))
-	} else {
-		c.credit = 0
+	if c.auditEnabled && (oldProtected != c.protectedBytesPS || oldValid != c.protectionValid) {
+		snapshot := c.snapshotLocked()
+		event := c.auditEventLocked(preferredCapacityAuditProtectionChanged, now, snapshot)
+		event.OldProtectedBytesPS = oldProtected
+		event.NewProtectedBytesPS = c.protectedBytesPS
+		event.ChangeReason = reason
+		c.appendAuditLocked(event)
 	}
-	c.clampCreditLocked()
 }
 
 // activateProtection is called only when a normal beta6 activation trigger and
@@ -298,9 +542,9 @@ func (c *preferredCapacityController) setProtectedRateLocked(now time.Time, rate
 // activation starts the additive reservation epoch and discards any pre-
 // activation surplus: DATA sent while leg0 was the only ordinary path must never
 // be treated as permission to displace leg0 immediately after booster joins.
-func (c *preferredCapacityController) activateProtection(now time.Time, snapshot preferredCapacitySnapshot) {
+func (c *preferredCapacityController) activateProtection(now time.Time, snapshot preferredCapacitySnapshot) bool {
 	if c == nil || !snapshot.DeliveryReady {
-		return
+		return false
 	}
 	c.mu.Lock()
 	if now.IsZero() {
@@ -310,18 +554,21 @@ func (c *preferredCapacityController) activateProtection(now time.Time, snapshot
 		now = c.deliveryStart
 	}
 	if snapshot.DeliveryRate >= c.targetBytesPS && (!c.protectionValid || snapshot.DeliveryRate > c.protectedBytesPS) {
-		c.setProtectedRateLocked(now, snapshot.DeliveryRate, true)
+		c.setProtectedRateLocked(now, snapshot.DeliveryRate, true, "activation_delivery_proven")
 	}
 	if !c.protectionValid {
-		c.setProtectedRateLocked(now, c.targetBytesPS, true)
+		c.setProtectedRateLocked(now, c.targetBytesPS, true, "activation_target_fallback")
 	}
+	armedNow := false
 	if !c.protectionActive {
 		c.protectionActive = true
 		c.creditLast = now
 		c.credit = float64(max(c.chunkSize, 1))
 		c.clampCreditLocked()
+		armedNow = true
 	}
 	c.mu.Unlock()
+	return armedNow
 }
 
 func (c *preferredCapacityController) reservationRateLocked() uint64 {
@@ -451,6 +698,7 @@ func (c *preferredCapacityController) snapshotLocked() preferredCapacitySnapshot
 		ProtectionActive: c.protectionActive,
 		DegradeWindows:   c.degradeWindows,
 		CreditBytes:      int64(c.credit),
+		WindowSequence:   c.auditWindowSequence,
 	}
 }
 

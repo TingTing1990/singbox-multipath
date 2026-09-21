@@ -69,6 +69,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, E.New("invalid chunk_size")
 	}
 	preferredCapacity := newPreferredCapacityController(options.PreferredCapacityMbps, window, chunkSize)
+	preferredCapacity.enableAudit()
 	queueFrames := int(options.QueueFrames)
 	if queueFrames == 0 {
 		queueFrames = 256
@@ -162,6 +163,10 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	}
 	if err := i.listener.Start(); err != nil {
 		return err
+	}
+	if controller := i.cfg.PreferredCapacity; controller != nil {
+		controller.recordAuditReady(time.Now())
+		i.flushPreferredCapacityAudit()
 	}
 	i.cfg.Memory.startLogging(i.ctx, i.logger, "server")
 	go i.senderStatusLoop()
@@ -290,6 +295,8 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
+	cfg.CapacityAuditSessionID = statusSessionID(hello.Session)
+	cfg.CapacityAuditDestination = destination.String()
 	cfg.OnProtocolError = func(err error) {
 		i.logger.ErrorContext(ctx, "multipath protocol error for ", destination, ": ", err)
 	}
@@ -403,6 +410,26 @@ func (i *Inbound) removeSession(id [16]byte, session *serverSession) {
 	i.access.Unlock()
 }
 
+func (i *Inbound) flushPreferredCapacityAudit() {
+	controller := i.cfg.PreferredCapacity
+	if controller == nil {
+		return
+	}
+	events, dropped := controller.drainAuditEvents()
+	if dropped > 0 {
+		i.logger.ErrorContext(
+			i.ctx,
+			"CAP_AUDIT schema_version=", preferredCapacityAuditSchema,
+			" event=CAP_AUDIT_DROPPED side=server instance=", i.Tag(),
+			" dropped_events=", dropped,
+			" evidence_complete=false",
+		)
+	}
+	for _, event := range events {
+		i.logger.InfoContext(i.ctx, event.logLine(i.Tag()))
+	}
+}
+
 func (i *Inbound) wakeSenderStatus() {
 	select {
 	case i.statusWake <- struct{}{}:
@@ -430,6 +457,7 @@ func (i *Inbound) senderStatusLoop() {
 		case <-i.ctx.Done():
 			return
 		case now := <-ticker.C:
+			i.flushPreferredCapacityAudit()
 			i.sendSenderStatus(now, false)
 		case <-i.statusWake:
 			timer := time.NewTimer(100 * time.Millisecond)
@@ -438,6 +466,7 @@ func (i *Inbound) senderStatusLoop() {
 				timer.Stop()
 				return
 			case <-timer.C:
+				i.flushPreferredCapacityAudit()
 				i.sendSenderStatus(time.Now(), true)
 			}
 		}

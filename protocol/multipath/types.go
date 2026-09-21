@@ -28,6 +28,8 @@ type coreConfig struct {
 	ReplayTimeout                  time.Duration
 	Memory                         *memoryBudget
 	OnLeg1Active                   func(activationInfo, bool)
+	CapacityAuditSessionID         string
+	CapacityAuditDestination       string
 	OnLegFailure                   func(uint8, legFailureStage, error)
 	OnStatusEvent                  func()
 	OnProtocolError                func(error)
@@ -177,92 +179,96 @@ type mpLeg struct {
 }
 
 type mpCore struct {
-	finPath         *mpLeg // stateMu; retransmit FIN after a control path change
-	peerPressure    bool   // stateMu; suppress speculative secondary assignments
-	cfg             coreConfig
-	ctx             context.Context
-	cancel          context.CancelFunc
-	appConn         *logicalConn
-	txPipe          net.Conn
-	rxPipe          net.Conn
-	legsMu          sync.RWMutex
-	legs            map[uint8]*mpLeg
-	reserved        map[uint8]bool
-	retiring        map[uint8]*mpLeg
-	done            chan struct{}
-	released        chan struct{}
-	closeOne        sync.Once
-	txSeq           atomic.Uint64
-	ingressBytes    atomic.Uint64
-	egressBytes     atomic.Uint64
-	legCounters     [2]mpLegCounters
-	active          atomic.Bool
-	activeCh        chan struct{}
-	activateOnce    sync.Once
-	activationMu    sync.Mutex
-	activation      activationInfo
-	activationAt    time.Time
-	notifiedLeg1    *mpLeg
-	leg1Joins       uint64
-	localFIN        atomic.Bool
-	remoteFIN       atomic.Bool
-	receivedFIN     atomic.Bool
-	ackedFIN        atomic.Bool
-	localClosing    atomic.Bool
-	closeSource     atomic.Uint32
-	localReadClosed atomic.Bool
-	ackedNext       atomic.Uint64
-	rxExpected      atomic.Uint64
-	replayMu        sync.Mutex
-	replayBytes     int64
-	reorderBytes    atomic.Int64
-	reorderCount    atomic.Int64
-	replayPeak      atomic.Int64
-	reorderPeak     atomic.Int64
-	reorderFPeak    atomic.Int64
-	legPeak         [2]atomic.Int64
-	fallbackB       atomic.Uint64
-	fallbackF       atomic.Uint64
-	fallbackE       atomic.Uint64
-	replayTO        atomic.Uint64
-	backpressE      atomic.Uint64
-	backpressNS     atomic.Uint64
-	legFailureMu    sync.Mutex
-	legFailures     [2]uint64
-	lastFailLeg     uint8
-	lastFailStage   legFailureStage
-	failureMu       sync.Mutex
-	failure         string
-	failureAt       time.Time
-	memory          *memoryBudget
-	sessionBytes    int64
-	txReserve       chan []byte
-	peerStatusMu    sync.Mutex
-	peerStatus      peerSenderStatus
-	statusMu        sync.Mutex
-	statusSeq       uint64
-	lastStatus      senderStatus
-	lastStatusAt    time.Time
-	probeMu         sync.Mutex
-	probeNext       uint64
-	probePending    [2]pendingProbe
-	probeLast       [2]time.Time
-	probeRTT        [2]legRTTSnapshot
-	workerMu        sync.Mutex
-	workerGroup     sync.WaitGroup
-	workerClosed    bool
-	stateMu         sync.Mutex
-	tx              *stream.Sender
-	rx              *stream.Receiver
-	headPages       int
-	nextGeneration  uint64
-	pumpWake        chan struct{}
-	rxWake          chan struct{}
-	txWake          chan struct{}
-	startedAt       time.Time
-	mappings        []dataMapping
-	mappingHead     int
-	feedbackDirty   bool
+	finPath      *mpLeg // stateMu; retransmit FIN after a control path change
+	peerPressure bool   // stateMu; suppress speculative secondary assignments
+	cfg          coreConfig
+	ctx          context.Context
+	cancel       context.CancelFunc
+	appConn      *logicalConn
+	txPipe       net.Conn
+	rxPipe       net.Conn
+	legsMu       sync.RWMutex
+	legs         map[uint8]*mpLeg
+	reserved     map[uint8]bool
+	retiring     map[uint8]*mpLeg
+	done         chan struct{}
+	released     chan struct{}
+	closeOne     sync.Once
+	txSeq        atomic.Uint64
+	ingressBytes atomic.Uint64
+	egressBytes  atomic.Uint64
+	legCounters  [2]mpLegCounters
+	active       atomic.Bool
+	activeCh     chan struct{}
+	activateOnce sync.Once
+	activationMu sync.Mutex
+	activation   activationInfo
+	activationAt time.Time
+	// activationLoop is the sole writer. These fields rate-limit server audit
+	// evidence to at most one blocked event per trigger/controller window.
+	capacityAuditBlockedSeen   [3]bool
+	capacityAuditBlockedWindow [3]uint64
+	notifiedLeg1               *mpLeg
+	leg1Joins                  uint64
+	localFIN                   atomic.Bool
+	remoteFIN                  atomic.Bool
+	receivedFIN                atomic.Bool
+	ackedFIN                   atomic.Bool
+	localClosing               atomic.Bool
+	closeSource                atomic.Uint32
+	localReadClosed            atomic.Bool
+	ackedNext                  atomic.Uint64
+	rxExpected                 atomic.Uint64
+	replayMu                   sync.Mutex
+	replayBytes                int64
+	reorderBytes               atomic.Int64
+	reorderCount               atomic.Int64
+	replayPeak                 atomic.Int64
+	reorderPeak                atomic.Int64
+	reorderFPeak               atomic.Int64
+	legPeak                    [2]atomic.Int64
+	fallbackB                  atomic.Uint64
+	fallbackF                  atomic.Uint64
+	fallbackE                  atomic.Uint64
+	replayTO                   atomic.Uint64
+	backpressE                 atomic.Uint64
+	backpressNS                atomic.Uint64
+	legFailureMu               sync.Mutex
+	legFailures                [2]uint64
+	lastFailLeg                uint8
+	lastFailStage              legFailureStage
+	failureMu                  sync.Mutex
+	failure                    string
+	failureAt                  time.Time
+	memory                     *memoryBudget
+	sessionBytes               int64
+	txReserve                  chan []byte
+	peerStatusMu               sync.Mutex
+	peerStatus                 peerSenderStatus
+	statusMu                   sync.Mutex
+	statusSeq                  uint64
+	lastStatus                 senderStatus
+	lastStatusAt               time.Time
+	probeMu                    sync.Mutex
+	probeNext                  uint64
+	probePending               [2]pendingProbe
+	probeLast                  [2]time.Time
+	probeRTT                   [2]legRTTSnapshot
+	workerMu                   sync.Mutex
+	workerGroup                sync.WaitGroup
+	workerClosed               bool
+	stateMu                    sync.Mutex
+	tx                         *stream.Sender
+	rx                         *stream.Receiver
+	headPages                  int
+	nextGeneration             uint64
+	pumpWake                   chan struct{}
+	rxWake                     chan struct{}
+	txWake                     chan struct{}
+	startedAt                  time.Time
+	mappings                   []dataMapping
+	mappingHead                int
+	feedbackDirty              bool
 }
 
 type dataMapping struct {
