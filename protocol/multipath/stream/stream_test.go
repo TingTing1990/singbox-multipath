@@ -342,3 +342,64 @@ func TestPathRateDoesNotTreatQUICBurstsAsCapacity(t *testing.T) {
 		t.Fatal("burst-biased delivery rate", p.Rate)
 	}
 }
+
+func TestReceiverReusesConsumedPagesWithoutAllocationChurn(t *testing.T) {
+	memory := &testMemory{limit: 8}
+	r := NewReceiver(4*PageSize, memory)
+	payload := bytes.Repeat([]byte{0x5a}, PageSize)
+	for i := 0; i < 1000; i++ {
+		seq := uint64(i * PageSize)
+		if _, err := r.Insert(seq, payload); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Readable(); len(got) != PageSize {
+			t.Fatalf("iteration %d readable=%d", i, len(got))
+		}
+		r.Consume(PageSize)
+		r.Advertise(true)
+	}
+	// Sequential traffic needs only the reusable head page charge. The old
+	// implementation performed one heap allocation per consumed page.
+	if memory.used != 1 {
+		t.Fatalf("reusable receive page charge=%d, want 1", memory.used)
+	}
+	if len(r.freeHeadPages) != 1 {
+		t.Fatalf("head reuse pool=%d, want 1", len(r.freeHeadPages))
+	}
+	r.Close()
+	if memory.used != 0 {
+		t.Fatalf("receive page charge not released on close: %d", memory.used)
+	}
+}
+
+func TestSenderDropsOversizedDrainedMetadata(t *testing.T) {
+	s := NewSender(1 << 20)
+	for range retainedSegmentCapacity + 1 {
+		if err := s.Append(NewBuffer([]byte{1}, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Next = s.WriteNext
+	if err := s.Acknowledge(s.WriteNext, s.WindowEnd); err != nil {
+		t.Fatal(err)
+	}
+	if s.segments != nil || s.head != 0 {
+		t.Fatalf("oversized drained segment backing retained: len=%d cap=%d head=%d", len(s.segments), cap(s.segments), s.head)
+	}
+}
+
+func TestPathDropsOversizedDrainedFlightMetadata(t *testing.T) {
+	p := &Path{Generation: 1}
+	now := time.Unix(1, 0)
+	for range retainedFlightCapacity + 1 {
+		if _, err := p.Submitted(1, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Feedback(Receipt{Generation: 1, Next: p.Sent, ReceivedAt: 1}, now.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if p.flights != nil || p.head != 0 {
+		t.Fatalf("oversized drained flight backing retained: len=%d cap=%d head=%d", len(p.flights), cap(p.flights), p.head)
+	}
+}
