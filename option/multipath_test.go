@@ -65,3 +65,23 @@ func TestMultipathByteOptions(t *testing.T) {
 		t.Fatalf("unexpected numeric memory_limit: %d", inbound.MemoryLimit.Value())
 	}
 }
+
+func TestMultipathPreferredCapacityOption(t *testing.T) {
+	var outbound MultipathOutboundOptions
+	if err := json.UnmarshalDisallowUnknownFields([]byte(`{"preferred_capacity_mbps":70}`), &outbound); err != nil {
+		t.Fatal(err)
+	}
+	if outbound.PreferredCapacityMbps != 70 {
+		t.Fatalf("outbound preferred_capacity_mbps=%d, want 70", outbound.PreferredCapacityMbps)
+	}
+	var inbound MultipathInboundOptions
+	if err := json.UnmarshalDisallowUnknownFields([]byte(`{"preferred_capacity_mbps":50}`), &inbound); err != nil {
+		t.Fatal(err)
+	}
+	if inbound.PreferredCapacityMbps != 50 {
+		t.Fatalf("inbound preferred_capacity_mbps=%d, want 50", inbound.PreferredCapacityMbps)
+	}
+	if err := json.UnmarshalDisallowUnknownFields([]byte(`{"preferred_capacity_mbps":-1}`), &outbound); err == nil {
+		t.Fatal("negative preferred_capacity_mbps must be rejected")
+	}
+}

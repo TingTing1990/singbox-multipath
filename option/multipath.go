@@ -10,6 +10,7 @@ import (
 // one logical TCP byte stream. UDP is intentionally not aggregated and is
 // delegated to UDPOutbound (or Preferred / the first child).
 type MultipathOutboundOptions struct {
+	PreferredCapacityMbps       uint32                   `json:"preferred_capacity_mbps,omitempty"`
 	Outbounds                   []string                 `json:"outbounds" reference:"outbound"`
 	Preferred                   string                   `json:"preferred,omitempty" reference:"outbound"`
 	UDPOutbound                 string                   `json:"udp_outbound,omitempty" reference:"outbound"`
@@ -40,6 +41,7 @@ type MultipathOutboundOptions struct {
 
 type MultipathInboundOptions struct {
 	ListenOptions
+	PreferredCapacityMbps       uint32                   `json:"preferred_capacity_mbps,omitempty"`
 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
 	ActivationOnQueue           *bool                    `json:"activation_on_queue,omitempty"`
 	ActivationThresholdMbps     *uint32                  `json:"activation_threshold_mbps,omitempty"`
