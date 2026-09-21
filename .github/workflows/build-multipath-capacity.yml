@@ -249,7 +249,7 @@ jobs:
               require('c.assignmentRate+assignmentTolerance < protected' in upd,'scheduler under-assignment can self-ratify degradation')
               require('preferredCapacityDegradeWindows' in upd and 'c.degradeWindows++' in upd,'multi-window physical degradation evidence missing')
               require('c.setProtectedRateLocked(now, c.deliveryRate, true, "physical_delivery_degradation")' in upd,'delivery-driven physical decay missing')
-              require('(c.protectionValid && c.deliveryRate > c.protectedBytesPS)' in upd,'below-target recovery cannot relearn')
+              require('c.protectionValid' in upd and 'c.deliveryRate > c.protectedBytesPS' in upd and 'c.protectedBytesPS < c.targetBytesPS' in upd and 'delivery_recovery_raise' in upd,'below-target recovery cannot relearn')
               require('protected := c.protectedBytesPS' in upd,'degradation remains incorrectly anchored to admission target')
               for name in ('TestPreferredCapacityLowDemandDoesNotDecayProvenRate','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityRealDeliveryDegradationDecaysConservatively','TestPreferredCapacityRealDegradationMayFallBelowAdmissionTarget','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven','TestPreferredCapacityHigherPeerDeliveryRaisesProtection'): require(name in tests,'adaptation test missing: '+name)
               return 'no self-ratifying decay; low demand preserved; real degradation/recovery remains delivery-driven'
