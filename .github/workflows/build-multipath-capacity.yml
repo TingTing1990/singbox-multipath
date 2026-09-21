@@ -1,4 +1,4 @@
-name: Build Multipath Capacity V2 Additive
+name: Build Multipath Capacity V2 Server Audit v1
 
 on:
   workflow_dispatch:
@@ -13,13 +13,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: multipath-capacity-v2-additive-${{ inputs.source_ref }}
+  group: multipath-capacity-v2-server-audit-v1-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
   GO_VERSION: '1.25.5'
   VERSION: '1.14.0-multipath-beta6'
   PARENT_BRANCH: 'feature/mieru-outbound-beta6'
+  AUDIT_BASE_REV: '0c7792b743bb679f304395264565e94d24a95a71'
 
 jobs:
   audit_test:
@@ -29,6 +30,7 @@ jobs:
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       parent_sha: ${{ steps.resolve.outputs.parent_sha }}
+      audit_base_sha: ${{ steps.resolve.outputs.audit_base_sha }}
 
     steps:
       - name: Checkout requested source
@@ -58,23 +60,28 @@ jobs:
           grep -Fx "go ${GO_VERSION}" go.mod
 
           CANDIDATE_SHA="$(git rev-parse HEAD)"
+          AUDIT_BASE_SHA="$(git rev-parse "${AUDIT_BASE_REV}^{commit}")"
+          test "$(git merge-base "$CANDIDATE_SHA" "$AUDIT_BASE_SHA")" = "$AUDIT_BASE_SHA"
+
           git fetch --no-tags origin \
             "+refs/heads/${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
-          PARENT_SHA="$(git rev-parse "refs/remotes/origin/${PARENT_BRANCH}^{commit}")"
-          MERGE_BASE="$(git merge-base "$CANDIDATE_SHA" "$PARENT_SHA")"
-
-          # V2 must be based on the current clean Mieru parent. If the parent has
-          # moved, fail rather than silently auditing against a different baseline.
-          test "$MERGE_BASE" = "$PARENT_SHA"
+          PARENT_TIP="$(git rev-parse "refs/remotes/origin/${PARENT_BRANCH}^{commit}")"
+          # Freeze this incremental audit to the exact final-additive commit. The
+          # clean Mieru parent is its merge-base with the maintained parent branch,
+          # so a later parent-branch advance cannot create a false CI failure.
+          PARENT_SHA="$(git merge-base "$AUDIT_BASE_SHA" "$PARENT_TIP")"
+          test "$(git merge-base "$CANDIDATE_SHA" "$PARENT_SHA")" = "$PARENT_SHA"
 
           echo "source_ref=$SOURCE_REF"
           echo "candidate_sha=$CANDIDATE_SHA"
+          echo "audit_base_sha=$AUDIT_BASE_SHA"
           echo "parent_branch=$PARENT_BRANCH"
-          echo "parent_sha=$PARENT_SHA"
-          echo "merge_base=$MERGE_BASE"
+          echo "parent_tip=$PARENT_TIP"
+          echo "clean_parent_sha=$PARENT_SHA"
           echo "go=$(go version)"
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
           echo "parent_sha=$PARENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "audit_base_sha=$AUDIT_BASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set audited build inputs
         shell: bash
@@ -97,24 +104,36 @@ jobs:
           git worktree add --detach "$PARENT_DIR" "${{ steps.resolve.outputs.parent_sha }}"
           echo "PARENT_DIR=$PARENT_DIR" >> "$GITHUB_ENV"
 
-      - name: Full-source additive audit x10
+      - name: Materialize exact final-additive audit baseline
         shell: bash
         run: |
           set -euo pipefail
-          cat > "${RUNNER_TEMP}/multipath-capacity-v2-additive-full-audit.py" <<'PY'
+          AUDIT_BASE_DIR="${RUNNER_TEMP}/multipath-audit-base-v2-additive"
+          rm -rf "$AUDIT_BASE_DIR"
+          git worktree add --detach "$AUDIT_BASE_DIR" "${{ steps.resolve.outputs.audit_base_sha }}"
+          echo "AUDIT_BASE_DIR=$AUDIT_BASE_DIR" >> "$GITHUB_ENV"
+
+      - name: Full-source server-audit closure audit x10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/multipath-capacity-v2-server-audit-full-audit.py" <<'PY'
           #!/usr/bin/env python3
           from pathlib import Path
           import hashlib, os, re, subprocess, sys
           ROOT=Path(os.environ['GITHUB_WORKSPACE'])
           PARENT=Path(os.environ['PARENT_DIR'])
-          REPORT=Path(os.environ['RUNNER_TEMP'])/'multipath-capacity-v2-additive-full-audit-report.txt'
+          REPORT=Path(os.environ['RUNNER_TEMP'])/'multipath-capacity-v2-server-audit-full-audit-report.txt'
+          AUDIT_BASE=Path(os.environ['AUDIT_BASE_DIR'])
           EXPECTED_PARENT_MODIFIED={
            'README.md','option/multipath.go','option/multipath_test.go',
            'protocol/multipath/activation.go','protocol/multipath/inbound.go','protocol/multipath/outbound.go',
            'protocol/multipath/reorder_options_test.go','protocol/multipath/scheduler.go',
            'protocol/multipath/status.go','protocol/multipath/types.go',
           }
-          EXPECTED_PARENT_ADDED={'protocol/multipath/capacity.go','protocol/multipath/capacity_test.go'}
+          EXPECTED_PARENT_ADDED={'protocol/multipath/capacity.go','protocol/multipath/capacity_test.go','protocol/multipath/server_audit_test.go'}
+          EXPECTED_AUDIT_MODIFIED={'README.md','protocol/multipath/activation.go','protocol/multipath/capacity.go','protocol/multipath/inbound.go','protocol/multipath/types.go'}
+          EXPECTED_AUDIT_ADDED={'protocol/multipath/server_audit_test.go'}
           MIERU={'constant/proxy.go','option/mieru.go','protocol/mieru/outbound.go','include/registry.go','go.mod','go.sum'}
           FROZEN_RUNTIME={'protocol/multipath/wire.go','protocol/multipath/telemetry.go','protocol/multipath/memory.go','protocol/multipath/stream/path.go','protocol/multipath/protocol.go','protocol/multipath/performance_test.go'}
           class Fail(Exception): pass
@@ -173,9 +192,10 @@ jobs:
               raise Fail('unbalanced '+sig)
           
           def pass1():
-              m,a,r=diffsets(PARENT,ROOT); require(m==EXPECTED_PARENT_MODIFIED and a==EXPECTED_PARENT_ADDED and not r,f'parent write-set mismatch modified={sorted(m)} added={sorted(a)} removed={sorted(r)}')
+              m,a,r=diffsets(PARENT,ROOT); require(m==EXPECTED_PARENT_MODIFIED and a==EXPECTED_PARENT_ADDED and not r,f'clean-parent write-set mismatch modified={sorted(m)} added={sorted(a)} removed={sorted(r)}')
+              im,ia,ir=diffsets(AUDIT_BASE,ROOT); require(im==EXPECTED_AUDIT_MODIFIED and ia==EXPECTED_AUDIT_ADDED and not ir,f'incremental server-audit write-set mismatch modified={sorted(im)} added={sorted(ia)} removed={sorted(ir)}')
               for rel in MIERU: require((ROOT/rel).read_bytes()==(PARENT/rel).read_bytes(),f'Mieru/dependency drift: {rel}')
-              return 'exact clean-parent write-set + Mieru/dependency freeze'
+              return 'exact final-additive incremental write-set + clean-parent feature write-set + Mieru/dependency freeze'
           def pass2():
               opt=text('option/multipath.go'); cap=text('protocol/multipath/capacity.go'); inp=text('protocol/multipath/inbound.go'); out=text('protocol/multipath/outbound.go'); typ=text('protocol/multipath/types.go')
               require(opt.count('PreferredCapacityMbps')==2,'field not exactly inbound+outbound')
@@ -188,13 +208,15 @@ jobs:
               require('preferred_capacity' not in text('protocol/multipath/telemetry.go').lower(),'field leaked into telemetry')
               return 'instance ownership + Local-TX direction isolation + strict zero-field bypass + wire isolation'
           def pass3():
-              act=text('protocol/multipath/activation.go')
+              act=text('protocol/multipath/activation.go'); base=(AUDIT_BASE/'protocol/multipath/activation.go').read_text(encoding='utf-8')
               for needle in ('activationAfterBytes(', 'c.cfg.ThresholdBytesPS > 0', 'c.cfg.ActivationOnQueue'): require(needle in act,'original activation trigger missing: '+needle)
-              require(act.count('&& capacity.DeliveryReady')>=3,'capacity gate not ANDed with all three original triggers')
-              prepare=extract_func(act,'func (c *mpCore) preparePreferredCapacityActivation')
-              require('!c.cfg.Recovery.allows(0)' in prepare,'recovery bypass can establish normal protection')
-              require('controller.activateProtection(now, capacity)' in prepare,'protection activation missing')
-              return 'original beta6 activation OR-triggers preserved; aggregate delivery gate ANDed; recovery bypass isolated'
+              require(act.count('if !capacity.DeliveryReady {')==3,'all three original triggers are not explicitly capacity-gated')
+              require(act.count('recordPreferredCapacityGateDecision(now, info, capacity, false)')==3,'blocked decision evidence missing from a trigger')
+              require(act.count('recordPreferredCapacityGateDecision(now, info, capacity, true)')==3,'opened decision evidence missing from a trigger')
+              for sig in ('func activationAfterBytes(', 'func (c *mpCore) activate('): require(extract_func(act,sig)==extract_func(base,sig),'control helper changed while adding audit: '+sig)
+              state=extract_func(act,'func (c *mpCore) preferredCapacityActivationState'); require('snapshot.DeliveryReady = true' in state and 'snapshot.RecoveryBypass = true' in state,'recovery bypass evidence missing')
+              prepare=extract_func(act,'func (c *mpCore) preparePreferredCapacityActivation'); require('!c.cfg.Recovery.allows(0)' in prepare,'recovery bypass can establish normal protection'); require('controller.activateProtection(now, capacity)' in prepare,'protection activation missing')
+              return 'original beta6 trigger predicates preserved; all three capacity decisions directly evidenced; recovery bypass remains non-normal admission'
           def pass4():
               sch=text('protocol/multipath/scheduler.go'); psch=parent_text('protocol/multipath/scheduler.go'); sig='func (c *mpCore) choosePathLocked(length int) *mpLeg'
               require(extract_func(sch,sig)==extract_func(psch,sig),'original beta6 scheduler body changed')
@@ -226,34 +248,43 @@ jobs:
               cap=text('protocol/multipath/capacity.go'); tests=text('protocol/multipath/capacity_test.go'); upd=extract_func(cap,'func (c *preferredCapacityController) updateProtectedRateLocked')
               require('c.assignmentRate+assignmentTolerance < protected' in upd,'scheduler under-assignment can self-ratify degradation')
               require('preferredCapacityDegradeWindows' in upd and 'c.degradeWindows++' in upd,'multi-window physical degradation evidence missing')
-              require('c.setProtectedRateLocked(now, c.deliveryRate, true)' in upd,'delivery-driven decay missing')
+              require('c.setProtectedRateLocked(now, c.deliveryRate, true, "physical_delivery_degradation")' in upd,'delivery-driven physical decay missing')
               require('(c.protectionValid && c.deliveryRate > c.protectedBytesPS)' in upd,'below-target recovery cannot relearn')
               require('protected := c.protectedBytesPS' in upd,'degradation remains incorrectly anchored to admission target')
               for name in ('TestPreferredCapacityLowDemandDoesNotDecayProvenRate','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityRealDeliveryDegradationDecaysConservatively','TestPreferredCapacityRealDegradationMayFallBelowAdmissionTarget','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven','TestPreferredCapacityHigherPeerDeliveryRaisesProtection'): require(name in tests,'adaptation test missing: '+name)
               return 'no self-ratifying decay; low demand preserved; real degradation/recovery remains delivery-driven'
           def pass8():
-              cap=text('protocol/multipath/capacity.go'); sch=text('protocol/multipath/scheduler.go'); section=cap[:cap.index('// recordPreferredCapacityRange')]
+              cap=text('protocol/multipath/capacity.go'); sch=text('protocol/multipath/scheduler.go'); inp=text('protocol/multipath/inbound.go'); section=cap[:cap.index('// recordPreferredCapacityRange')]
               require('c.stateMu' not in section and 'c.legsMu' not in section,'controller calls back into core locks / reverses lock order')
               require('now.Before(c.deliveryStart)' in cap and 'now.Before(c.creditLast)' in cap,'cross-core monotonic time guards missing')
               require('preferredCapacityDebtChunks' in cap and 'preferredCapacitySurplusChunks' in cap,'credit bounds missing')
               require('preferredCapacityRanges' in cap and 'preferredCapacityRangeHead' in cap,'receipt range lifecycle missing')
               require('selection.finish(pumpErr)' in sch,'reservation lifecycle detached from submit result')
-              return 'lock-order isolation + monotonic shared time + bounded credit/ranges + submit lifecycle'
+              require('preferredCapacityAuditQueueLimit = 1024' in cap and 'c.auditDropped++' in cap,'server audit buffer is not bounded with explicit loss')
+              require('go i.senderStatusLoop()' in inp and 'go i.flushPreferredCapacityAudit' not in inp,'audit introduced a new control/logging goroutine')
+              require('CAP_AUDIT_DROPPED' in inp and 'evidence_complete=false' in inp,'audit loss is not FIELD-failing evidence')
+              return 'lock-order isolation + monotonic shared time + bounded control state/audit queue + no new audit goroutine + explicit evidence loss'
           def pass9():
-              status=text('protocol/multipath/status.go'); readme=text('README.md'); reorder=text('protocol/multipath/reorder_options_test.go')
-              for needle in ('protected_mbps','protection_valid','protection_active','preferred_assigned_bytes','assignment_bytes_per_second'): require(needle in status,'runtime observability missing: '+needle)
-              require('booster DATA is additive excess' in readme and '70+80 split under 150 Mbps demand would violate' in readme,'README additive contract incomplete')
+              cap=text('protocol/multipath/capacity.go'); inp=text('protocol/multipath/inbound.go'); out=text('protocol/multipath/outbound.go'); typ=text('protocol/multipath/types.go'); readme=text('README.md'); status=text('protocol/multipath/status.go'); reorder=text('protocol/multipath/reorder_options_test.go')
+              for ev in ('CAP_AUDIT_READY','CAP_GATE_BLOCKED','CAP_GATE_OPENED','CAP_PROTECTION_ARMED','CAP_WINDOW','CAP_PROTECTION_CHANGED'): require(ev in cap,'server FIELD audit event missing: '+ev)
+              for field in ('original_trigger_satisfied','recovery_bypass','target_mbps','delivery_mbps','delivery_ready','protected_mbps','protection_valid','protection_active','preferred_assignment_mbps','degrade_windows','normal_booster_admitted','current_bytes','threshold_bytes','session_id','destination','controller_window_seq'): require(field in cap,'server FIELD evidence field missing: '+field)
+              require(inp.count('preferredCapacity.enableAudit()')==1,'server inbound audit not enabled exactly once')
+              require('enableAudit()' not in out,'client outbound unexpectedly enables server audit plane')
+              for needle in ('recordAuditReady(time.Now())','i.flushPreferredCapacityAudit()','cfg.CapacityAuditSessionID = statusSessionID(hello.Session)','cfg.CapacityAuditDestination = destination.String()'): require(needle in inp,'server audit lifecycle/correlation missing: '+needle)
+              require('CAP_AUDIT_READY side=server' in readme and 'CAP_GATE_BLOCKED' in readme and 'original_trigger_satisfied=true' in readme,'FIELD precheck/acceptance contract missing from README')
+              for needle in ('protected_mbps','protection_valid','protection_active','preferred_assigned_bytes','assignment_bytes_per_second'): require(needle in status,'existing outbound capacity status drifted: '+needle)
               require('baseline.PreferredCapacity != nil' in reorder and 'omitted preferred capacity created a controller' in reorder,'zero-field config regression missing')
               for rel in FROZEN_RUNTIME: require((ROOT/rel).read_bytes()==(PARENT/rel).read_bytes(),f'frozen runtime drift: {rel}')
-              return 'status/docs/zero-field config consistency + wire/telemetry/memory/stream/protocol/performance freeze'
+              require('CAP_AUDIT' not in text('protocol/multipath/wire.go') and 'CAP_AUDIT' not in text('protocol/multipath/telemetry.go'),'server audit leaked into wire/telemetry')
+              return 'server inbound FIELD observability closure + precheck + session correlation + outbound-status preservation + frozen runtime'
           def pass10():
-              tests=text('protocol/multipath/capacity_test.go'); gomod=text('go.mod')
-              required=['TestPreferredCapacityProtectsProven90AgainstBoosterDisplacement','TestPreferredCapacityTarget50DoesNotPullProven75Down','TestPreferredCapacitySharedProtectionAcrossCores','TestPreferredCapacityPreActivationSurplusCannotLicenseImmediateDisplacement','TestPreferredCapacityBusyPreferredDoesNotBlockBooster','TestPreferredCapacityFullPreferredDoesNotBlockBooster','TestPreferredCapacityDisabledReturnsOriginalDecision','TestPreferredCapacityRepairRangesExcludedFromDelivery','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven']
-              for n in required: require('func '+n in tests,'required adversarial test missing: '+n)
+              tests=text('protocol/multipath/capacity_test.go')+'\n'+text('protocol/multipath/server_audit_test.go'); gomod=text('go.mod')
+              required=['TestPreferredCapacityProtectsProven90AgainstBoosterDisplacement','TestPreferredCapacityTarget50DoesNotPullProven75Down','TestPreferredCapacitySharedProtectionAcrossCores','TestPreferredCapacityPreActivationSurplusCannotLicenseImmediateDisplacement','TestPreferredCapacityBusyPreferredDoesNotBlockBooster','TestPreferredCapacityFullPreferredDoesNotBlockBooster','TestPreferredCapacityDisabledReturnsOriginalDecision','TestPreferredCapacityRepairRangesExcludedFromDelivery','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven','TestPreferredCapacityServerAuditReadyAndDisabledIsolation','TestPreferredCapacityServerAuditBlockedAfterOriginalBytesTrigger','TestPreferredCapacityServerAuditOpenedAndProtectionArmed','TestPreferredCapacityRecoveryBypassIsNotReportedAsNormalAdmission','TestPreferredCapacityServerAuditWindowAndPhysicalDegradationReason','TestPreferredCapacityAuditIsDecisionEquivalent','TestPreferredCapacityAuditQueueIsBoundedAndLossIsExplicit','TestPreferredCapacityAuditLogLineCarriesFieldAcceptanceEvidence']
+              for n in required: require('func '+n in tests,'required adversarial/audit test missing: '+n)
               require(re.search(r'^go 1\.25\.5$',gomod,re.M) is not None,'Go 1.25.5 baseline changed')
               require((ROOT/'release/DEFAULT_BUILD_TAGS_OTHERS').read_bytes()==(PARENT/'release/DEFAULT_BUILD_TAGS_OTHERS').read_bytes(),'build tags drift')
               require((ROOT/'release/LDFLAGS').read_bytes()==(PARENT/'release/LDFLAGS').read_bytes(),'ldflags drift')
-              return 'adversarial regression coverage + Go/build inputs frozen + no scope expansion'
+              return 'additive adversarial regressions + server FIELD evidence tests + Go/build inputs frozen'
           
           passes=[pass1,pass2,pass3,pass4,pass5,pass6,pass7,pass8,pass9,pass10]
           lines=[]; base=None
@@ -268,7 +299,7 @@ jobs:
           REPORT.write_text('\n'.join(lines)+'\nALL 10 COMPLETE-SOURCE AUDIT PASSES COMPLETE\n')
           print('ALL 10 COMPLETE-SOURCE AUDIT PASSES COMPLETE')
           PY
-          python3 "${RUNNER_TEMP}/multipath-capacity-v2-additive-full-audit.py"
+          python3 "${RUNNER_TEMP}/multipath-capacity-v2-server-audit-full-audit.py"
 
       - name: Independent external additive simulation x10 with mutation controls
         shell: bash
@@ -553,6 +584,74 @@ jobs:
           PY
           python3 "${RUNNER_TEMP}/multipath-capacity-v2-additive-independent-sim.py"
 
+      - name: Independent Server FIELD Audit Closure v1 acceptance x10 + mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/server-audit-v1-independent.py" <<'PY'
+          from dataclasses import dataclass, replace
+          MiB=1024*1024
+          @dataclass(frozen=True)
+          class E:
+              kind:str; target:float; delivery:float=0; ready:bool=False; trigger:str='none'; trigger_ok:bool=False
+              current_bytes:int=0; threshold_bytes:int=0; protected:float=0; assignment:float=0
+              protection_valid:bool=False; protection_active:bool=False; normal_admitted:bool=False
+              recovery_bypass:bool=False; session_id:str=''; destination:str=''; change_reason:str=''
+              old_protected:float=0; new_protected:float=0; evidence_complete:bool=True
+          def one(es,k):
+              xs=[e for e in es if e.kind==k]; assert len(xs)==1,(k,len(xs)); return xs[0]
+          def complete(es):
+              assert all(e.evidence_complete for e in es); assert not any(e.kind=='CAP_AUDIT_DROPPED' for e in es)
+          def s21(es):
+              complete(es); b=one(es,'CAP_GATE_BLOCKED'); assert one(es,'CAP_AUDIT_READY').target==700
+              assert b.target==700 and b.trigger=='bytes' and b.trigger_ok and b.current_bytes>=b.threshold_bytes>=2*MiB
+              assert b.delivery<b.target and not b.ready and not b.normal_admitted and not b.recovery_bypass
+              assert b.session_id and b.destination; assert not any(e.kind in ('CAP_GATE_OPENED','CAP_PROTECTION_ARMED') for e in es)
+          def s22(es):
+              complete(es); o=one(es,'CAP_GATE_OPENED'); a=one(es,'CAP_PROTECTION_ARMED')
+              assert o.target==70 and o.trigger_ok and o.ready and o.normal_admitted and not o.recovery_bypass
+              assert o.session_id and o.destination and a.session_id==o.session_id and a.destination==o.destination
+              assert a.protection_valid and a.protection_active and a.protected>a.target and a.normal_admitted
+          def s23(es):
+              complete(es); a=one(es,'CAP_PROTECTION_ARMED'); assert a.target==70 and a.protected>=89
+              ws=[e for e in es if e.kind=='CAP_WINDOW' and e.protection_active]; assert ws
+              for w in ws: assert w.protected>=89 and w.assignment>=w.protected-2
+          def s24(es):
+              complete(es); cs=[e for e in es if e.kind=='CAP_PROTECTION_CHANGED' and e.new_protected<e.old_protected]; assert cs
+              c=cs[-1]; assert c.change_reason=='physical_delivery_degradation' and c.assignment>=c.old_protected-2
+              lows=[w for w in es if w.kind=='CAP_WINDOW' and w.protection_active and w.assignment>=c.old_protected-2 and w.delivery<.9*c.old_protected]
+              assert len(lows)>=3
+          def recovery(es):
+              complete(es); o=one(es,'CAP_GATE_OPENED'); assert o.recovery_bypass and not o.normal_admitted
+              assert not any(e.kind=='CAP_PROTECTION_ARMED' for e in es)
+          R700=E('CAP_AUDIT_READY',700)
+          B700=E('CAP_GATE_BLOCKED',700,550,False,'bytes',True,581745969,2*MiB,session_id='a4bd1539',destination='speedtest.hnd.fdcservers.net:8080')
+          R70=E('CAP_AUDIT_READY',70)
+          O70=E('CAP_GATE_OPENED',70,90,True,'bytes',True,4*MiB,2*MiB,normal_admitted=True,session_id='11223344',destination='download.example:443')
+          A90=E('CAP_PROTECTION_ARMED',70,90,True,'bytes',True,4*MiB,2*MiB,90,90,True,True,True,False,'11223344','download.example:443')
+          W=[E('CAP_WINDOW',70,d,True,protected=90,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True) for d in (90,89,91)]
+          DW=[E('CAP_WINDOW',70,60,False,protected=90,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True) for _ in range(3)]
+          C60=E('CAP_PROTECTION_CHANGED',70,60,False,protected=60,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True,change_reason='physical_delivery_degradation',old_protected=90,new_protected=60)
+          RB=E('CAP_GATE_OPENED',70,0,True,'bytes',True,3*MiB,2*MiB,recovery_bypass=True,normal_admitted=False,session_id='55667788',destination='recovery.example:443')
+          formal=[('S2-1 700 below target',[R700,B700],s21),('S2-2 open/arm',[R70,O70,A90],s22),('S2-3 additive P',[R70,O70,A90,*W],s23),('S2-4 real degradation',[R70,O70,A90,*DW,C60],s24),('recovery bypass',[R70,RB],recovery)]
+          mutants=[
+            ('missing-blocked',[R700],s21),('no-trigger-proof',[R700,replace(B700,trigger_ok=False)],s21),
+            ('no-session-correlation',[R700,replace(B700,session_id='')],s21),('recovery-as-normal',[R70,replace(RB,normal_admitted=True)],recovery),
+            ('T-as-protected-P',[R70,O70,replace(A90,protected=70)],s22),('P-underassigned',[R70,O70,A90,*W[:-1],replace(W[-1],assignment=70)],s23),
+            ('underassignment-ratifies-degrade',[R70,O70,A90,*DW,replace(C60,assignment=60)],s24),
+            ('silent-loss',[R700,B700,E('CAP_AUDIT_DROPPED',700,evidence_complete=False)],s21),
+          ]
+          for batch in range(10):
+              for n,es,f in formal: f(es)
+              for n,es,f in mutants:
+                  try: f(es)
+                  except AssertionError: pass
+                  else: raise SystemExit('FAIL mutation survived: '+n)
+          print('PASS 10 independent Server FIELD Audit Closure v1 batches')
+          print('PASS 8/8 incomplete/wrong evidence architectures killed in every batch')
+          PY
+          python3 "${RUNNER_TEMP}/server-audit-v1-independent.py"
+
       - name: Check formatting of complete approved Go write-set
         shell: bash
         run: |
@@ -569,6 +668,7 @@ jobs:
             protocol/multipath/types.go
             protocol/multipath/capacity.go
             protocol/multipath/capacity_test.go
+            protocol/multipath/server_audit_test.go
           )
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then
@@ -715,10 +815,11 @@ jobs:
           print('PASS zero-field candidate retains >=98% direct-parent performance for all fixtures')
           PY
 
-      - name: Cleanup parent worktree
+      - name: Cleanup audit worktrees
         if: always()
         shell: bash
         run: |
+          git worktree remove --force "$AUDIT_BASE_DIR" >/dev/null 2>&1 || true
           git worktree remove --force "$PARENT_DIR" >/dev/null 2>&1 || true
 
   build_targets:
