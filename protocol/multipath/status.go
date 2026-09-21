@@ -448,20 +448,21 @@ type statusFrames struct {
 }
 
 type statusActivation struct {
-	Reason                       string `json:"reason"`
-	At                           string `json:"at"`
-	CurrentBytes                 uint64 `json:"current_bytes,omitempty"`
-	ThresholdBytes               uint64 `json:"threshold_bytes,omitempty"`
-	WindowBytes                  uint64 `json:"window_bytes,omitempty"`
-	RateBytesPS                  uint64 `json:"rate_bytes_per_second,omitempty"`
-	ThresholdBytesPS             uint64 `json:"threshold_bytes_per_second,omitempty"`
-	MinRateBytesPS               uint64 `json:"min_rate_bytes_per_second,omitempty"`
-	ElapsedMS                    int64  `json:"elapsed_ms,omitempty"`
-	BacklogBytes                 int64  `json:"backlog_bytes,omitempty"`
-	QueueBytes                   int64  `json:"queue_bytes,omitempty"`
-	RequiredDurationMS           int64  `json:"required_duration_ms,omitempty"`
-	PreferredCapacityTargetMbps  uint64 `json:"preferred_capacity_target_mbps,omitempty"`
-	PreferredCapacityRateBytesPS uint64 `json:"preferred_capacity_rate_bytes_per_second,omitempty"`
+	Reason                         string `json:"reason"`
+	At                             string `json:"at"`
+	CurrentBytes                   uint64 `json:"current_bytes,omitempty"`
+	ThresholdBytes                 uint64 `json:"threshold_bytes,omitempty"`
+	WindowBytes                    uint64 `json:"window_bytes,omitempty"`
+	RateBytesPS                    uint64 `json:"rate_bytes_per_second,omitempty"`
+	ThresholdBytesPS               uint64 `json:"threshold_bytes_per_second,omitempty"`
+	MinRateBytesPS                 uint64 `json:"min_rate_bytes_per_second,omitempty"`
+	ElapsedMS                      int64  `json:"elapsed_ms,omitempty"`
+	BacklogBytes                   int64  `json:"backlog_bytes,omitempty"`
+	QueueBytes                     int64  `json:"queue_bytes,omitempty"`
+	RequiredDurationMS             int64  `json:"required_duration_ms,omitempty"`
+	PreferredCapacityTargetMbps    uint64 `json:"preferred_capacity_target_mbps,omitempty"`
+	PreferredCapacityRateBytesPS   uint64 `json:"preferred_capacity_rate_bytes_per_second,omitempty"`
+	PreferredCapacityProtectedMbps uint64 `json:"preferred_capacity_protected_mbps,omitempty"`
 }
 
 type statusParameters struct {
@@ -486,7 +487,13 @@ type statusParameters struct {
 type statusPreferredCapacity struct {
 	TargetMbps              uint64 `json:"target_mbps"`
 	PreferredDeliveredBytes uint64 `json:"preferred_delivered_bytes"`
+	PreferredAssignedBytes  uint64 `json:"preferred_assigned_bytes"`
 	DeliveryBytesPS         uint64 `json:"delivery_bytes_per_second"`
+	AssignmentBytesPS       uint64 `json:"assignment_bytes_per_second"`
+	ProtectedMbps           uint64 `json:"protected_mbps"`
+	ProtectionValid         bool   `json:"protection_valid"`
+	ProtectionActive        bool   `json:"protection_active"`
+	DegradeWindows          int    `json:"degrade_windows"`
 	Ready                   bool   `json:"ready"`
 	AssignmentCreditBytes   int64  `json:"assignment_credit_bytes"`
 }
@@ -695,20 +702,21 @@ func activationStatus(info activationInfo, at time.Time) *statusActivation {
 		return nil
 	}
 	return &statusActivation{
-		Reason:                       string(info.Reason),
-		At:                           at.Format(time.RFC3339Nano),
-		CurrentBytes:                 info.CurrentBytes,
-		ThresholdBytes:               info.ThresholdBytes,
-		WindowBytes:                  info.WindowBytes,
-		RateBytesPS:                  info.RateBytesPS,
-		ThresholdBytesPS:             info.ThresholdBytesPS,
-		MinRateBytesPS:               info.MinRateBytesPS,
-		ElapsedMS:                    info.Elapsed.Milliseconds(),
-		BacklogBytes:                 info.BacklogBytes,
-		QueueBytes:                   info.QueueBytes,
-		RequiredDurationMS:           info.RequiredDuration.Milliseconds(),
-		PreferredCapacityTargetMbps:  info.PreferredCapacityTargetBytesPS * 8 / 1_000_000,
-		PreferredCapacityRateBytesPS: info.PreferredCapacityRateBytesPS,
+		Reason:                         string(info.Reason),
+		At:                             at.Format(time.RFC3339Nano),
+		CurrentBytes:                   info.CurrentBytes,
+		ThresholdBytes:                 info.ThresholdBytes,
+		WindowBytes:                    info.WindowBytes,
+		RateBytesPS:                    info.RateBytesPS,
+		ThresholdBytesPS:               info.ThresholdBytesPS,
+		MinRateBytesPS:                 info.MinRateBytesPS,
+		ElapsedMS:                      info.Elapsed.Milliseconds(),
+		BacklogBytes:                   info.BacklogBytes,
+		QueueBytes:                     info.QueueBytes,
+		RequiredDurationMS:             info.RequiredDuration.Milliseconds(),
+		PreferredCapacityTargetMbps:    info.PreferredCapacityTargetBytesPS * 8 / 1_000_000,
+		PreferredCapacityRateBytesPS:   info.PreferredCapacityRateBytesPS,
+		PreferredCapacityProtectedMbps: info.PreferredCapacityProtectedBytesPS * 8 / 1_000_000,
 	}
 }
 
@@ -846,7 +854,13 @@ func (s *outboundStatus) buildDocument(now time.Time) statusDocument {
 		logical.PreferredCapacity = &statusPreferredCapacity{
 			TargetMbps:              capacity.TargetBytesPS * 8 / 1_000_000,
 			PreferredDeliveredBytes: capacity.DeliveredBytes,
+			PreferredAssignedBytes:  capacity.AssignedBytes,
 			DeliveryBytesPS:         capacity.DeliveryRate,
+			AssignmentBytesPS:       capacity.AssignmentRate,
+			ProtectedMbps:           capacity.ProtectedBytesPS * 8 / 1_000_000,
+			ProtectionValid:         capacity.ProtectionValid,
+			ProtectionActive:        capacity.ProtectionActive,
+			DegradeWindows:          capacity.DegradeWindows,
 			Ready:                   capacity.DeliveryReady,
 			AssignmentCreditBytes:   capacity.CreditBytes,
 		}

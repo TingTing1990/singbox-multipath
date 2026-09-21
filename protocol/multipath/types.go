@@ -53,19 +53,20 @@ const (
 )
 
 type activationInfo struct {
-	Reason                         activationReason
-	CurrentBytes                   uint64
-	ThresholdBytes                 uint64
-	WindowBytes                    uint64
-	RateBytesPS                    uint64
-	ThresholdBytesPS               uint64
-	MinRateBytesPS                 uint64
-	Elapsed                        time.Duration
-	BacklogBytes                   int64
-	QueueBytes                     int64
-	RequiredDuration               time.Duration
-	PreferredCapacityTargetBytesPS uint64
-	PreferredCapacityRateBytesPS   uint64
+	Reason                            activationReason
+	CurrentBytes                      uint64
+	ThresholdBytes                    uint64
+	WindowBytes                       uint64
+	RateBytesPS                       uint64
+	ThresholdBytesPS                  uint64
+	MinRateBytesPS                    uint64
+	Elapsed                           time.Duration
+	BacklogBytes                      int64
+	QueueBytes                        int64
+	RequiredDuration                  time.Duration
+	PreferredCapacityTargetBytesPS    uint64
+	PreferredCapacityRateBytesPS      uint64
+	PreferredCapacityProtectedBytesPS uint64
 }
 
 func (i activationInfo) String() string {
@@ -117,10 +118,11 @@ func activationInfoString(i activationInfo) string {
 		return base
 	}
 	return fmt.Sprintf(
-		"%s preferred_capacity_target_mbps=%.2f preferred_capacity_delivery_mbps=%.2f",
+		"%s preferred_capacity_target_mbps=%.2f preferred_capacity_delivery_mbps=%.2f preferred_capacity_protected_mbps=%.2f",
 		base,
 		float64(i.PreferredCapacityTargetBytesPS)*8/1_000_000,
 		float64(i.PreferredCapacityRateBytesPS)*8/1_000_000,
+		float64(i.PreferredCapacityProtectedBytesPS)*8/1_000_000,
 	)
 }
 

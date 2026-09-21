@@ -223,15 +223,22 @@ type pathSelection struct {
 }
 
 func (s pathSelection) finish(err error) {
-	if err != nil && s.reservation != nil {
-		s.reservation.refund()
+	if s.reservation == nil {
+		return
 	}
+	if err != nil {
+		s.reservation.refund()
+		return
+	}
+	s.reservation.commit()
 }
 
 // choosePathForSubmitLocked starts from the unchanged beta6 scheduler and adds
-// only an instance-shared aggregate preferred reservation. It never waits solely
-// to satisfy the reservation: if preferred is busy/full/unavailable, the
-// original candidate remains usable so booster can carry excess demand.
+// only an instance-shared additive preferred reservation. Once capacity-mode
+// booster DATA is active, the shared controller protects the peer-delivery-proven
+// preferred rate (never merely caps/targets the configured threshold). It never
+// waits solely to repay preferred credit: if preferred is busy/full/unavailable,
+// the original candidate remains usable so booster can carry excess demand.
 func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelection {
 	chosen := c.choosePathLocked(length)
 	controller := c.cfg.PreferredCapacity
@@ -240,8 +247,10 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelect
 	}
 
 	// Every normal preferred assignment, including preferred-only connections,
-	// consumes the one shared instance target. This is what prevents N logical
-	// sessions from each receiving an independent N x target reservation.
+	// is accounted by the one shared instance controller. Once additive
+	// protection is active, these assignments consume the shared protected-rate
+	// reservation. This prevents N logical sessions from each receiving an
+	// independent N x target/protection reservation.
 	if chosen.id == 0 {
 		_, reservation := controller.reserveAssignment(now, length, true, false)
 		return pathSelection{leg: chosen, reservation: reservation}

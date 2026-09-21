@@ -46,6 +46,51 @@ func preferBoosterForCapacityTest(preferred, booster *mpLeg, chunk uint64) {
 	booster.path.Received = 0
 }
 
+func primePreferredProtection(t *testing.T, controller *preferredCapacityController, start time.Time, deliveredBytesPS uint64) preferredCapacitySnapshot {
+	t.Helper()
+	if controller.capacityReady(start) {
+		t.Fatal("capacity unexpectedly ready before any delivery")
+	}
+	controller.observePreferredDelivery(deliveredBytesPS, start.Add(time.Second))
+	snapshot := controller.capacityState(start.Add(time.Second))
+	if !snapshot.DeliveryReady {
+		t.Fatalf("delivery did not satisfy target: %+v", snapshot)
+	}
+	controller.activateProtection(start.Add(time.Second), snapshot)
+	snapshot = controller.snapshot()
+	if !snapshot.ProtectionActive || !snapshot.ProtectionValid {
+		t.Fatalf("additive protection did not activate: %+v", snapshot)
+	}
+	return snapshot
+}
+
+func runBoosterBiasedAssignments(t *testing.T, controller *preferredCapacityController, cores []*mpCore, offeredBytesPS uint64, duration time.Duration, start time.Time) (preferredBytes, boosterBytes uint64) {
+	t.Helper()
+	if len(cores) == 0 {
+		t.Fatal("no cores")
+	}
+	chunk := cores[0].cfg.ChunkSize
+	step := time.Duration(float64(time.Second) * float64(chunk) / float64(offeredBytesPS))
+	if step <= 0 {
+		t.Fatal("invalid assignment step")
+	}
+	index := 0
+	for now, end := start, start.Add(duration); now.Before(end); now = now.Add(step) {
+		selection := cores[index%len(cores)].choosePathForSubmitLocked(chunk, now)
+		if selection.leg == nil {
+			t.Fatal("scheduler returned nil with both paths eligible")
+		}
+		if selection.leg.id == 0 {
+			preferredBytes += uint64(chunk)
+		} else {
+			boosterBytes += uint64(chunk)
+		}
+		selection.finish(nil)
+		index++
+	}
+	return
+}
+
 func TestPreferredCapacityAggregateDeliveryReadiness(t *testing.T) {
 	controller := newPreferredCapacityController(70, time.Second, 64<<10)
 	t0 := time.Unix(100, 0)
@@ -64,55 +109,116 @@ func TestPreferredCapacityAggregateDeliveryReadiness(t *testing.T) {
 	}
 }
 
-func TestPreferredCapacitySharedAssignmentAcrossCores(t *testing.T) {
+func TestPreferredCapacityProtectsProven90AgainstBoosterDisplacement(t *testing.T) {
 	const (
-		targetBytesPS  = 8_000_000
-		offeredBytesPS = 16_000_000
+		preferredBytesPS = 90_000_000 / 8
+		offeredBytesPS   = 150_000_000 / 8
 	)
-	controller := &preferredCapacityController{targetBytesPS: targetBytesPS, window: time.Second, chunkSize: 64 << 10}
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(200, 0)
+	snapshot := primePreferredProtection(t, controller, t0, preferredBytesPS)
+	if snapshot.ProtectedBytesPS != preferredBytesPS {
+		t.Fatalf("protected rate=%d, want delivery-proven %d", snapshot.ProtectedBytesPS, preferredBytesPS)
+	}
+
 	cores := make([]*mpCore, 4)
 	for i := range cores {
 		core, preferred, booster := capacitySchedulerCore(controller)
+		// The unchanged beta6 scheduler is deliberately biased toward booster.
+		// The additive controller must therefore be the thing that preserves the
+		// already-proven preferred contribution.
 		preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
 		cores[i] = core
 	}
-	chunk := cores[0].cfg.ChunkSize
-	step := time.Duration(float64(time.Second) * float64(chunk) / offeredBytesPS)
-	t0 := time.Unix(200, 0)
-	end := t0.Add(4 * time.Second)
-	var preferredBytes, boosterBytes uint64
-	index := 0
-	for now := t0; now.Before(end); now = now.Add(step) {
-		selection := cores[index%len(cores)].choosePathForSubmitLocked(chunk, now)
-		if selection.leg == nil {
-			t.Fatal("shared scheduler returned nil with both paths eligible")
-		}
-		if selection.leg.id == 0 {
-			preferredBytes += uint64(chunk)
-		} else {
-			boosterBytes += uint64(chunk)
-		}
-		selection.finish(nil)
-		index++
-	}
-	elapsed := end.Sub(t0).Seconds()
-	preferredRate := float64(preferredBytes) / elapsed
-	boosterRate := float64(boosterBytes) / elapsed
-	chunkTolerance := float64(chunk) * 3 / elapsed
-	if diff := preferredRate - targetBytesPS; diff < -chunkTolerance || diff > chunkTolerance {
-		t.Fatalf("aggregate preferred rate %.0f B/s, want ~%d B/s; booster %.0f B/s", preferredRate, targetBytesPS, boosterRate)
+	preferredBytes, boosterBytes := runBoosterBiasedAssignments(t, controller, cores, offeredBytesPS, 4*time.Second, t0.Add(time.Second))
+	preferredRate := float64(preferredBytes) / 4
+	boosterRate := float64(boosterBytes) / 4
+	tolerance := float64(cores[0].cfg.ChunkSize) * 4 / 4
+	if diff := preferredRate - preferredBytesPS; diff < -tolerance || diff > tolerance {
+		t.Fatalf("booster displaced proven preferred rate: preferred=%.0f B/s want~%d; booster=%.0f B/s", preferredRate, preferredBytesPS, boosterRate)
 	}
 	if boosterBytes == 0 {
 		t.Fatal("excess demand never reached booster")
 	}
 }
 
+func TestPreferredCapacityTarget50DoesNotPullProven75Down(t *testing.T) {
+	const (
+		preferredBytesPS = 75_000_000 / 8
+		offeredBytesPS   = 120_000_000 / 8
+	)
+	controller := newPreferredCapacityController(50, time.Second, 64<<10)
+	t0 := time.Unix(300, 0)
+	primePreferredProtection(t, controller, t0, preferredBytesPS)
+	core, preferred, booster := capacitySchedulerCore(controller)
+	preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
+	preferredBytes, boosterBytes := runBoosterBiasedAssignments(t, controller, []*mpCore{core}, offeredBytesPS, 4*time.Second, t0.Add(time.Second))
+	preferredRate := float64(preferredBytes) / 4
+	if preferredRate < float64(preferredBytesPS)-float64(core.cfg.ChunkSize) {
+		t.Fatalf("target=50 pulled proven 75 Mbps preferred down: %.0f B/s", preferredRate)
+	}
+	if boosterBytes == 0 {
+		t.Fatal("target=50 prevented additive booster use")
+	}
+}
+
+func TestPreferredCapacitySharedProtectionAcrossCores(t *testing.T) {
+	const (
+		protectedBytesPS = 80_000_000 / 8
+		offeredBytesPS   = 160_000_000 / 8
+	)
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(400, 0)
+	primePreferredProtection(t, controller, t0, protectedBytesPS)
+	cores := make([]*mpCore, 8)
+	for i := range cores {
+		core, preferred, booster := capacitySchedulerCore(controller)
+		preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
+		cores[i] = core
+	}
+	preferredBytes, boosterBytes := runBoosterBiasedAssignments(t, controller, cores, offeredBytesPS, 4*time.Second, t0.Add(time.Second))
+	preferredRate := float64(preferredBytes) / 4
+	tolerance := float64(cores[0].cfg.ChunkSize)
+	if diff := preferredRate - protectedBytesPS; diff < -tolerance || diff > tolerance {
+		t.Fatalf("shared aggregate protected rate %.0f B/s, want ~%d B/s; booster=%d", preferredRate, protectedBytesPS, boosterBytes)
+	}
+	if boosterBytes == 0 {
+		t.Fatal("shared protection multiplied target by flow count and starved booster")
+	}
+}
+
+func TestPreferredCapacityPreActivationSurplusCannotLicenseImmediateDisplacement(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(500, 0)
+	// Record many preferred-only assignments before first booster activation.
+	for i := 0; i < 64; i++ {
+		_, r := controller.reserveAssignment(t0.Add(time.Duration(i)*time.Millisecond), 64<<10, true, false)
+		if r == nil {
+			t.Fatal("preferred assignment reservation missing")
+		}
+		r.commit()
+	}
+	controller.capacityState(t0)
+	controller.observePreferredDelivery(90_000_000/8, t0.Add(time.Second))
+	snapshot := controller.capacityState(t0.Add(time.Second))
+	controller.activateProtection(t0.Add(time.Second), snapshot)
+	core, preferred, booster := capacitySchedulerCore(controller)
+	preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
+	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, t0.Add(time.Second))
+	if selection.leg != preferred {
+		t.Fatalf("pre-activation preferred traffic licensed immediate booster displacement: got leg %v", legIDForCapacityTest(selection.leg))
+	}
+	selection.finish(nil)
+}
+
 func TestPreferredCapacityBusyPreferredDoesNotBlockBooster(t *testing.T) {
 	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(600, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
 	core, preferred, booster := capacitySchedulerCore(controller)
 	preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
 	preferred.busy = true
-	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(300, 0))
+	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, t0.Add(time.Second))
 	if selection.leg != booster {
 		t.Fatalf("busy preferred blocked/replaced original booster candidate: got leg %v", legIDForCapacityTest(selection.leg))
 	}
@@ -120,11 +226,13 @@ func TestPreferredCapacityBusyPreferredDoesNotBlockBooster(t *testing.T) {
 
 func TestPreferredCapacityFullPreferredDoesNotBlockBooster(t *testing.T) {
 	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(700, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
 	core, preferred, booster := capacitySchedulerCore(controller)
 	preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
 	preferred.path.Sent = uint64(core.cfg.ReplayBytes)
 	preferred.path.Received = 0
-	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(400, 0))
+	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, t0.Add(time.Second))
 	if selection.leg != booster {
 		t.Fatalf("pipeline-full preferred blocked/replaced original booster candidate: got leg %v", legIDForCapacityTest(selection.leg))
 	}
@@ -134,7 +242,7 @@ func TestPreferredCapacityDisabledReturnsOriginalDecision(t *testing.T) {
 	core, preferred, booster := capacitySchedulerCore(nil)
 	preferBoosterForCapacityTest(preferred, booster, uint64(core.cfg.ChunkSize))
 	want := core.choosePathLocked(core.cfg.ChunkSize)
-	got := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(500, 0)).leg
+	got := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(800, 0)).leg
 	if got != want || got != booster {
 		t.Fatalf("disabled capacity changed beta6 decision: got=%v want=%v", legIDForCapacityTest(got), legIDForCapacityTest(want))
 	}
@@ -142,6 +250,8 @@ func TestPreferredCapacityDisabledReturnsOriginalDecision(t *testing.T) {
 
 func TestPreferredCapacityNaturalPreferredIsNotCapped(t *testing.T) {
 	controller := newPreferredCapacityController(50, time.Second, 64<<10)
+	t0 := time.Unix(900, 0)
+	primePreferredProtection(t, controller, t0, 75_000_000/8)
 	core, preferred, booster := capacitySchedulerCore(controller)
 	// Make booster slower by outstanding work so original beta6 naturally picks preferred.
 	booster.path.Sent = 16 * uint64(core.cfg.ChunkSize)
@@ -149,26 +259,112 @@ func TestPreferredCapacityNaturalPreferredIsNotCapped(t *testing.T) {
 	preferred.path.Sent = 0
 	preferred.path.Received = 0
 	for i := 0; i < 32; i++ {
-		selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(600, int64(i)*1_000_000))
+		selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, t0.Add(time.Second+time.Duration(i)*time.Millisecond))
 		if selection.leg != preferred {
-			t.Fatalf("target acted as a cap on natural preferred at iteration %d: leg=%v", i, legIDForCapacityTest(selection.leg))
+			t.Fatalf("target/protection acted as a cap on natural preferred at iteration %d: leg=%v", i, legIDForCapacityTest(selection.leg))
 		}
 		selection.finish(nil)
 	}
 }
 
-func TestPreferredCapacityRecoveryFailoverBypassesGateAndFloor(t *testing.T) {
+func TestPreferredCapacityLowDemandDoesNotDecayProvenRate(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1000, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	for window := 1; window <= preferredCapacityDegradeWindows+1; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		// Only 60 Mbps is assigned and delivered. That is low demand, not evidence
+		// that the path lost its previously proven 90 Mbps capability.
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 60_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(60_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 90_000_000/8 {
+		t.Fatalf("low demand decayed protected rate: got=%d want=%d", got, 90_000_000/8)
+	}
+}
+
+func TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1100, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	for window := 1; window <= preferredCapacityDegradeWindows+1; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		// A hypothetical buggy scheduler only gives preferred 70 Mbps and it
+		// delivers all 70. This must NOT be interpreted as physical degradation;
+		// otherwise the controller would ratify the scheduler's own displacement.
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 70_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(70_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 90_000_000/8 {
+		t.Fatalf("scheduler under-assignment ratified its own displacement: got=%d want=%d", got, 90_000_000/8)
+	}
+}
+
+func TestPreferredCapacityRealDeliveryDegradationDecaysConservatively(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1200, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	for window := 1; window <= preferredCapacityDegradeWindows; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 90_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(80_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+		if window < preferredCapacityDegradeWindows && controller.snapshot().ProtectedBytesPS != 90_000_000/8 {
+			t.Fatalf("protected rate decayed before %d consecutive evidence windows", preferredCapacityDegradeWindows)
+		}
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 80_000_000/8 {
+		t.Fatalf("real sustained degradation did not decay protected rate: got=%d want=%d", got, 80_000_000/8)
+	}
+}
+
+func TestPreferredCapacityRealDegradationMayFallBelowAdmissionTarget(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1250, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	for window := 1; window <= preferredCapacityDegradeWindows; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 90_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(60_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 60_000_000/8 {
+		t.Fatalf("configured admission target became an impossible post-activation floor: got=%d want=%d", got, 60_000_000/8)
+	}
+}
+
+func TestPreferredCapacityHigherPeerDeliveryRaisesProtection(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1300, 0)
+	primePreferredProtection(t, controller, t0, 80_000_000/8)
+	start := t0.Add(time.Second)
+	_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 95_000_000/8, true, false)
+	r.commit()
+	controller.observePreferredDelivery(95_000_000/8, start.Add(time.Second))
+	controller.capacityState(start.Add(time.Second))
+	if got := controller.snapshot().ProtectedBytesPS; got != 95_000_000/8 {
+		t.Fatalf("higher peer delivery did not raise protected rate: got=%d want=%d", got, 95_000_000/8)
+	}
+}
+
+func TestPreferredCapacityRecoveryFailoverBypassesGateAndProtection(t *testing.T) {
 	controller := newPreferredCapacityController(70, time.Second, 64<<10)
 	policy := &recoveryPolicy{}
 	policy.update(1, 0b10, 1) // leg0 unavailable, leg1 allowed.
 	core, _, booster := capacitySchedulerCore(controller)
 	core.cfg.Recovery = policy
-	if !core.preferredCapacityActivationReady(time.Unix(700, 0)) {
+	if !core.preferredCapacityActivationReady(time.Unix(1400, 0)) {
 		t.Fatal("capacity gate blocked true recovery failover")
 	}
-	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(700, 0))
+	selection := core.choosePathForSubmitLocked(core.cfg.ChunkSize, time.Unix(1400, 0))
 	if selection.leg != booster {
-		t.Fatalf("capacity floor overrode recovery leg1: got leg %v", legIDForCapacityTest(selection.leg))
+		t.Fatalf("capacity protection overrode recovery leg1: got leg %v", legIDForCapacityTest(selection.leg))
 	}
 }
 
@@ -219,51 +415,53 @@ func TestPreferredCapacityRepairRangesExcludedFromDelivery(t *testing.T) {
 func TestPreferredCapacityCrossCoreTimestampDoesNotMintCredit(t *testing.T) {
 	const chunk = 64 << 10
 	controller := newPreferredCapacityController(70, time.Second, chunk)
-	t0 := time.Unix(800, 0)
-	// Initialize at t0 and consume the initial preferred assignment.
-	_, r := controller.reserveAssignment(t0, chunk, true, false)
-	if r == nil {
-		t.Fatal("initial preferred reservation missing")
-	}
-	// A later core advances the shared clock.
-	_, _ = controller.reserveAssignment(t0.Add(20*time.Millisecond), chunk, true, false)
-	before := controller.snapshot().CreditBytes
+	t0 := time.Unix(1500, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	// Consume the initial post-activation preferred debt.
+	_, r := controller.reserveAssignment(t0.Add(time.Second), chunk, true, false)
+	r.commit()
+
+	controller.mu.Lock()
+	controller.refillCreditLocked(t0.Add(time.Second+20*time.Millisecond), chunk)
+	before := int64(controller.credit)
 	// Another core captured an older timestamp but enters the controller later.
-	_, _ = controller.reserveAssignment(t0.Add(10*time.Millisecond), chunk, false, false)
-	afterOld := controller.snapshot().CreditBytes
-	// No backwards movement may create extra elapsed credit.
-	_, _ = controller.reserveAssignment(t0.Add(21*time.Millisecond), chunk, false, false)
-	afterNext := controller.snapshot().CreditBytes
+	controller.refillCreditLocked(t0.Add(time.Second+10*time.Millisecond), chunk)
+	afterOld := int64(controller.credit)
+	controller.refillCreditLocked(t0.Add(time.Second+21*time.Millisecond), chunk)
+	afterNext := int64(controller.credit)
+	protected := controller.reservationRateLocked()
+	controller.mu.Unlock()
 	if afterOld != before {
 		t.Fatalf("out-of-order timestamp changed shared credit: before=%d after=%d", before, afterOld)
 	}
-	maxOneMillisecondEarned := int64(controller.targetBytesPS / 1000)
+	maxOneMillisecondEarned := int64(protected / 1000)
 	if delta := afterNext - afterOld; delta < 0 || delta > maxOneMillisecondEarned+2 {
 		t.Fatalf("out-of-order timestamp minted duplicate credit: delta=%d max~%d", delta, maxOneMillisecondEarned)
 	}
 }
 
-func TestPreferredCapacityHistoricalSurplusDoesNotLeakBelowTarget(t *testing.T) {
+func TestPreferredCapacityHistoricalSurplusDoesNotLeakBelowProtectedRate(t *testing.T) {
 	const chunk = 64 << 10
 	controller := newPreferredCapacityController(70, time.Second, chunk)
-	t0 := time.Unix(900, 0)
+	t0 := time.Unix(1600, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
 	controller.mu.Lock()
-	controller.creditLast = t0
+	controller.creditLast = t0.Add(time.Second)
 	controller.credit = -float64(4 * chunk)
 	controller.mu.Unlock()
-	// 40 Mbps offered load spaces 64 KiB chunks by ~13 ms, longer than the
-	// ~7.5 ms needed for a 70 Mbps target to owe one chunk. Historical surplus
-	// must therefore be cleared and the next booster candidate forced preferred.
+	// 40 Mbps offered load spaces 64 KiB chunks longer than the time needed for
+	// a 90 Mbps protected rate to owe one chunk. Historical surplus must therefore
+	// be cleared and the next booster candidate forced preferred.
 	step := time.Duration(float64(time.Second) * float64(chunk) / 5_000_000)
-	force, reservation := controller.reserveAssignment(t0.Add(step), chunk, false, true)
+	force, reservation := controller.reserveAssignment(t0.Add(time.Second).Add(step), chunk, false, true)
 	if !force || reservation == nil {
-		t.Fatalf("historical preferred surplus leaked booster DATA below target: force=%v reservation=%v snapshot=%+v", force, reservation, controller.snapshot())
+		t.Fatalf("historical preferred surplus leaked booster DATA below protected rate: force=%v reservation=%v snapshot=%+v", force, reservation, controller.snapshot())
 	}
 }
 
 func TestPreferredCapacityDeliveryTimeDoesNotMoveBackward(t *testing.T) {
 	controller := newPreferredCapacityController(70, time.Second, 64<<10)
-	t0 := time.Unix(1000, 0)
+	t0 := time.Unix(1700, 0)
 	if controller.capacityReady(t0) {
 		t.Fatal("unexpected initial readiness")
 	}
@@ -273,5 +471,68 @@ func TestPreferredCapacityDeliveryTimeDoesNotMoveBackward(t *testing.T) {
 	controller.observePreferredDelivery(4_375_000, t0.Add(600*time.Millisecond))
 	if !controller.capacityReady(t0.Add(time.Second)) {
 		t.Fatalf("out-of-order delivery timestamp corrupted aggregate window: %+v", controller.snapshot())
+	}
+}
+
+func TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1800, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+	for window := 1; window <= preferredCapacityDegradeWindows+1; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		// 85 Mbps is materially below the proven 90 Mbps protected rate, but still
+		// close enough that a broad percentage threshold could incorrectly treat it
+		// as sufficient offered work and ratify scheduler displacement.
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 85_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(80_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 90_000_000/8 {
+		t.Fatalf("moderate scheduler under-assignment ratified physical degradation: got=%d want=%d", got, 90_000_000/8)
+	}
+}
+
+func TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	t0 := time.Unix(1900, 0)
+	primePreferredProtection(t, controller, t0, 90_000_000/8)
+
+	// First prove a real decline below the admission target: assignment remains at
+	// the protected 90 Mbps, while peer-confirmed normal delivery sustains only 60.
+	for window := 1; window <= preferredCapacityDegradeWindows; window++ {
+		start := t0.Add(time.Duration(window) * time.Second)
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 90_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(60_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 60_000_000/8 {
+		t.Fatalf("first below-target physical decline not learned: got=%d want=%d", got, 60_000_000/8)
+	}
+
+	// A further real decline must be judged against the current protected 60 Mbps,
+	// not the original admission target 70 Mbps.
+	for window := 1; window <= preferredCapacityDegradeWindows; window++ {
+		start := t0.Add(time.Duration(preferredCapacityDegradeWindows+window) * time.Second)
+		_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 60_000_000/8, true, false)
+		r.commit()
+		controller.observePreferredDelivery(50_000_000/8, start.Add(time.Second))
+		controller.capacityState(start.Add(time.Second))
+	}
+	if got := controller.snapshot().ProtectedBytesPS; got != 50_000_000/8 {
+		t.Fatalf("second below-target physical decline not learned: got=%d want=%d", got, 50_000_000/8)
+	}
+
+	// Existing active traffic may recover while still below the configured 70 Mbps
+	// admission threshold. Higher peer-confirmed normal delivery must raise the
+	// protection immediately; target is not a post-activation relearning floor.
+	start := t0.Add(time.Duration(preferredCapacityDegradeWindows*2+1) * time.Second)
+	_, r := controller.reserveAssignment(start.Add(100*time.Millisecond), 65_000_000/8, true, false)
+	r.commit()
+	controller.observePreferredDelivery(65_000_000/8, start.Add(time.Second))
+	controller.capacityState(start.Add(time.Second))
+	if got := controller.snapshot().ProtectedBytesPS; got != 65_000_000/8 {
+		t.Fatalf("below-target recovery did not raise delivery-proven protection: got=%d want=%d", got, 65_000_000/8)
 	}
 }

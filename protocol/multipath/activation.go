@@ -40,7 +40,7 @@ func (c *mpCore) activationLoop() {
 			capacity := c.preferredCapacityActivationState(now)
 			bytesNow := c.ingressBytes.Load()
 			if info, ok := activationAfterBytes(c.cfg, bytesNow, windowBase, now.Sub(windowStart)); ok && capacity.DeliveryReady {
-				c.attachPreferredCapacityActivation(&info, capacity)
+				c.preparePreferredCapacityActivation(now, &info, capacity)
 				c.activate(info)
 				return
 			}
@@ -59,7 +59,7 @@ func (c *mpCore) activationLoop() {
 						ThresholdBytesPS: c.cfg.ThresholdBytesPS,
 						Elapsed:          elapsed,
 					}
-					c.attachPreferredCapacityActivation(&info, capacity)
+					c.preparePreferredCapacityActivation(now, &info, capacity)
 					c.activate(info)
 					return
 				}
@@ -87,7 +87,7 @@ func (c *mpCore) activationLoop() {
 						Elapsed:          now.Sub(queueHighSince),
 						RequiredDuration: c.cfg.ActivationWindow,
 					}
-					c.attachPreferredCapacityActivation(&info, capacity)
+					c.preparePreferredCapacityActivation(now, &info, capacity)
 					c.activate(info)
 					return
 				}
@@ -115,12 +115,25 @@ func (c *mpCore) preferredCapacityActivationReady(now time.Time) bool {
 	return c.preferredCapacityActivationState(now).DeliveryReady
 }
 
-func (c *mpCore) attachPreferredCapacityActivation(info *activationInfo, capacity preferredCapacitySnapshot) {
-	if info == nil || c.cfg.PreferredCapacity == nil {
+func (c *mpCore) preparePreferredCapacityActivation(now time.Time, info *activationInfo, capacity preferredCapacitySnapshot) {
+	controller := c.cfg.PreferredCapacity
+	if info == nil || controller == nil {
+		return
+	}
+	// True recovery/failover may activate leg1 while preferred is explicitly
+	// unavailable. That path bypasses the capacity gate and must not establish a
+	// normal additive-protection epoch from a synthetic ready=true snapshot.
+	if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(0) {
 		return
 	}
 	info.PreferredCapacityTargetBytesPS = capacity.TargetBytesPS
 	info.PreferredCapacityRateBytesPS = capacity.DeliveryRate
+	info.PreferredCapacityProtectedBytesPS = capacity.ProtectedBytesPS
+	controller.activateProtection(now, capacity)
+	// activateProtection may establish the first additive-protection epoch. Read
+	// the resulting protected rate for diagnostics so the activation record says
+	// what the scheduler actually committed to preserve, not only the gate rate.
+	info.PreferredCapacityProtectedBytesPS = controller.snapshot().ProtectedBytesPS
 }
 
 func activationAfterBytes(cfg coreConfig, bytesNow, windowBase uint64, elapsed time.Duration) (activationInfo, bool) {
