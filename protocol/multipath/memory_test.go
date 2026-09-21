@@ -63,6 +63,25 @@ func acquireTestMemory(t *testing.T, budget *memoryBudget, size int) []byte {
 	return buffer
 }
 
+func waitMemoryBudgetReclaimIdle(budget *memoryBudget, timeout time.Duration) bool {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		budget.access.Lock()
+		done := budget.pendingReclaim == 0 && !budget.scavenging && !budget.scavengeQueued
+		changed := budget.changed
+		budget.access.Unlock()
+		if done {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-deadline.C:
+			return false
+		}
+	}
+}
+
 func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 	budget := newMemoryBudget(1024, false)
 	first := acquireTestMemory(t, budget, 800)
@@ -80,14 +99,39 @@ func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 		t.Fatal("booster resumed above low watermark")
 	}
 	budget.release(first)
-	if !budget.boosterAllowed() || !budget.reservePage(64, false) {
-		t.Fatal("booster did not resume")
+	if !budget.boosterAllowed() {
+		t.Fatal("booster did not resume below low watermark")
 	}
+
+	oldScavenge := memoryScavenge
+	var calls atomic.Int32
+	memoryScavenge = func() { calls.Add(1) }
+	t.Cleanup(func() {
+		_ = waitMemoryBudgetReclaimIdle(budget, time.Second)
+		memoryScavenge = oldScavenge
+	})
+
+	// Page admission is intentionally non-blocking. The first attempt may detach
+	// physically committed TX cache and queue reclaim, but it must not run a
+	// process-wide scavenge inline or spend that credit before reclaim completes.
+	if budget.reservePage(64, false) {
+		t.Fatal("booster page admission unexpectedly reclaimed physical credit inline")
+	}
+	if !waitMemoryBudgetReclaimIdle(budget, time.Second) {
+		t.Fatal("background reclaim did not finish")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("scavenge calls=%d, want 1", calls.Load())
+	}
+	if !budget.reservePage(64, false) {
+		t.Fatal("booster did not resume after background reclaim")
+	}
+
 	budget.releaseSession(64)
 	cached := acquireTestMemory(t, budget, 64)
 	budget.release(cached)
 	snapshot := budget.snapshot()
-	if snapshot.Pressure || snapshot.PressureEvents != 1 {
+	if snapshot.Pressure || snapshot.PressureEvents == 0 {
 		t.Fatalf("unexpected final memory snapshot: %+v", snapshot)
 	}
 	if snapshot.PeakUsedBytes < 1000 || snapshot.PeakCachedBytes < 64 {
@@ -275,9 +319,12 @@ func TestMemoryBudgetScavengeRunsOutsideBudgetLockAndKeepsCredit(t *testing.T) {
 	budget.release(second)
 
 	oldScavenge := memoryScavenge
-	calls := 0
+	var calls atomic.Int32
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
 	memoryScavenge = func() {
-		calls++
+		calls.Add(1)
 		// This lock acquisition would deadlock if production called the
 		// process-wide scavenge while holding budget.access.
 		budget.access.Lock()
@@ -285,30 +332,54 @@ func TestMemoryBudgetScavengeRunsOutsideBudgetLockAndKeepsCredit(t *testing.T) {
 			t.Errorf("physical credit returned before scavenge: pending=%d used=%d", budget.pendingReclaim, budget.used)
 		}
 		budget.access.Unlock()
+		started <- struct{}{}
+		<-release
 	}
-	t.Cleanup(func() { memoryScavenge = oldScavenge })
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = waitMemoryBudgetReclaimIdle(budget, time.Second)
+		memoryScavenge = oldScavenge
+	})
 
-	done := make(chan []byte, 1)
-	go func() {
-		buffer, _ := budget.tryAcquirePrimary(96 << 10)
-		done <- buffer
-	}()
-	select {
-	case buffer := <-done:
-		if buffer == nil {
-			t.Fatal("allocation did not resume after scavenging detached cache")
-		}
-		if calls != 1 {
-			t.Fatalf("scavenge calls=%d, want 1", calls)
-		}
-		snapshot := budget.snapshot()
-		if snapshot.UsedBytes != 96<<10 || budget.pendingReclaim != 0 || budget.scavenging {
-			t.Fatalf("post-scavenge accounting mismatch: snapshot=%+v pending=%d scavenging=%v", snapshot, budget.pendingReclaim, budget.scavenging)
-		}
-		budget.release(buffer)
-	case <-time.After(time.Second):
-		t.Fatal("scavenge path blocked on memoryBudget mutex")
+	buffer, changed := budget.tryAcquirePrimary(96 << 10)
+	if buffer != nil || changed == nil {
+		t.Fatalf("first allocation must wait for asynchronous reclaim: buffer=%v changed=%v", buffer != nil, changed != nil)
 	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background scavenge did not start or held memoryBudget mutex")
+	}
+
+	budget.access.Lock()
+	pending, used, scavenging := budget.pendingReclaim, budget.used, budget.scavenging
+	budget.access.Unlock()
+	if pending != 128<<10 || used != 128<<10 || !scavenging {
+		t.Fatalf("physical credit changed before scavenge completion: pending=%d used=%d scavenging=%v", pending, used, scavenging)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("reclaim completion did not signal blocked allocator")
+	}
+	if !waitMemoryBudgetReclaimIdle(budget, time.Second) {
+		t.Fatal("background reclaim did not finish")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("scavenge calls=%d, want 1", calls.Load())
+	}
+
+	buffer, _ = budget.tryAcquirePrimary(96 << 10)
+	if buffer == nil {
+		t.Fatal("allocation did not resume after asynchronous scavenge")
+	}
+	snapshot := budget.snapshot()
+	if snapshot.UsedBytes != 96<<10 || budget.pendingReclaim != 0 || budget.scavenging {
+		t.Fatalf("post-scavenge accounting mismatch: snapshot=%+v pending=%d scavenging=%v", snapshot, budget.pendingReclaim, budget.scavenging)
+	}
+	budget.release(buffer)
 }
 
 func TestMemoryBudgetIdleScavengeCoversNonSlabGarbage(t *testing.T) {
@@ -419,14 +490,27 @@ func TestMemoryBudgetPendingPageCreditScavengedBeforeFreshPageAdmission(t *testi
 		t.Fatalf("released page credit became spendable before scavenge: used=%d pending=%d", budget.snapshot().UsedBytes, budget.pendingReclaim)
 	}
 	oldScavenge := memoryScavenge
-	calls := 0
-	memoryScavenge = func() { calls++ }
-	t.Cleanup(func() { memoryScavenge = oldScavenge })
-	if !budget.reservePage(page, true) {
-		t.Fatal("fresh page admission did not reclaim pending physical page credit")
+	var calls atomic.Int32
+	memoryScavenge = func() { calls.Add(1) }
+	t.Cleanup(func() {
+		_ = waitMemoryBudgetReclaimIdle(budget, time.Second)
+		memoryScavenge = oldScavenge
+	})
+
+	// PageMemory admission is non-blocking. It must queue reclaim and fail this
+	// attempt rather than performing a process-wide GC while a protocol lock may
+	// be held. Only a later attempt may spend the reclaimed physical credit.
+	if budget.reservePage(page, true) {
+		t.Fatal("fresh page admission reclaimed pending physical credit inline")
 	}
-	if calls != 1 {
-		t.Fatalf("scavenge calls=%d, want 1", calls)
+	if !waitMemoryBudgetReclaimIdle(budget, time.Second) {
+		t.Fatal("background page reclaim did not finish")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("scavenge calls=%d, want 1", calls.Load())
+	}
+	if !budget.reservePage(page, true) {
+		t.Fatal("fresh page admission did not resume after background reclaim")
 	}
 	if snapshot := budget.snapshot(); snapshot.UsedBytes != 2*page || budget.pendingReclaim != 0 {
 		t.Fatalf("post-reclaim page accounting mismatch: snapshot=%+v pending=%d", snapshot, budget.pendingReclaim)
@@ -443,11 +527,16 @@ func TestMemoryBudgetReservePageNeverScavengesInline(t *testing.T) {
 	oldScavenge := memoryScavenge
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
 	memoryScavenge = func() {
 		started <- struct{}{}
 		<-release
 	}
-	t.Cleanup(func() { memoryScavenge = oldScavenge })
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = waitMemoryBudgetReclaimIdle(budget, time.Second)
+		memoryScavenge = oldScavenge
+	})
 
 	begin := time.Now()
 	if budget.reservePage(32<<10, true) {
@@ -464,18 +553,10 @@ func TestMemoryBudgetReservePageNeverScavengesInline(t *testing.T) {
 	if snapshot := budget.snapshot(); snapshot.UsedBytes != 128<<10 || budget.pendingReclaim == 0 {
 		t.Fatalf("physical credit changed before background scavenge: snapshot=%+v pending=%d", snapshot, budget.pendingReclaim)
 	}
-	close(release)
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		budget.access.Lock()
-		pending, scavenging := budget.pendingReclaim, budget.scavenging
-		budget.access.Unlock()
-		if pending == 0 && !scavenging {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	releaseOnce.Do(func() { close(release) })
+	if !waitMemoryBudgetReclaimIdle(budget, time.Second) {
+		t.Fatal("background reclaim did not finish")
 	}
-	t.Fatal("background reclaim did not finish")
 }
 
 func TestMemoryBudgetAcquireDoesNotSpinDuringScavenge(t *testing.T) {
@@ -506,11 +587,16 @@ func TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget(t *testing.T) {
 	oldScavenge := memoryScavenge
 	started := make(chan struct{}, 8)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
 	memoryScavenge = func() {
 		started <- struct{}{}
 		<-release
 	}
-	t.Cleanup(func() { memoryScavenge = oldScavenge })
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = waitMemoryBudgetReclaimIdle(budget, time.Second)
+		memoryScavenge = oldScavenge
+	})
 
 	var wg sync.WaitGroup
 	for range 32 {
@@ -531,5 +617,8 @@ func TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget(t *testing.T) {
 		t.Fatal("duplicate queued scavenge started for one budget")
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(release)
+	releaseOnce.Do(func() { close(release) })
+	if !waitMemoryBudgetReclaimIdle(budget, time.Second) {
+		t.Fatal("queued scavenge did not finish")
+	}
 }
