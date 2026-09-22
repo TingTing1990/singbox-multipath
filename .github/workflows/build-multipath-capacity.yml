@@ -122,9 +122,9 @@ jobs:
             'protocol/multipath/budget_stream.go':'ced4439d2c59e02342c6b363b43ae1fd3e478fc411e6859b73f53713b2ef1e0e',
             'protocol/multipath/capacity.go':'7db160620618714cab86107bf7cfd3b30e91791b5e8fa1593117017c78858c02',
             'protocol/multipath/capacity_test.go':'77771f4ba211dd193da82a47ef8b051e0b7255660242c6b7e408e37f8d219c9d',
-            'protocol/multipath/core.go':'7c1954b34a8a8169c0e0a3de1eecff704ddeeb766b0c1ed3c879d8e3f0526c04',
-            'protocol/multipath/memory.go':'ae6b042491830b0b771675a6918f8adbd5e56a2eaa917f2c46e05a3a65001fb0',
-            'protocol/multipath/memory_test.go':'3640928af9507da2bba6fc80069a282966000a1acd6d8ca9c778ec212e44016e',
+            'protocol/multipath/core.go':'9ff1bd421b92f4a91dc433504564b20fda576ccd02975d017cf536c0723e58de',
+            'protocol/multipath/memory.go':'9fd09bb6df2eb872a6d3b187f3a5aaec3f82736b7978acbeb667eae719b0d1b3',
+            'protocol/multipath/memory_test.go':'15187586377341b94587ab1dbeb95517654458fe26f34fce266acf8a72af2466',
             'protocol/multipath/scheduler.go':'41bfafbb745466107b3d6bbd594c52575881c5c3382f7889633f9e8d36a1169e',
             'protocol/multipath/stream/path.go':'c1a7d58f03424ad99c0464f6ada7a85b751339cdb7e06c061f7a07223222a2ac',
             'protocol/multipath/stream/receive.go':'4f1b2e12df35b249c8061d4e74aebbcc142c99ad7915c765c982c9fd0da6e10e',
@@ -230,13 +230,18 @@ jobs:
               req(mod==EXPECTED and not add and not rem,f'write-set mod={sorted(mod)} add={sorted(add)} rem={sorted(rem)}')
               for rel in FROZEN: req((ROOT/rel).read_bytes()==(BASE/rel).read_bytes(),'frozen drift '+rel)
               req('go 1.25.5' in txt(ROOT,'go.mod'),'Go version drift')
-              same_except('protocol/multipath/core.go',{'Release'})
+              same_except('protocol/multipath/core.go',{'Release','releaseAfterShutdown'})
               same_except('protocol/multipath/scheduler.go',{'handleWindow'})
               same_except('protocol/multipath/capacity.go',{'recordPreferredCapacityRange','confirmPreferredCapacityDelivery'})
               same_except('protocol/multipath/stream/send.go',{'Acknowledge'})
               same_except('protocol/multipath/stream/path.go',{'Feedback'})
               same_except('protocol/multipath/stream/receive.go',{'Insert','Consume','Close','pruneTail','pruneTailForHead','resetReceivePage','takeReusablePage','recyclePage'})
               req('c.memory.releasePage(stream.PageCharge)' in one(ROOT,'protocol/multipath/core.go','Release'),'RX page retirement missing')
+              shutdown=one(ROOT,'protocol/multipath/core.go','releaseAfterShutdown')
+              req('if c.memory.sessions.Add(-1) == 0' in shutdown and 'c.memory.reclaimPendingAfterLastSession()' in shutdown,'final-session pending reclaim missing')
+              req(shutdown.find('c.stateMu.Unlock()') < shutdown.find('c.memory.reclaimPendingAfterLastSession()'),'final-session reclaim runs under stateMu')
+              final_reclaim=one(ROOT,'protocol/multipath/memory.go','reclaimPendingAfterLastSession')
+              req('b.scavengePending(false)' in final_reclaim and 'memoryScavenge()' not in final_reclaim,'final-session reclaim bypasses controlled scavenge')
               cap=txt(ROOT,'protocol/multipath/capacity.go'); req('last.end == start' in cap and 'retainedPreferredCapacityRangeCapacity' in cap,'capacity metadata bound/coalesce missing')
               mem=txt(ROOT,'protocol/multipath/memory.go')
               rel=one(ROOT,'protocol/multipath/memory.go','release'); relpage=one(ROOT,'protocol/multipath/memory.go','releasePage')
@@ -270,7 +275,7 @@ jobs:
               req('retainedSegmentCapacity = 1024' in txt(ROOT,'protocol/multipath/stream/send.go'),'segment bound missing')
               req('retainedFlightCapacity = 1024' in txt(ROOT,'protocol/multipath/stream/path.go'),'flight bound missing')
               tests='\n'.join(txt(ROOT,p) for p in ('protocol/multipath/memory_test.go','protocol/multipath/stream/stream_test.go','protocol/multipath/capacity_test.go'))
-              for name in ('TestMemoryBudgetReleasedSlabKeepsPhysicalCreditAndIsReused','TestMemoryBudgetTurnoverDoesNotMintFreshPhysicalCredit','TestMemoryBudgetScavengeRunsOutsideBudgetLockAndKeepsCredit','TestMemoryBudgetScavengeSerializesAcrossInstances','TestMemoryBudgetReleasedPageKeepsPhysicalCreditUntilScavenge','TestMemoryBudgetPendingPageCreditScavengedBeforeFreshPageAdmission','TestMemoryBudgetIdleTrimScavengesExcessCommittedCache','TestMemoryBudgetIdleScavengeCoversNonSlabGarbage','TestMemoryBudgetReservePageNeverScavengesInline','TestMemoryBudgetAcquireDoesNotSpinDuringScavenge','TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget','TestReceiverReusesConsumedPagesWithoutAllocationChurn','TestSenderDropsOversizedDrainedMetadata','TestPathDropsOversizedDrainedFlightMetadata','TestPreferredCapacityAdjacentDeliveryRangesCoalesce'):
+              for name in ('TestMemoryBudgetReleasedSlabKeepsPhysicalCreditAndIsReused','TestMemoryBudgetTurnoverDoesNotMintFreshPhysicalCredit','TestMemoryBudgetScavengeRunsOutsideBudgetLockAndKeepsCredit','TestMemoryBudgetScavengeSerializesAcrossInstances','TestMemoryBudgetReleasedPageKeepsPhysicalCreditUntilScavenge','TestMemoryBudgetPendingPageCreditScavengedBeforeFreshPageAdmission','TestMemoryBudgetIdleTrimScavengesExcessCommittedCache','TestMemoryBudgetIdleScavengeCoversNonSlabGarbage','TestMemoryBudgetReservePageNeverScavengesInline','TestMemoryBudgetAcquireDoesNotSpinDuringScavenge','TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget','TestMemoryBudgetLastSessionReclaimsPendingBeforeRelease','TestReceiverReusesConsumedPagesWithoutAllocationChurn','TestSenderDropsOversizedDrainedMetadata','TestPathDropsOversizedDrainedFlightMetadata','TestPreferredCapacityAdjacentDeliveryRangesCoalesce'):
                   req(name in tests,'missing regression '+name)
               return tree(ROOT),sorted(mod)
           rows=[]
@@ -364,6 +369,12 @@ jobs:
           go test -race -count=10 -timeout=30m -tags "$BUILD_TAGS" \
             -run '^(TestMemoryBudget.*|TestPreferredCapacityAdjacentDeliveryRangesCoalesce)$' \
             ./protocol/multipath
+
+      - name: Frozen close and memory-release regression x10
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race ./protocol/multipath -run '^(TestBeta5BidirectionalByteStream|TestBeta5SecondaryFailureDoesNotCloseSession|TestApplicationCloseDrainsAcrossTransientLegs|TestMemoryBudgetLastSessionReclaimsPendingBeforeRelease)$' -count=10
 
       - name: Full option + multipath + Mieru regression
         shell: bash
