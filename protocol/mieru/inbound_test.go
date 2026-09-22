@@ -3,13 +3,18 @@ package mieru
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 
 	mierumodel "github.com/enfein/mieru/v3/apis/model"
@@ -120,6 +125,107 @@ func TestBuildMieruServerConfigUDP(t *testing.T) {
 	}
 }
 
+func TestMieruInboundListenerUsesSingBoxListenOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		address   string
+		network   string
+	}{
+		{name: "tcp_ipv4_loopback", transport: "TCP", address: "127.0.0.1", network: "tcp4"},
+		{name: "udp_ipv4_loopback", transport: "UDP", address: "127.0.0.1", network: "udp4"},
+		{name: "tcp_ipv6_loopback", transport: "TCP", address: "::1", network: "tcp6"},
+		{name: "udp_ipv6_loopback", transport: "UDP", address: "::1", network: "udp6"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			port, ok := reserveLoopbackPort(t, tt.network, tt.address)
+			if !ok {
+				t.Skip("requested address family is unavailable on this runner")
+			}
+			o := validMieruInboundOptions()
+			o.Transport = tt.transport
+			o.ListenPort = port
+			listenAddr := badoption.Addr(netip.MustParseAddr(tt.address))
+			o.Listen = &listenAddr
+			raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "mieru-listen-test", o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := raw.(*Inbound)
+			if err := h.Start(adapter.StartStateStart); err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+
+			var actual net.Addr
+			if tt.transport == "TCP" {
+				if h.listener.TCPListener() == nil {
+					t.Fatal("sing-box TCP listener factory was not used")
+				}
+				actual = h.listener.TCPListener().Addr()
+			} else {
+				if h.listener.UDPConn() == nil {
+					t.Fatal("sing-box UDP listener factory was not used")
+				}
+				actual = h.listener.UDPConn().LocalAddr()
+			}
+			actualHost, actualPort, err := net.SplitHostPort(actual.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if netip.MustParseAddr(actualHost).Unmap() != netip.MustParseAddr(tt.address).Unmap() {
+				t.Fatalf("listener address drift: configured=%s actual=%s", tt.address, actualHost)
+			}
+			if actualPort != fmt.Sprint(port) {
+				t.Fatalf("listener port drift: configured=%d actual=%s", port, actualPort)
+			}
+		})
+	}
+}
+
+func TestMieruInboundOmittedListenPreservesWildcardIPv4(t *testing.T) {
+	port, ok := reserveLoopbackPort(t, "tcp4", "127.0.0.1")
+	if !ok {
+		t.Fatal("IPv4 loopback unavailable")
+	}
+	o := validMieruInboundOptions()
+	o.ListenPort = port
+	raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "mieru-default-listen-test", o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*Inbound)
+	if err := h.Start(adapter.StartStateStart); err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	addr := h.listener.TCPListener().Addr().(*net.TCPAddr)
+	if !addr.IP.IsUnspecified() || addr.IP.To4() == nil {
+		t.Fatalf("omitted listen changed pre-fix wildcard IPv4 behavior: %v", addr)
+	}
+}
+
+func reserveLoopbackPort(t *testing.T, network, address string) (uint16, bool) {
+	t.Helper()
+	if network == "tcp4" || network == "tcp6" {
+		listener, err := net.Listen(network, net.JoinHostPort(address, "0"))
+		if err != nil {
+			return 0, false
+		}
+		port := uint16(listener.Addr().(*net.TCPAddr).Port)
+		_ = listener.Close()
+		return port, true
+	}
+	packetConn, err := net.ListenPacket(network, net.JoinHostPort(address, "0"))
+	if err != nil {
+		return 0, false
+	}
+	port := uint16(packetConn.LocalAddr().(*net.UDPAddr).Port)
+	_ = packetConn.Close()
+	return port, true
+}
+
 func TestMieruPacketConnReadPacketDomain(t *testing.T) {
 	wire := buf.NewSize(2048)
 	defer wire.Release()
@@ -152,11 +258,14 @@ func TestMieruPacketConnReadPacketDomain(t *testing.T) {
 func TestMieruPacketConnWritePacketIPv4(t *testing.T) {
 	pc := new(capturePacketConn)
 	wrapped := &mieruPacketConn{PacketConn: pc}
-	buffer := buf.As([]byte("payload"))
-	defer buffer.Release()
+	buffer := buf.NewSize(1024)
+	_, _ = buffer.Write([]byte("payload"))
 	destination := M.Socksaddr{Addr: netip.MustParseAddr("203.0.113.7"), Port: 53}
 	if err := wrapped.WritePacket(buffer, destination); err != nil {
 		t.Fatal(err)
+	}
+	if buffer.RawCap() != 0 {
+		t.Fatalf("WritePacket did not consume transferred buffer: cap=%d", buffer.RawCap())
 	}
 	if len(pc.writtenPacket) < 4 || pc.writtenPacket[0] != 0 || pc.writtenPacket[1] != 0 || pc.writtenPacket[2] != 0 {
 		t.Fatalf("missing SOCKS5 UDP RSV/FRAG prefix: %x", pc.writtenPacket)
@@ -175,6 +284,75 @@ func TestMieruPacketConnWritePacketIPv4(t *testing.T) {
 	}
 }
 
+func TestMieruPacketConnWritePacketConsumesBufferOnError(t *testing.T) {
+	pc := &capturePacketConn{writeErr: errors.New("injected write error")}
+	wrapped := &mieruPacketConn{PacketConn: pc}
+	buffer := buf.NewSize(1024)
+	_, _ = buffer.Write([]byte("payload"))
+	err := wrapped.WritePacket(buffer, M.Socksaddr{Addr: netip.MustParseAddr("203.0.113.7"), Port: 53})
+	if err == nil {
+		t.Fatal("expected write error")
+	}
+	if buffer.RawCap() != 0 {
+		t.Fatalf("WritePacket error path did not consume transferred buffer: cap=%d", buffer.RawCap())
+	}
+}
+
+func TestMieruPacketConnWritePacketConsumesBufferOnAddressEncodingError(t *testing.T) {
+	wrapped := &mieruPacketConn{PacketConn: new(capturePacketConn)}
+	buffer := buf.NewSize(1024)
+	_, _ = buffer.Write([]byte("payload"))
+	err := wrapped.WritePacket(buffer, M.Socksaddr{Fqdn: strings.Repeat("a", 256), Port: 53})
+	if err == nil {
+		t.Fatal("expected SOCKS5 address encoding error")
+	}
+	if buffer.RawCap() != 0 {
+		t.Fatalf("WritePacket address encoding error did not consume transferred buffer: cap=%d", buffer.RawCap())
+	}
+}
+
+func TestMieruPacketConnRejectsInvalidUDPHeader(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		prefix [3]byte
+		want   string
+	}{
+		{name: "reserved", prefix: [3]byte{1, 0, 0}, want: "reserved"},
+		{name: "fragment", prefix: [3]byte{0, 0, 1}, want: "fragment"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packet := []byte{test.prefix[0], test.prefix[1], test.prefix[2], 1, 203, 0, 113, 7, 0, 53, 'x'}
+			wrapped := &mieruPacketConn{PacketConn: &capturePacketConn{readPacket: packet}}
+			buffer := buf.NewSize(1024)
+			defer buffer.Release()
+			_, err := wrapped.ReadPacket(buffer)
+			if err == nil || !contains(err.Error(), test.want) {
+				t.Fatalf("invalid header accepted or wrong error: %v", err)
+			}
+		})
+	}
+}
+
+func TestMieruPacketConnRejectsMalformedUDPAddress(t *testing.T) {
+	packets := [][]byte{
+		{},
+		{0},
+		{0, 0},
+		{0, 0, 0},
+		{0, 0, 0, 9},
+		{0, 0, 0, 1, 127},
+	}
+	for _, packet := range packets {
+		wrapped := &mieruPacketConn{PacketConn: &capturePacketConn{readPacket: append([]byte(nil), packet...)}}
+		buffer := buf.NewSize(1024)
+		_, err := wrapped.ReadPacket(buffer)
+		buffer.Release()
+		if err == nil {
+			t.Fatalf("malformed UDP packet accepted: %x", packet)
+		}
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -187,6 +365,7 @@ func contains(s, sub string) bool {
 type capturePacketConn struct {
 	readPacket    []byte
 	writtenPacket []byte
+	writeErr      error
 }
 
 func (c *capturePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -199,6 +378,9 @@ func (c *capturePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *capturePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	c.writtenPacket = append([]byte(nil), p...)
 	return len(p), nil
 }

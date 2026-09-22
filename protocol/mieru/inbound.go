@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -50,25 +51,51 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, fmt.Errorf("failed to build mieru server config: %w", err)
 	}
+
+	// Mieru v3.36.1 owns Accept and packet processing, while sing-box owns
+	// socket creation. Keep the pre-fix Mieru default (wildcard IPv4) when
+	// listen is omitted, and apply explicit socket-level ListenOptions through
+	// sing-box ListenTCP/ListenUDP.
+	listenOptions := options.ListenOptions
+	if listenOptions.Listen == nil {
+		defaultListen := badoption.Addr(netip.IPv4Unspecified())
+		listenOptions.Listen = &defaultListen
+	}
+	socketListener := listener.New(listener.Options{
+		Context: ctx,
+		Logger:  logger,
+		Network: []string{N.NetworkTCP, N.NetworkUDP},
+		Listen:  listenOptions,
+	})
+	listenerFactory := &mieruListenerFactory{listener: socketListener}
+	config.StreamListenerFactory = listenerFactory
+	config.PacketListenerFactory = listenerFactory
+
 	s := mieruserver.NewServer()
 	if err := s.Store(config); err != nil {
 		return nil, fmt.Errorf("failed to store mieru server config: %w", err)
 	}
-	inboundInstance := &Inbound{
+	return &Inbound{
 		Adapter:   inbound.NewAdapter(C.TypeMieru, tag),
 		ctx:       ctx,
 		router:    uot.NewRouter(router, logger),
 		logger:    logger,
+		listener:  socketListener,
 		server:    s,
 		userNames: userNames,
-	}
-	inboundInstance.listener = listener.New(listener.Options{
-		Context: ctx,
-		Logger:  logger,
-		Network: []string{N.NetworkTCP, N.NetworkUDP},
-		Listen:  options.ListenOptions,
-	})
-	return inboundInstance, nil
+	}, nil
+}
+
+type mieruListenerFactory struct {
+	listener *listener.Listener
+}
+
+func (f *mieruListenerFactory) Listen(_ context.Context, _, _ string) (net.Listener, error) {
+	return f.listener.ListenTCP()
+}
+
+func (f *mieruListenerFactory) ListenPacket(_ context.Context, _, _ string) (net.PacketConn, error) {
+	return f.listener.ListenUDP()
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -192,6 +219,13 @@ func (c *mieruPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksadd
 	if buffer.Len() < 3 {
 		return M.Socksaddr{}, io.ErrShortBuffer
 	}
+	header := buffer.Bytes()[:3]
+	if header[0] != 0 || header[1] != 0 {
+		return M.Socksaddr{}, E.New("invalid SOCKS5 UDP reserved field")
+	}
+	if header[2] != 0 {
+		return M.Socksaddr{}, E.New("UDP fragment is not supported")
+	}
 	buffer.Advance(3)
 	var addr mierumodel.AddrSpec
 	if err := addr.ReadFromSocks5(buffer); err != nil {
@@ -213,6 +247,7 @@ func (c *mieruPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksadd
 }
 
 func (c *mieruPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
 	header := buf.NewSize(3 + M.MaxSocksaddrLength)
 	defer header.Release()
 	common.Must(header.WriteZeroN(3))
