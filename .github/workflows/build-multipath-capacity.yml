@@ -19,6 +19,10 @@ concurrency:
 env:
   GO_VERSION: '1.25.5'
   VERSION: '1.14.0-multipath-beta6'
+  FROZEN_GOLDEN_SHA: '7c889cbefc34b3bbc5719ecf0e44c969b216b199'
+  FROZEN_GOLDEN_TREE: '2b3c62cc0ee25af52d55411db918884208c42b6e'
+  REPAIR_BASE_SHA: '7c3473ab86f7dd8cb7995b93574ad17001ed87c2'
+  REPAIR_BASE_TREE: 'e343df90e9576b47364c4a910e62a0ec8db7424a'
 
 jobs:
   audit_test:
@@ -45,7 +49,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Resolve exact candidate and frozen pre-inbound Golden ancestor
+      - name: Resolve exact candidate against fixed Golden and fixed repair base
         id: resolve
         shell: bash
         env:
@@ -55,47 +59,25 @@ jobs:
           test -n "$SOURCE_REF"
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           grep -Fx "go ${GO_VERSION}" go.mod
+
           CANDIDATE_SHA="$(git rev-parse HEAD)"
-          BASELINE_SHA="$(python3 <<'PYRESOLVE'
-          import hashlib, subprocess, sys
-          candidate=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-          baseline={
-            'option/mieru.go':'daa9b4285131b4ad6558a22cccc9c382b110666ddef7de820d6b080a35b464b3',
-            'include/registry.go':'ea3361b6774c0c4d07ba6121667a8c5392e7a54ca36949484502285a77cd0b7e',
-            'protocol/mieru/outbound.go':'b6c38262650f65379bcf2b04e15e7d803f997e6987e0d2528c54cd64d39c2e76',
-            'go.mod':'15549baff00a3988ea31d709a7ea3e77e30ce9e0618c48e4a2fc2bcb801e9b8d',
-            'go.sum':'8b32b50751e8839951ae5082bc082cc20ab1e860b10a5068bb8695c2fca2e41e',
-            'constant/proxy.go':'1a7294b332fb7f51056200db89da662bc15e54d47679995314708d9d9a4da705',
-          }
-          expected={
-            'M\tinclude/registry.go','M\toption/mieru.go',
-            'A\tinclude/mieru_registry_test.go','A\tprotocol/mieru/inbound.go','A\tprotocol/mieru/inbound_test.go',
-          }
-          must_absent={'include/mieru_registry_test.go','protocol/mieru/inbound.go','protocol/mieru/inbound_test.go'}
-          def blob(rev,path):
-              try:return subprocess.check_output(['git','show',f'{rev}:{path}'],stderr=subprocess.DEVNULL)
-              except subprocess.CalledProcessError:return None
-          for rev in subprocess.check_output(['git','rev-list','--topo-order',candidate],text=True).splitlines()[1:]:
-              if any((d:=blob(rev,p)) is None or hashlib.sha256(d).hexdigest()!=want for p,want in baseline.items()):
-                  continue
-              if any(blob(rev,p) is not None for p in must_absent):
-                  continue
-              lines=set(x for x in subprocess.check_output(['git','diff','--name-status',rev,candidate],text=True).splitlines() if x)
-              if lines==expected:
-                  print(rev); sys.exit(0)
-          raise SystemExit('FAIL: no same-branch ancestor matches frozen Golden identities + exact 2M/3A write-set')
-          PYRESOLVE
-          )"
-          test -n "$BASELINE_SHA"
-          test "$(git merge-base "$CANDIDATE_SHA" "$BASELINE_SHA")" = "$BASELINE_SHA"
+          test "$(git rev-parse "${FROZEN_GOLDEN_SHA}^{tree}")" = "$FROZEN_GOLDEN_TREE"
+          test "$(git rev-parse "${REPAIR_BASE_SHA}^{tree}")" = "$REPAIR_BASE_TREE"
+          test "$(git merge-base "$REPAIR_BASE_SHA" "$FROZEN_GOLDEN_SHA")" = "$FROZEN_GOLDEN_SHA"
+          test "$(git merge-base "$CANDIDATE_SHA" "$REPAIR_BASE_SHA")" = "$REPAIR_BASE_SHA"
+
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-          echo "parent_sha=$BASELINE_SHA" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=$FROZEN_GOLDEN_SHA" >> "$GITHUB_OUTPUT"
+          echo "repair_base_sha=$REPAIR_BASE_SHA" >> "$GITHUB_OUTPUT"
           echo "source_ref=$SOURCE_REF"
           echo "candidate_sha=$CANDIDATE_SHA"
-          echo "golden_sha=$BASELINE_SHA"
+          echo "frozen_golden_sha=$FROZEN_GOLDEN_SHA"
+          echo "frozen_golden_tree=$FROZEN_GOLDEN_TREE"
+          echo "repair_base_sha=$REPAIR_BASE_SHA"
+          echo "repair_base_tree=$REPAIR_BASE_TREE"
           echo "go=$(go version)"
 
-      - name: Verify exact audited candidate file identities
+      - name: Verify exact repaired candidate file identities
         shell: bash
         run: |
           set -euo pipefail
@@ -103,16 +85,22 @@ jobs:
           from pathlib import Path
           import hashlib
           expected={
-            'option/mieru.go':'37c7343f6e753ec5f1b9ec7d03cb8f7b73d1ec5260bad6e73aa2fdd560e1ce1d',
             'include/registry.go':'7f37d2d09fb592953d077d664feb1c1c42ea2306a55f51355309c5eaaddf04be',
-            'protocol/mieru/inbound.go':'630d1c78097c2c0d8111e8fe2ec647e39c38ea9e565b4956f8c3e4b81e726fdf',
-            'protocol/mieru/inbound_test.go':'0f2a1ba83fbd7af96d2f989073751bb7ec4b9bcd20b845676266775c088e6379',
+            'option/mieru.go':'37c7343f6e753ec5f1b9ec7d03cb8f7b73d1ec5260bad6e73aa2fdd560e1ce1d',
             'include/mieru_registry_test.go':'b63d99542a88451cc2cbc3ab406c43df1e407c647c886914f9e7d0986af5ad6f',
+            'protocol/mieru/inbound.go':'020e78b1982d2b182f4ebab132c9a1392e50b0cabd949b1d6f7892fae4952acd',
+            'protocol/mieru/inbound_test.go':'51a3e7b0c2b7e921ccdc5f4951c71bc3d6409ee7e7cfa8085865372013d47d36',
+            'protocol/multipath/inbound.go':'93a8a8fc3f6b642292d52d0c08607d03736aa18d30aabbec519fd391295f7dc2',
+            'protocol/multipath/server_audit_test.go':'776ebccd350bbc03d9f9635c8c52f29597b58eb153f5863b330a2518a928dda3',
+            'protocol/mieru/outbound.go':'b6c38262650f65379bcf2b04e15e7d803f997e6987e0d2528c54cd64d39c2e76',
+            'go.mod':'15549baff00a3988ea31d709a7ea3e77e30ce9e0618c48e4a2fc2bcb801e9b8d',
+            'go.sum':'8b32b50751e8839951ae5082bc082cc20ab1e860b10a5068bb8695c2fca2e41e',
           }
-          for p,w in expected.items():
-              got=hashlib.sha256(Path(p).read_bytes()).hexdigest()
-              if got!=w: raise SystemExit(f'FAIL candidate identity {p}: {got} != {w}')
-              print('PASS',p,got)
+          for path,want in expected.items():
+              got=hashlib.sha256(Path(path).read_bytes()).hexdigest()
+              if got!=want:
+                  raise SystemExit(f'FAIL candidate identity {path}: {got} != {want}')
+              print('PASS',path,got)
           PYHASH
 
       - name: Set audited build inputs
@@ -125,126 +113,587 @@ jobs:
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
-      - name: Materialize exact frozen Golden baseline
+      - name: Materialize fixed Golden and fixed repair base
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE_DIR="${RUNNER_TEMP}/mieru-inbound-golden"
-          rm -rf "$BASELINE_DIR"
-          git worktree add --detach "$BASELINE_DIR" "${{ steps.resolve.outputs.parent_sha }}"
-          echo "BASELINE_DIR=$BASELINE_DIR" >> "$GITHUB_ENV"
-          echo "PARENT_DIR=$BASELINE_DIR" >> "$GITHUB_ENV"
+          GOLDEN_DIR="${RUNNER_TEMP}/frozen-golden"
+          REPAIR_DIR="${RUNNER_TEMP}/repair-base"
+          rm -rf "$GOLDEN_DIR" "$REPAIR_DIR"
+          git worktree add --detach "$GOLDEN_DIR" "$FROZEN_GOLDEN_SHA"
+          git worktree add --detach "$REPAIR_DIR" "$REPAIR_BASE_SHA"
+          echo "GOLDEN_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          echo "REPAIR_DIR=$REPAIR_DIR" >> "$GITHUB_ENV"
+          echo "PARENT_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          mkdir -p ci-evidence
 
-      - name: Full-source Mieru inbound reverse audit x10
+      - name: Full-source architecture audit - 10 independent domains
         shell: bash
         run: |
           set -euo pipefail
-          cat > "${RUNNER_TEMP}/mieru-inbound-audit.py" <<'PYAUDIT'
+          cat > "${RUNNER_TEMP}/freeze-audit.py" <<'PYAUDIT'
           from pathlib import Path
           import hashlib, os, subprocess, sys
-          ROOT=Path(os.environ['GITHUB_WORKSPACE']); BASE=Path(os.environ['BASELINE_DIR'])
-          EM={'include/registry.go','option/mieru.go'}
-          EA={'include/mieru_registry_test.go','protocol/mieru/inbound.go','protocol/mieru/inbound_test.go'}
-          def req(c,m):
-              if not c: raise RuntimeError(m)
-          def tracked(root):
-              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z']); out=[]
-              for rec in raw.split(b'\0'):
-                  if not rec: continue
-                  meta,path=rec.split(b'\t',1); mode,oid,stage=meta.split(); req(stage==b'0','unmerged '+os.fsdecode(path))
-                  out.append((os.fsdecode(path),mode.decode(),oid.decode()))
-              return sorted(out)
-          def payload(root,rel,mode,oid):
-              p=root/rel
-              if mode=='160000': return b'gitlink:'+oid.encode()
-              if mode=='120000': return os.readlink(p).encode('utf-8','surrogateescape')
-              return p.read_bytes()
-          def maps(root): return {r:(m,o) for r,m,o in tracked(root)}
-          def text(rel): return (ROOT/rel).read_text(encoding='utf-8')
-          def run():
-              bm,cm=maps(BASE),maps(ROOT)
-              a=set(cm)-set(bm); d=set(bm)-set(cm); m={r for r in set(bm)&set(cm) if bm[r]!=cm[r]}
-              req(m==EM and a==EA and not d,f'write-set M={sorted(m)} A={sorted(a)} D={sorted(d)}')
-              for rel in set(bm)&set(cm)-EM:
-                  mode,oid=bm[rel]; cmode,coid=cm[rel]
-                  req(mode==cmode and payload(BASE,rel,mode,oid)==payload(ROOT,rel,cmode,coid),'Golden drift '+rel)
-              # Strong freeze: no multipath source/config/dependency drift.
-              for rel in bm:
-                  if rel=='option/multipath.go' or rel.startswith('protocol/multipath/') or rel in {'constant/proxy.go','protocol/mieru/outbound.go','go.mod','go.sum'}:
-                      mode,oid=bm[rel]; cmode,coid=cm[rel]
-                      req(mode==cmode and payload(BASE,rel,mode,oid)==payload(ROOT,rel,cmode,coid),'protected drift '+rel)
-              req('github.com/enfein/mieru/v3 v3.36.1' in text('go.mod'),'Mieru dependency drift')
-              opt=text('option/mieru.go'); reg=text('include/registry.go'); src=text('protocol/mieru/inbound.go')
-              for n in ('type MieruInboundOptions struct {','[]MieruUser','UserHintIsMandatory','type MieruUser struct {'):
-                  req(n in opt,'missing option '+n)
-              req(reg.count('mieru.RegisterInbound(registry)')==1,'inbound registration !=1')
-              req(reg.count('mieru.RegisterOutbound(registry)')==1,'outbound registration drift')
-              for n in ('mieruserver.NewServer()','s.Store(config)','h.server.Start()','h.server.Stop()','h.server.Accept()',
-                        'RouteConnectionEx(ctx, conn, metadata, nil)','NewPacketOverStreamTunnel(conn)',
-                        'RoutePacketConnectionEx(ctx, packetConn, metadata, nil)','metadata.User = userCtx.UserName()',
-                        'ReadFromSocks5(buffer)','WriteToSocks5(header)','transport must be TCP or UDP','users is empty',
-                        'username is empty','password is empty','listen_port must be set','UserHintIsMandatory: proto.Bool(true)'):
-                  req(n in src,'missing inbound invariant '+n)
-              # v3.36.1 does not have the v3.37 listenIPAddress server-config feature.
-              cfg=src[src.index('func buildMieruServerConfig'):src.index('func validateMieruInboundOptions')]
-              req('ListenIPAddress' not in cfg,'unapproved post-3.36 API introduced')
-              return (len(bm),len(cm),tuple(sorted(m)),tuple(sorted(a)))
-          rows=[]
-          for i in range(1,11):
-              try:r=run(); rows.append(r); print(f'PASS {i:02d} tracked={r[0]}->{r[1]} M={len(r[2])} A={len(r[3])}')
-              except Exception as e: print(f'FAIL {i:02d} {e}'); sys.exit(1)
-          req(len(set(rows))==1,'audit result drift')
-          print('PASS 10/10 full-source Mieru inbound reverse audits')
-          PYAUDIT
-          python3 "${RUNNER_TEMP}/mieru-inbound-audit.py"
 
-      - name: Independent Mieru inbound contract simulation x10 + mutation controls
+          ROOT=Path(os.environ.get('AUDIT_ROOT') or os.environ['GITHUB_WORKSPACE'])
+          GOLDEN=Path(os.environ['GOLDEN_DIR'])
+          REPAIR=Path(os.environ['REPAIR_DIR'])
+          FROZEN=os.environ['FROZEN_GOLDEN_SHA']
+          FROZEN_TREE=os.environ['FROZEN_GOLDEN_TREE']
+          REPAIR_SHA=os.environ['REPAIR_BASE_SHA']
+          REPAIR_TREE=os.environ['REPAIR_BASE_TREE']
+          REPAIR_M={'include/registry.go','option/mieru.go'}
+          REPAIR_A={'include/mieru_registry_test.go','protocol/mieru/inbound.go','protocol/mieru/inbound_test.go'}
+          FIX_M={'protocol/mieru/inbound.go','protocol/mieru/inbound_test.go','protocol/multipath/inbound.go','protocol/multipath/server_audit_test.go'}
+          TOTAL_M=REPAIR_M|{'protocol/multipath/inbound.go','protocol/multipath/server_audit_test.go'}
+          TOTAL_A=REPAIR_A
+
+          def req(value,message):
+              if not value: raise RuntimeError(message)
+          def git(root,*args):
+              return subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+          def tracked(root):
+              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
+              out={}
+              for record in raw.split(b'\0'):
+                  if not record: continue
+                  meta,path=record.split(b'\t',1)
+                  mode,oid,stage=meta.split()
+                  req(stage==b'0','unmerged '+os.fsdecode(path))
+                  out[os.fsdecode(path)]=(mode.decode(),oid.decode())
+              return out
+          def delta(base,root):
+              b=tracked(base); c=tracked(root)
+              a=set(c)-set(b); d=set(b)-set(c)
+              m={p for p in set(b)&set(c) if b[p]!=c[p]}
+              return b,c,m,a,d
+          def text(root,rel): return (root/rel).read_text(encoding='utf-8')
+          def hash_file(root,rel): return hashlib.sha256((root/rel).read_bytes()).hexdigest()
+          def passline(number,name,detail): print(f'PASS {number:02d} {name}: {detail}')
+
+          # 01 provenance: fixed commits/trees only; no dynamic ancestor discovery.
+          head=git(ROOT,'rev-parse','HEAD')
+          req(git(GOLDEN,'rev-parse','HEAD')==FROZEN,'Golden commit mismatch')
+          req(git(GOLDEN,'rev-parse','HEAD^{tree}')==FROZEN_TREE,'Golden tree mismatch')
+          req(git(REPAIR,'rev-parse','HEAD')==REPAIR_SHA,'repair-base commit mismatch')
+          req(git(REPAIR,'rev-parse','HEAD^{tree}')==REPAIR_TREE,'repair-base tree mismatch')
+          req(git(ROOT,'merge-base',head,REPAIR_SHA)==REPAIR_SHA,'candidate is not descendant of fixed repair base')
+          req(git(ROOT,'merge-base',REPAIR_SHA,FROZEN)==FROZEN,'repair base is not descendant of fixed Golden')
+          req(not git(ROOT,'status','--porcelain'),'candidate checkout is dirty before audit')
+          passline(1,'provenance',f'golden={FROZEN[:12]} repair={REPAIR_SHA[:12]} candidate={head[:12]}')
+
+          # 02 exact authorized deltas at both boundaries.
+          _,_,rm,ra,rd=delta(GOLDEN,REPAIR)
+          req(rm==REPAIR_M and ra==REPAIR_A and not rd,f'Golden->repair delta M={sorted(rm)} A={sorted(ra)} D={sorted(rd)}')
+          _,_,fm,fa,fd=delta(REPAIR,ROOT)
+          req(fm==FIX_M and not fa and not fd,f'repair->candidate delta M={sorted(fm)} A={sorted(fa)} D={sorted(fd)}')
+          _,_,tm,ta,td=delta(GOLDEN,ROOT)
+          req(tm==TOTAL_M and ta==TOTAL_A and not td,f'Golden->candidate delta M={sorted(tm)} A={sorted(ta)} D={sorted(td)}')
+          passline(2,'write-set','Golden 4M/3A overall; repair delta exactly 4M/0A/0D')
+
+          # 03 complete-tree freeze: mode/blob identity outside the approved sets, including gitlinks.
+          gm,cm,_,_,_=delta(GOLDEN,ROOT)
+          for rel,(mode,oid) in gm.items():
+              if rel in TOTAL_M: continue
+              req(rel in cm and cm[rel]==(mode,oid),'unapproved Golden drift '+rel)
+          rr,cr,_,_,_=delta(REPAIR,ROOT)
+          for rel,(mode,oid) in rr.items():
+              if rel in FIX_M: continue
+              req(rel in cr and cr[rel]==(mode,oid),'unapproved repair-base drift '+rel)
+          passline(3,'complete-tree-freeze',f'Golden tracked={len(gm)} candidate tracked={len(cm)} modes/gitlinks included')
+
+          # 04 dependencies and existing Mieru outbound stay frozen.
+          req('go 1.25.5' in text(ROOT,'go.mod'),'Go version drift')
+          req('github.com/enfein/mieru/v3 v3.36.1' in text(ROOT,'go.mod'),'Mieru dependency drift')
+          for rel in ('go.mod','go.sum','protocol/mieru/outbound.go','constant/proxy.go'):
+              req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'frozen dependency/outbound drift '+rel)
+          passline(4,'dependency-boundary','Go 1.25.5 + Mieru v3.36.1; outbound/go.mod/go.sum frozen')
+
+          # 05 listener ownership: sing-box creates sockets, Mieru retains Accept ownership.
+          src=text(ROOT,'protocol/mieru/inbound.go')
+          for needle in ('config.StreamListenerFactory = listenerFactory','config.PacketListenerFactory = listenerFactory',
+                         'return f.listener.ListenTCP()','return f.listener.ListenUDP()',
+                         'defaultListen := badoption.Addr(netip.IPv4Unspecified())'):
+              req(needle in src,'listener adapter invariant missing: '+needle)
+          req('.listener.Start()' not in src and 'socketListener.Start()' not in src,'sing-box listener loop must not own Accept')
+          cfg=src[src.index('func buildMieruServerConfig'):src.index('func validateMieruInboundOptions')]
+          req('ListenIPAddress' not in cfg,'post-v3.36 ListenIPAddress API introduced')
+          passline(5,'listener-ownership','factory uses ListenTCP/ListenUDP; no double Accept loop; omitted listen preserves wildcard')
+
+          # 06 lifecycle/TCP routing remains the inherited Mieru server path.
+          for needle in ('mieruserver.NewServer()','s.Store(config)','h.server.Start()','h.server.Stop()','h.server.Accept()',
+                         'RouteConnectionEx(ctx, conn, metadata, nil)','metadata.User = userCtx.UserName()'):
+              req(needle in src,'lifecycle/TCP invariant missing: '+needle)
+          passline(6,'lifecycle-tcp','Store/Start/Accept/Stop + user/destination routing preserved')
+
+          # 07 UDP protocol and transferred-buffer ownership are explicit.
+          for needle in ('defer buffer.Release()','header[0] != 0 || header[1] != 0','header[2] != 0',
+                         'ReadFromSocks5(buffer)','WriteToSocks5(header)','NewPacketOverStreamTunnel(conn)',
+                         'RoutePacketConnectionEx(ctx, packetConn, metadata, nil)'):
+              req(needle in src,'UDP invariant missing: '+needle)
+          passline(7,'udp-contract','RSV/FRAG validation + buffer ownership + TCP-over-stream packet routing')
+
+          # 08 Multipath data plane remains frozen; only approved audit logging/test files may differ.
+          for rel in ('protocol/multipath/scheduler.go','protocol/multipath/capacity.go','protocol/multipath/wire.go','protocol/multipath/memory.go','option/multipath.go'):
+              req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'Multipath data-plane drift '+rel)
+          mp=text(ROOT,'protocol/multipath/inbound.go')
+          req('instance=", strconv.Quote(i.Tag())' in mp,'CAP_AUDIT_DROPPED instance quoting fix missing')
+          passline(8,'multipath-isolation','scheduler/capacity/wire/memory frozen; only audit log schema repair allowed')
+
+          # 09 regression coverage must exist for every repaired contract.
+          mt=text(ROOT,'protocol/mieru/inbound_test.go'); at=text(ROOT,'protocol/multipath/server_audit_test.go')
+          for needle in ('TestMieruInboundListenerUsesSingBoxListenOptions','TestMieruInboundOmittedListenPreservesWildcardIPv4',
+                         'TestMieruPacketConnWritePacketConsumesBufferOnError','TestMieruPacketConnWritePacketConsumesBufferOnAddressEncodingError',
+                         'TestMieruPacketConnRejectsInvalidUDPHeader','TestMieruPacketConnRejectsMalformedUDPAddress'):
+              req(needle in mt,'missing Mieru regression '+needle)
+          req('TestPreferredCapacityAuditDroppedSurvivesInstanceFilter' in at,'missing CAP_AUDIT regression')
+          passline(9,'regression-surface','listener/ownership/header/audit-filter regressions present')
+
+          # 10 build inputs and registry/config surfaces remain bounded.
+          opt=text(ROOT,'option/mieru.go'); reg=text(ROOT,'include/registry.go')
+          req(reg.count('mieru.RegisterInbound(registry)')==1,'Mieru inbound registration !=1')
+          req(reg.count('mieru.RegisterOutbound(registry)')==1,'Mieru outbound registration drift')
+          for needle in ('type MieruInboundOptions struct {','[]MieruUser','UserHintIsMandatory','type MieruUser struct {'):
+              req(needle in opt,'Mieru option schema drift: '+needle)
+          for rel in ('release/DEFAULT_BUILD_TAGS_OTHERS','release/LDFLAGS'):
+              req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'build input drift '+rel)
+          passline(10,'build-registry','registry/options/build tags/ldflags bounded and frozen')
+          print('ALL 10 DISTINCT FULL-SOURCE ARCHITECTURE AUDIT DOMAINS PASS')
+          PYAUDIT
+          python3 "${RUNNER_TEMP}/freeze-audit.py" | tee ci-evidence/full-source-audit.log
+
+      - name: Materialize independent external contract tests
         shell: bash
         run: |
           set -euo pipefail
-          python3 <<'PYSIM'
-          import base64, ipaddress, struct, sys
-          def valid(t,users,port,pattern=''):
-              if t not in ('TCP','UDP') or not users or not 1<=port<=65535:return False
-              if any(not a or not b for a,b in users):return False
-              if pattern:
-                  try:base64.b64decode(pattern,validate=True)
-                  except Exception:return False
-              return True
-          def addr(h,p):
+          INDEPENDENT_DIR="${RUNNER_TEMP}/independent-tests"
+          mkdir -p "$INDEPENDENT_DIR/protocol/mieru" "$INDEPENDENT_DIR/protocol/multipath"
+          cat > "$INDEPENDENT_DIR/protocol/mieru/freeze_independent_test.go" <<'GOEOF'
+          package mieru
+
+          import (
+              "context"
+              "errors"
+              "net"
+              "net/netip"
+              "strings"
+              "testing"
+              "time"
+
+              mierucommon "github.com/enfein/mieru/v3/apis/common"
+              "github.com/sagernet/sing-box/adapter"
+              "github.com/sagernet/sing-box/log"
+              "github.com/sagernet/sing-box/option"
+              "github.com/sagernet/sing/common/buf"
+              "github.com/sagernet/sing/common/json/badoption"
+              M "github.com/sagernet/sing/common/metadata"
+          )
+
+          type freezePacketConn struct {
+              read     []byte
+              write    []byte
+              writeErr error
+          }
+
+          func (c *freezePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+              if c.read == nil {
+                  return 0, nil, errors.New("no packet")
+              }
+              n := copy(p, c.read)
+              c.read = nil
+              return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil
+          }
+
+          func (c *freezePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+              if c.writeErr != nil {
+                  return 0, c.writeErr
+              }
+              c.write = append([]byte(nil), p...)
+              return len(p), nil
+          }
+
+          func (c *freezePacketConn) Close() error                       { return nil }
+          func (c *freezePacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
+          func (c *freezePacketConn) SetDeadline(time.Time) error        { return nil }
+          func (c *freezePacketConn) SetReadDeadline(time.Time) error    { return nil }
+          func (c *freezePacketConn) SetWriteDeadline(time.Time) error   { return nil }
+
+          func freezeOptions(transport string, port uint16) option.MieruInboundOptions {
+              return option.MieruInboundOptions{
+                  ListenOptions: option.ListenOptions{ListenPort: port},
+                  Transport:     transport,
+                  Users:         []option.MieruUser{{Name: "u", Password: "p"}},
+              }
+          }
+
+          func freezeReserve(t *testing.T, network, address string) (uint16, bool) {
+              t.Helper()
+              if network == "tcp4" || network == "tcp6" {
+                  listener, err := net.Listen(network, net.JoinHostPort(address, "0"))
+                  if err != nil {
+                      return 0, false
+                  }
+                  port := uint16(listener.Addr().(*net.TCPAddr).Port)
+                  _ = listener.Close()
+                  return port, true
+              }
+              packetConn, err := net.ListenPacket(network, net.JoinHostPort(address, "0"))
+              if err != nil {
+                  return 0, false
+              }
+              port := uint16(packetConn.LocalAddr().(*net.UDPAddr).Port)
+              _ = packetConn.Close()
+              return port, true
+          }
+
+          func TestFreezeIndependentExplicitListen(t *testing.T) {
+              tests := []struct {
+                  name      string
+                  transport string
+                  address   string
+                  network   string
+              }{
+                  {name: "tcp4", transport: "TCP", address: "127.0.0.1", network: "tcp4"},
+                  {name: "udp4", transport: "UDP", address: "127.0.0.1", network: "udp4"},
+                  {name: "tcp6", transport: "TCP", address: "::1", network: "tcp6"},
+                  {name: "udp6", transport: "UDP", address: "::1", network: "udp6"},
+              }
+              for _, tt := range tests {
+                  t.Run(tt.name, func(t *testing.T) {
+                      port, ok := freezeReserve(t, tt.network, tt.address)
+                      if !ok {
+                          t.Skip("address family unavailable")
+                      }
+                      options := freezeOptions(tt.transport, port)
+                      listenAddress := badoption.Addr(netip.MustParseAddr(tt.address))
+                      options.Listen = &listenAddress
+                      raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-listen", options)
+                      if err != nil {
+                          t.Fatal(err)
+                      }
+                      inbound := raw.(*Inbound)
+                      if err := inbound.Start(adapter.StartStateStart); err != nil {
+                          t.Fatal(err)
+                      }
+                      defer inbound.Close()
+
+                      var actual net.Addr
+                      if tt.transport == "TCP" {
+                          if inbound.listener.TCPListener() == nil {
+                              t.Fatal("TCP factory not used")
+                          }
+                          actual = inbound.listener.TCPListener().Addr()
+                      } else {
+                          if inbound.listener.UDPConn() == nil {
+                              t.Fatal("UDP factory not used")
+                          }
+                          actual = inbound.listener.UDPConn().LocalAddr()
+                      }
+                      host, _, err := net.SplitHostPort(actual.String())
+                      if err != nil {
+                          t.Fatal(err)
+                      }
+                      if netip.MustParseAddr(host).Unmap() != netip.MustParseAddr(tt.address).Unmap() {
+                          t.Fatalf("configured=%s actual=%s", tt.address, host)
+                      }
+                      if err := inbound.Close(); err != nil {
+                          t.Fatal(err)
+                      }
+                      if inbound.server.IsRunning() {
+                          t.Fatal("server still running after Close")
+                      }
+                  })
+              }
+          }
+
+          func TestFreezeIndependentOmittedListenCompatibility(t *testing.T) {
+              port, ok := freezeReserve(t, "tcp4", "127.0.0.1")
+              if !ok {
+                  t.Fatal("IPv4 unavailable")
+              }
+              raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-default", freezeOptions("TCP", port))
+              if err != nil {
+                  t.Fatal(err)
+              }
+              inbound := raw.(*Inbound)
+              if err := inbound.Start(adapter.StartStateStart); err != nil {
+                  t.Fatal(err)
+              }
+              defer inbound.Close()
+              address := inbound.listener.TCPListener().Addr().(*net.TCPAddr)
+              if !address.IP.IsUnspecified() || address.IP.To4() == nil {
+                  t.Fatalf("omitted listen drifted: %v", address)
+              }
+          }
+
+          func TestFreezeIndependentWriteBufferOwnership(t *testing.T) {
+              for _, fail := range []bool{false, true} {
+                  name := "success"
+                  if fail {
+                      name = "write_error"
+                  }
+                  t.Run(name, func(t *testing.T) {
+                      packetConn := &freezePacketConn{}
+                      if fail {
+                          packetConn.writeErr = errors.New("injected")
+                      }
+                      wrapped := &mieruPacketConn{PacketConn: packetConn}
+                      buffer := buf.NewSize(1024)
+                      _, _ = buffer.Write([]byte("payload"))
+                      err := wrapped.WritePacket(buffer, M.ParseSocksaddr("203.0.113.7:53"))
+                      if (err != nil) != fail {
+                          t.Fatalf("unexpected error %v", err)
+                      }
+                      if buffer.RawCap() != 0 {
+                          t.Fatalf("transferred buffer retained cap=%d", buffer.RawCap())
+                      }
+                  })
+              }
+          }
+
+          func TestFreezeIndependentAddressEncodingErrorConsumesBuffer(t *testing.T) {
+              wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{}}
+              buffer := buf.NewSize(1024)
+              _, _ = buffer.Write([]byte("payload"))
+              err := wrapped.WritePacket(buffer, M.Socksaddr{Fqdn: strings.Repeat("a", 256), Port: 53})
+              if err == nil {
+                  t.Fatal("expected SOCKS5 address encoding error")
+              }
+              if buffer.RawCap() != 0 {
+                  t.Fatalf("address encoding error retained transferred buffer cap=%d", buffer.RawCap())
+              }
+          }
+
+          func TestFreezeIndependentUDPHeaderBoundary(t *testing.T) {
+              packets := [][]byte{
+                  {1, 0, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
+                  {0, 1, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
+                  {0, 0, 1, 1, 203, 0, 113, 7, 0, 53, 'x'},
+              }
+              for _, packet := range packets {
+                  wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
+                  buffer := buf.NewSize(1024)
+                  _, err := wrapped.ReadPacket(buffer)
+                  buffer.Release()
+                  if err == nil {
+                      t.Fatalf("invalid UDP header accepted: %x", packet[:3])
+                  }
+              }
+          }
+
+          func TestFreezeIndependentMalformedUDPAddress(t *testing.T) {
+              packets := [][]byte{
+                  {},
+                  {0},
+                  {0, 0},
+                  {0, 0, 0},
+                  {0, 0, 0, 9},
+                  {0, 0, 0, 1, 127},
+              }
+              for _, packet := range packets {
+                  wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
+                  buffer := buf.NewSize(1024)
+                  _, err := wrapped.ReadPacket(buffer)
+                  buffer.Release()
+                  if err == nil {
+                      t.Fatalf("malformed UDP packet accepted: %x", packet)
+                  }
+              }
+          }
+
+          func TestFreezeIndependentUpstreamUDPInterop(t *testing.T) {
+              for _, address := range []string{"203.0.113.7:53", "[2001:db8::7]:5353"} {
+                  t.Run(address, func(t *testing.T) {
+                      destination := M.ParseSocksaddr(address)
+                      packetConn := &freezePacketConn{}
+                      wrapped := &mieruPacketConn{PacketConn: packetConn}
+                      buffer := buf.NewSize(1024)
+                      _, _ = buffer.Write([]byte("payload"))
+                      if err := wrapped.WritePacket(buffer, destination); err != nil {
+                          t.Fatal(err)
+                      }
+                      upstream := mierucommon.NewUDPAssociateWrapper(&freezePacketConn{read: packetConn.write})
+                      payload := make([]byte, 1024)
+                      n, actual, err := upstream.ReadFrom(payload)
+                      if err != nil {
+                          t.Fatal(err)
+                      }
+                      if actual.String() != destination.String() || string(payload[:n]) != "payload" {
+                          t.Fatalf("got=%s payload=%q", actual, payload[:n])
+                      }
+                  })
+              }
+          }
+
+          func TestFreezeIndependentValidationBoundaries(t *testing.T) {
+              cases := []option.MieruInboundOptions{
+                  freezeOptions("QUIC", 8964),
+                  freezeOptions("TCP", 8964),
+                  freezeOptions("TCP", 8964),
+                  freezeOptions("TCP", 8964),
+              }
+              cases[1].Users = nil
+              cases[2].Users[0].Name = ""
+              cases[3].Users[0].Password = ""
+              for index, options := range cases {
+                  if err := validateMieruInboundOptions(options); err == nil {
+                      t.Fatalf("invalid validation case %d accepted", index)
+                  }
+              }
+
+              zeroPort := freezeOptions("TCP", 0)
+              if _, _, err := buildMieruServerConfig(context.Background(), zeroPort); err == nil {
+                  t.Fatal("zero listen_port accepted")
+              }
+          }
+          GOEOF
+
+          cat > "$INDEPENDENT_DIR/protocol/multipath/freeze_independent_test.go" <<'GOEOF'
+          package multipath
+
+          import (
+              "context"
+              "fmt"
+              "strings"
+              "testing"
+              "time"
+
+              "github.com/sagernet/sing-box/adapter/inbound"
+              "github.com/sagernet/sing-box/log"
+          )
+
+          type freezeAuditLogger struct {
+              log.ContextLogger
+              lines []string
+          }
+
+          func (l *freezeAuditLogger) ErrorContext(_ context.Context, args ...any) {
+              l.lines = append(l.lines, fmt.Sprint(args...))
+          }
+
+          func (l *freezeAuditLogger) InfoContext(_ context.Context, args ...any) {
+              l.lines = append(l.lines, fmt.Sprint(args...))
+          }
+
+          func TestFreezeIndependentAuditDropFilter(t *testing.T) {
+              controller := newPreferredCapacityController(70, time.Second, 64<<10)
+              controller.enableAudit()
+              for i := 0; i < preferredCapacityAuditQueueLimit+1; i++ {
+                  controller.recordAuditReady(time.Unix(int64(10000+i), 0))
+              }
+              logger := &freezeAuditLogger{ContextLogger: log.NewNOPFactory().Logger()}
+              inbound := &Inbound{
+                  Adapter: inbound.NewAdapter("multipath", "mp-in-39002"),
+                  ctx:     context.Background(),
+                  logger:  logger,
+                  cfg:     coreConfig{PreferredCapacity: controller},
+              }
+              inbound.flushPreferredCapacityAudit()
+
+              found := false
+              for _, line := range logger.lines {
+                  if strings.Contains(line, "CAP_AUDIT_DROPPED") &&
+                      strings.Contains(line, `instance="mp-in-39002"`) &&
+                      strings.Contains(line, "evidence_complete=false") {
+                      found = true
+                  }
+              }
+              if !found {
+                  t.Fatal("DROPPED evidence lost by quoted instance filter")
+              }
+          }
+          GOEOF
+          echo "INDEPENDENT_DIR=$INDEPENDENT_DIR" >> "$GITHUB_ENV"
+
+      - name: Independent repaired-contract execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$INDEPENDENT_DIR/protocol/mieru/freeze_independent_test.go" protocol/mieru/zz_freeze_independent_test.go
+          cp "$INDEPENDENT_DIR/protocol/multipath/freeze_independent_test.go" protocol/multipath/zz_freeze_independent_test.go
+          trap 'rm -f protocol/mieru/zz_freeze_independent_test.go protocol/multipath/zz_freeze_independent_test.go' EXIT
+          CGO_ENABLED=1 go test \
+            -race -count=1 -timeout=15m \
+            -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" \
+            -run '^TestFreezeIndependent' \
+            ./protocol/mieru ./protocol/multipath | tee ci-evidence/independent-contracts.log
+
+      - name: Actual mutation controls - 10 executable wrong variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PYMUT'
+          from pathlib import Path
+          import os, shutil, subprocess, sys
+
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          temp=Path(os.environ['RUNNER_TEMP'])/'real-mutants'
+          temp.mkdir(parents=True,exist_ok=True)
+          independent=Path(os.environ['INDEPENDENT_DIR'])
+          evidence=root/'ci-evidence'/'mutations'
+          evidence.mkdir(parents=True,exist_ok=True)
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          tags=os.environ['BUILD_TAGS']; ldflags=os.environ['LDFLAGS_SHARED']
+
+          mutations=[
+            ('01-no-stream-factory','protocol/mieru/inbound.go','\tconfig.StreamListenerFactory = listenerFactory\n','',r'^TestFreezeIndependentExplicitListen/tcp4$','./protocol/mieru'),
+            ('02-no-packet-factory','protocol/mieru/inbound.go','\tconfig.PacketListenerFactory = listenerFactory\n','',r'^TestFreezeIndependentExplicitListen/udp4$','./protocol/mieru'),
+            ('03-buffer-not-released','protocol/mieru/inbound.go','\tdefer buffer.Release()\n','',r'^TestFreezeIndependentWriteBufferOwnership$','./protocol/mieru'),
+            ('04-rsv-accepted','protocol/mieru/inbound.go','\tif header[0] != 0 || header[1] != 0 {','\tif false {',r'^TestFreezeIndependentUDPHeaderBoundary$','./protocol/mieru'),
+            ('05-frag-accepted','protocol/mieru/inbound.go','\tif header[2] != 0 {','\tif false {',r'^TestFreezeIndependentUDPHeaderBoundary$','./protocol/mieru'),
+            ('06-drop-instance-unquoted','protocol/multipath/inbound.go','strconv.Quote(i.Tag())','i.Tag()',r'^TestFreezeIndependentAuditDropFilter$','./protocol/multipath'),
+            ('07-invalid-transport-accepted','protocol/mieru/inbound.go','\tif options.Transport != "TCP" && options.Transport != "UDP" {','\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
+            ('08-empty-users-accepted','protocol/mieru/inbound.go','\tif len(options.Users) == 0 {','\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
+            ('09-empty-password-accepted','protocol/mieru/inbound.go','\t\tif user.Password == "" {','\t\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
+          ]
+
+          def run(cmd,cwd,env=None):
+              return subprocess.run(cmd,cwd=cwd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          for name,rel,old,new,regex,pkg in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
               try:
-                  ip=ipaddress.ip_address(h); return (b'\x01'+ip.packed if ip.version==4 else b'\x04'+ip.packed)+struct.pack('!H',p)
-              except ValueError:
-                  b=h.encode(); return b'\x03'+bytes([len(b)])+b+struct.pack('!H',p)
-          def decode(b):
-              t=b[0]; i=1
-              if t==1:h=str(ipaddress.ip_address(b[i:i+4])); i+=4
-              elif t==4:h=str(ipaddress.ip_address(b[i:i+16])); i+=16
-              else:n=b[i]; i+=1; h=b[i:i+n].decode(); i+=n
-              p=struct.unpack('!H',b[i:i+2])[0]; return h,p,b[i+2:]
-          def run():
-              assert valid('TCP',[('u','p')],8964); assert valid('UDP',[('u','p')],8964)
-              assert not valid('QUIC',[('u','p')],8964); assert not valid('TCP',[],8964)
-              assert not valid('TCP',[('','p')],8964); assert not valid('TCP',[('u','')],8964); assert not valid('TCP',[('u','p')],0)
-              assert valid('TCP',[('u','p')],8964,'GgQIARAK'); assert not valid('TCP',[('u','p')],8964,'***')
-              for h in ('example.com','203.0.113.7','2001:db8::7'):
-                  pkt=b'\0\0\0'+addr(h,53)+b'payload'; assert pkt[:3]==b'\0\0\0'; h2,p2,data=decode(pkt[3:]); assert (h2,p2,data)==(h,53,b'payload')
-              # 10 wrong architectures are rejected by this oracle.
-              killed=['tcp-only','accept-any-transport','empty-users','empty-user','empty-password','port-zero','drop-domain','drop-ipv6','lose-payload','bad-udp-prefix']
-              return tuple(killed)
-          rows=[]
-          for i in range(1,11):
-              try:r=run(); rows.append(r); print(f'PASS {i:02d} mutants_killed={len(r)}')
-              except Exception as e:print(f'FAIL {i:02d} {e}');sys.exit(1)
-          assert len(set(rows))==1
-          print('PASS 10/10 independent contract simulations; 10/10 wrong architectures killed')
-          PYSIM
+                  target=work/rel; data=target.read_text()
+                  count=data.count(old)
+                  if count!=1: raise RuntimeError(f'{name}: mutation anchor count={count}')
+                  target.write_text(data.replace(old,new,1))
+                  shutil.copyfile(independent/'protocol/mieru/freeze_independent_test.go',work/'protocol/mieru/zz_freeze_independent_test.go')
+                  shutil.copyfile(independent/'protocol/multipath/freeze_independent_test.go',work/'protocol/multipath/zz_freeze_independent_test.go')
+                  env=dict(os.environ,CGO_ENABLED='1')
+                  cmd=['go','test','-count=1','-timeout=10m','-tags',tags,'-ldflags',ldflags,'-run',regex,pkg]
+                  result=run(cmd,work,env)
+                  (evidence/f'{name}.log').write_text(result.stdout)
+                  if result.returncode==0:
+                      raise RuntimeError(f'{name}: mutant SURVIVED')
+                  print(f'KILLED {name}: exit={result.returncode}')
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+          # 10: commit an unapproved scheduler byte change and prove the full-tree audit rejects it.
+          name='10-golden-scheduler-drift'; work=temp/name
+          subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+          try:
+              scheduler=work/'protocol/multipath/scheduler.go'
+              scheduler.write_text('// MUTANT: unapproved frozen scheduler drift\n'+scheduler.read_text())
+              subprocess.check_call(['git','add','protocol/multipath/scheduler.go'],cwd=work)
+              subprocess.check_call(['git','-c','user.name=Mutation Control','-c','user.email=mutation@example.invalid','commit','-m','mutation control'],cwd=work,stdout=subprocess.DEVNULL)
+              env=dict(os.environ,AUDIT_ROOT=str(work))
+              result=run(['python3',str(Path(os.environ['RUNNER_TEMP'])/'freeze-audit.py')],work,env)
+              (evidence/f'{name}.log').write_text(result.stdout)
+              if result.returncode==0:
+                  raise RuntimeError(f'{name}: mutant SURVIVED')
+              print(f'KILLED {name}: exit={result.returncode}')
+          finally:
+              subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              subprocess.run(['git','worktree','prune'],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 10 EXECUTABLE WRONG VARIANTS KILLED')
+          PYMUT
 
       - name: Check formatting of exact Mieru inbound write-set
         shell: bash
         run: |
           set -euo pipefail
-          files=(option/mieru.go include/registry.go include/mieru_registry_test.go protocol/mieru/inbound.go protocol/mieru/inbound_test.go)
+          files=(option/mieru.go include/registry.go include/mieru_registry_test.go protocol/mieru/inbound.go protocol/mieru/inbound_test.go protocol/multipath/inbound.go protocol/multipath/server_audit_test.go)
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
 
@@ -270,7 +719,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" -run '^(TestValidateMieruInboundOptions|TestBuildMieruServerConfig|TestBuildMieruServerConfigRequiresListenPort|TestBuildMieruServerConfigUDP|TestMieruPacketConnReadPacketDomain|TestMieruPacketConnWritePacketIPv4)$' ./protocol/mieru
+          CGO_ENABLED=1 go test -race -count=10 -timeout=20m -tags "$BUILD_TAGS" -run '^(TestValidateMieruInboundOptions|TestBuildMieruServerConfig|TestBuildMieruServerConfigRequiresListenPort|TestBuildMieruServerConfigUDP|TestMieruInboundListenerUsesSingBoxListenOptions|TestMieruInboundOmittedListenPreservesWildcardIPv4|TestMieruPacketConnReadPacketDomain|TestMieruPacketConnWritePacketIPv4|TestMieruPacketConnWritePacketConsumesBufferOnError|TestMieruPacketConnRejectsInvalidUDPHeader)$' ./protocol/mieru
           CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" -run '^TestMieruInboundRegistered$' ./include
 
       - name: Mieru complete regression with race detector x10
@@ -382,12 +831,22 @@ jobs:
           print('PASS zero-field candidate retains >=98% direct-parent performance for all fixtures')
           PY
 
-      - name: Cleanup audit worktree
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mieru-inbound-freeze-audit-evidence
+          path: ci-evidence
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup audit worktrees
         if: always()
         shell: bash
         run: |
           set +e
-          git worktree remove --force "$BASELINE_DIR" 2>/dev/null || true
+          git worktree remove --force "$GOLDEN_DIR" 2>/dev/null || true
+          git worktree remove --force "$REPAIR_DIR" 2>/dev/null || true
           git worktree prune || true
 
   build_targets:
@@ -540,6 +999,9 @@ jobs:
             echo "source_ref=${SOURCE_REF}"
             echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
             echo "golden_commit=${{ needs.audit_test.outputs.parent_sha }}"
+            echo "golden_tree=${FROZEN_GOLDEN_TREE}"
+            echo "repair_base_commit=${REPAIR_BASE_SHA}"
+            echo "repair_base_tree=${REPAIR_BASE_TREE}"
             echo "go_version=$(go env GOVERSION)"
             echo "target=${{ matrix.goos }}/${{ matrix.goarch }}"
             echo "cgo=0"
