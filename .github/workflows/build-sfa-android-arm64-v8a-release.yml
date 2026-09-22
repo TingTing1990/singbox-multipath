@@ -98,7 +98,23 @@ jobs:
           grep -F 'applicationId = "io.nekohasekai.sfa"' sing-box-for-android/app/build.gradle.kts
           grep -F 'ndkVersion = "28.0.13004108"' sing-box-for-android/app/build.gradle.kts
           grep -F 'create("other") {' sing-box-for-android/app/build.gradle.kts
-          grep -A2 -F 'create("other") {' sing-box-for-android/app/build.gradle.kts | grep -F 'minSdk = 24'
+          python3 <<'PYGRADLE'
+          import re
+          from pathlib import Path
+          text = Path('sing-box-for-android/app/build.gradle.kts').read_text(encoding='utf-8')
+          checks = {
+              'namespace': text.count('namespace = "io.nekohasekai.sfa"') == 1,
+              'applicationId': text.count('applicationId = "io.nekohasekai.sfa"') == 1,
+              'ndkVersion': text.count('ndkVersion = "28.0.13004108"') == 1,
+              'other_minSdk_23': re.search(r'create\("other"\)\s*\{\s*minSdk\s*=\s*23\s*\}', text) is not None,
+              'universal_apk': text.count('isUniversalApk = true') == 1,
+              'official_abis': text.count('include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")') == 1,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit('pristine upstream SFA invariant mismatch: ' + ', '.join(failed))
+          print('PASS pristine upstream SFA Gradle invariants:', ', '.join(checks))
+          PYGRADLE
           grep -F 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' sing-box-for-android/app/build.gradle.kts
           grep -F '<string name="app_name" translatable="false">sing-box</string>' sing-box-for-android/app/src/main/res/values/strings.xml
           grep -F 'android:authorities="${applicationId}.cache"' sing-box-for-android/app/src/main/AndroidManifest.xml
@@ -180,11 +196,6 @@ jobs:
                   raise SystemExit(f'unexpected source state for {old!r}: count={text.count(old)}')
               text = text.replace(old, new, 1)
 
-          old_other = 'create("other") {\n            minSdk = 23\n        }'
-          new_other = 'create("other") {\n            minSdk = 24\n        }'
-          if text.count(old_other) != 1:
-              raise SystemExit(f'unexpected other flavor minSdk source state: count={text.count(old_other)}')
-          text = text.replace(old_other, new_other, 1)
           gradle.write_text(text, encoding='utf-8')
 
           strings = Path('sing-box-for-android/app/src/main/res/values/strings.xml')
@@ -201,7 +212,24 @@ jobs:
           grep -F 'applicationId = "custom.singbox.sfa"' sing-box-for-android/app/build.gradle.kts
           grep -F 'isUniversalApk = false' sing-box-for-android/app/build.gradle.kts
           grep -F 'include("arm64-v8a")' sing-box-for-android/app/build.gradle.kts
-          grep -F 'minSdk = 23' sing-box-for-android/app/build.gradle.kts
+          python3 <<'PYPOST'
+          import re
+          from pathlib import Path
+          text = Path('sing-box-for-android/app/build.gradle.kts').read_text(encoding='utf-8')
+          checks = {
+              'namespace_preserved': text.count('namespace = "io.nekohasekai.sfa"') == 1,
+              'custom_application_id': text.count('applicationId = "custom.singbox.sfa"') == 1,
+              'upstream_application_id_removed': 'applicationId = "io.nekohasekai.sfa"' not in text,
+              'other_minSdk_23_preserved': re.search(r'create\("other"\)\s*\{\s*minSdk\s*=\s*23\s*\}', text) is not None,
+              'no_universal_apk': text.count('isUniversalApk = false') == 1,
+              'arm64_only': text.count('include("arm64-v8a")') == 1,
+              'old_abi_set_removed': 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' not in text,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit('customized SFA invariant mismatch: ' + ', '.join(failed))
+          print('PASS customized SFA Gradle invariants:', ', '.join(checks))
+          PYPOST
           grep -F '<string name="app_name" translatable="false">SFA</string>' sing-box-for-android/app/src/main/res/values/strings.xml
 
           mapfile -t changed < <(git -C sing-box-for-android diff --name-only | sort)
