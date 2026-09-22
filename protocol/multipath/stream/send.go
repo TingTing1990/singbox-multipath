@@ -2,8 +2,6 @@ package stream
 
 import "math"
 
-const retainedSegmentCapacity = 1024
-
 // Buffer ownership is shared only by the connection send queue and active
 // writers. ACK processing must not recycle bytes referenced by a blocked Write.
 type Buffer struct {
@@ -157,11 +155,7 @@ func (s *Sender) Acknowledge(next, windowEnd uint64) error {
 		s.head++
 	}
 	if s.head == len(s.segments) {
-		if cap(s.segments) > retainedSegmentCapacity {
-			s.segments = nil
-		} else {
-			s.segments = s.segments[:0]
-		}
+		s.segments = s.segments[:0]
 		s.head = 0
 	} else if s.head >= 1024 && s.head*2 >= len(s.segments) {
 		n := copy(s.segments, s.segments[s.head:])

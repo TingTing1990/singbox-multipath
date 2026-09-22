@@ -13,10 +13,6 @@ const (
 	PageSize = 16 << 10
 	// Charge the payload, the presence bitmap, and the page/map bookkeeping.
 	PageCharge = PageSize + PageSize/8 + 256
-	// Keep a small per-receiver physical page working set charged and reusable.
-	// This prevents steady traffic from turning every consumed 16 KiB page into
-	// GC garbage while preserving the global PageMemory admission budget.
-	receivePageReuseLimit = 8
 )
 
 var (
@@ -45,19 +41,17 @@ type receivePage struct {
 // Its sparse, byte-addressed pages bound metadata even for one-byte frames.
 // Individual path receipts do not belong to this state machine.
 type Receiver struct {
-	Next          uint64
-	ReadNext      uint64
-	WindowEnd     uint64
-	Capacity      uint64
-	FIN           uint64
-	HasFIN        bool
-	Pruned        uint64
-	Dropped       uint64
-	buffered      uint64
-	pages         map[uint64]*receivePage
-	freeHeadPages []*receivePage
-	freePages     []*receivePage
-	memory        PageMemory
+	Next      uint64
+	ReadNext  uint64
+	WindowEnd uint64
+	Capacity  uint64
+	FIN       uint64
+	HasFIN    bool
+	Pruned    uint64
+	Dropped   uint64
+	buffered  uint64
+	pages     map[uint64]*receivePage
+	memory    PageMemory
 }
 
 func NewReceiver(capacity uint64, memory PageMemory) *Receiver {
@@ -131,20 +125,16 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 		page := r.pages[id]
 		if page == nil {
 			head := id == r.Next/PageSize
-			page = r.takeReusablePage(head)
-			if page == nil {
-				admitted := r.memory == nil || r.memory.Acquire(head)
-				if !admitted && head {
-					// Under pressure, repurpose the farthest speculative page as
-					// the missing head. Its ordinary memory charge remains live,
-					// so no Release->new allocation GC churn is introduced.
-					page = r.pruneTailForHead(id)
-				}
-				if admitted && page == nil {
-					page = &receivePage{head: head}
+			admitted := r.memory == nil || r.memory.Acquire(head)
+			if !admitted && head {
+				// Linux's receive-pressure rule: discard the farthest data
+				// which have NOT been Data-ACKed, then admit the missing head.
+				if r.pruneTail(id) {
+					admitted = r.memory.Acquire(head)
 				}
 			}
-			if page != nil {
+			if admitted {
+				page = &receivePage{head: head}
 				r.pages[id] = page
 			}
 		}
@@ -160,49 +150,6 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 		r.advance()
 	}
 	return accepted, nil
-}
-
-func resetReceivePage(page *receivePage) {
-	page.present = [PageSize / 64]uint64{}
-	page.count = 0
-}
-
-func (r *Receiver) takeReusablePage(head bool) *receivePage {
-	var page *receivePage
-	if head {
-		if n := len(r.freeHeadPages); n > 0 {
-			page = r.freeHeadPages[n-1]
-			r.freeHeadPages[n-1] = nil
-			r.freeHeadPages = r.freeHeadPages[:n-1]
-		}
-	} else if n := len(r.freePages); n > 0 {
-		page = r.freePages[n-1]
-		r.freePages[n-1] = nil
-		r.freePages = r.freePages[:n-1]
-	}
-	if page != nil {
-		resetReceivePage(page)
-	}
-	return page
-}
-
-func (r *Receiver) recyclePage(page *receivePage) {
-	if page == nil {
-		return
-	}
-	resetReceivePage(page)
-	if page.head {
-		if len(r.freeHeadPages) < receivePageReuseLimit {
-			r.freeHeadPages = append(r.freeHeadPages, page)
-			return
-		}
-	} else if len(r.freePages) < receivePageReuseLimit {
-		r.freePages = append(r.freePages, page)
-		return
-	}
-	if r.memory != nil {
-		r.memory.Release(page.head)
-	}
 }
 
 func (p *receivePage) insert(offset int, data []byte) int {
@@ -280,7 +227,9 @@ func (r *Receiver) Consume(length int) {
 	for id := old / PageSize; id < r.ReadNext/PageSize; id++ {
 		if page := r.pages[id]; page != nil {
 			delete(r.pages, id)
-			r.recyclePage(page)
+			if r.memory != nil {
+				r.memory.Release(page.head)
+			}
 		}
 	}
 }
@@ -300,7 +249,7 @@ func (r *Receiver) Advertise(grow bool) uint64 {
 	return r.WindowEnd
 }
 
-func (r *Receiver) pruneTailForHead(keep uint64) *receivePage {
+func (r *Receiver) pruneTail(keep uint64) bool {
 	var last uint64
 	found := false
 	for id := range r.pages {
@@ -309,17 +258,16 @@ func (r *Receiver) pruneTailForHead(keep uint64) *receivePage {
 		}
 	}
 	if !found {
-		return nil
+		return false
 	}
 	page := r.pages[last]
 	r.Pruned += uint64(page.count)
 	r.buffered -= uint64(page.count)
 	delete(r.pages, last)
-	// Keep the original ordinary-page charge and head flag. A charged
-	// speculative page is safe to use for head progress; it is conservative
-	// compared with consuming the prepaid head reservation.
-	resetReceivePage(page)
-	return page
+	if r.memory != nil {
+		r.memory.Release(page.head)
+	}
+	return true
 }
 
 func (r *Receiver) Buffered() (bytes, outOfOrder uint64, pages int) {
@@ -342,16 +290,5 @@ func (r *Receiver) Close() {
 			r.memory.Release(page.head)
 		}
 	}
-	if r.memory != nil {
-		for _, page := range r.freeHeadPages {
-			r.memory.Release(page.head)
-		}
-		for _, page := range r.freePages {
-			r.memory.Release(page.head)
-		}
-	}
-	r.freeHeadPages = nil
-	r.freePages = nil
-	r.pages = nil
 	r.buffered = 0
 }

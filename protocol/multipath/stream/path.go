@@ -5,8 +5,6 @@ import (
 	"time"
 )
 
-const retainedFlightCapacity = 1024
-
 // Receipt describes bytes which traversed the complete child path, including
 // duplicate logical data. ReceivedAt is the receiver's monotonic microsecond
 // timestamp at the last DATA receipt, not the time the feedback was transmitted.
@@ -122,11 +120,7 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 		}
 	}
 	if p.head == len(p.flights) {
-		if cap(p.flights) > retainedFlightCapacity {
-			p.flights = nil
-		} else {
-			p.flights = p.flights[:0]
-		}
+		p.flights = p.flights[:0]
 		p.head = 0
 	} else if p.head >= 256 && p.head*2 >= len(p.flights) {
 		n := copy(p.flights, p.flights[p.head:])
