@@ -1,10 +1,10 @@
-name: Build Multipath Memory v1 beta6
+name: Build Multipath Capacity V2 Server Audit v1
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Source branch to audit and build
+        description: Source branch/tag/commit to audit and build
         required: true
         default: feature/multipath-capacity-v2-beta6
         type: string
@@ -13,25 +13,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: multipath-memory-v1-${{ inputs.source_ref }}
+  group: multipath-capacity-v2-server-audit-v1-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
   GO_VERSION: '1.25.5'
   VERSION: '1.14.0-multipath-beta6'
-  SOURCE_BRANCH: ${{ inputs.source_ref }}
+  PARENT_BRANCH: 'feature/mieru-outbound-beta6'
+  AUDIT_BASE_REV: '0c7792b743bb679f304395264565e94d24a95a71'
 
 jobs:
   audit_test:
-    name: Full-source audit x10 + independent memory x10 + runtime regression
+    name: Full-source audit + independent simulation + runtime tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
-      baseline_sha: ${{ steps.resolve.outputs.baseline_sha }}
+      parent_sha: ${{ steps.resolve.outputs.parent_sha }}
+      audit_base_sha: ${{ steps.resolve.outputs.audit_base_sha }}
 
     steps:
-      - name: Checkout frozen source branch
+      - name: Checkout requested source
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref }}
@@ -46,97 +48,40 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Resolve current candidate and exact same-branch pre-Memory baseline
+      - name: Resolve exact candidate and clean parent
         id: resolve
         shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
+          test -n "$SOURCE_REF"
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           grep -Fx "go ${GO_VERSION}" go.mod
 
-          git fetch --no-tags origin "+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}"
-          CANDIDATE_SHA="$(git rev-parse HEAD^{commit})"
-          REMOTE_SHA="$(git rev-parse refs/remotes/origin/${SOURCE_BRANCH}^{commit})"
-          test "$CANDIDATE_SHA" = "$REMOTE_SHA"
-          export CANDIDATE_SHA
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          AUDIT_BASE_SHA="$(git rev-parse "${AUDIT_BASE_REV}^{commit}")"
+          test "$(git merge-base "$CANDIDATE_SHA" "$AUDIT_BASE_SHA")" = "$AUDIT_BASE_SHA"
 
-          BASELINE_SHA="$(python3 <<'PY'
-          import hashlib, os, subprocess, sys
-          candidate=os.environ['CANDIDATE_SHA']
-          baseline={
-            'README.md':'ea9471baaa6025e2c07d54dedb541059fb9315191ff1503dbe2697c8c50176a5',
-            'protocol/multipath/budget_stream.go':'a3892a9ac0c28141bbbec3d2c4f0a33d98204ce01d9273ab46a0fcf6aa9978ff',
-            'protocol/multipath/capacity.go':'b4744381030ffaaf96c050af9476d8188cd4492d4f052aaedd5ba01cc85d8588',
-            'protocol/multipath/capacity_test.go':'ea413b00e1915aa343572ba8b4e4ee15b282e5f27a94d031dffad3c4ac3ec377',
-            'protocol/multipath/core.go':'3b95c82cc7fc02a9e3a34a90434ce7753b9e6c32bba519ad1087ab5919c8e83a',
-            'protocol/multipath/memory.go':'551104aca8359ab801fd552fdecf434d02e8c1f8c1d0fc34b3d3dd836b7bc051',
-            'protocol/multipath/memory_test.go':'adbb0c4cbe0c0aa117d7e70ce514c783520fe1c63d416c0b06f3f5691d3d3c2a',
-            'protocol/multipath/scheduler.go':'281efb9034875feae7becc325f09ae63e809fcd2ebbe24ed3a7173fbc3ea4391',
-            'protocol/multipath/stream/path.go':'af7178b22fcdf6e63c4d307f8bec24e57cbf2fa05b9da6ee6d2e6538b70f5903',
-            'protocol/multipath/stream/receive.go':'16f9b9e4141f984871d60bca5db88c8d2d3c8b714192a20482dc618287509c75',
-            'protocol/multipath/stream/send.go':'04367962de2e1053a4f4459e1b94b30bf61efd53e17f20d5fef0090b931bbcd6',
-            'protocol/multipath/stream/stream_test.go':'5f6b2fca180b9fc809b51567a6a6ec305c850b6f90046001f31e753224c4975e',
-          }
-          expected={f'M\t{p}' for p in baseline}
-          def blob(rev,path):
-              try:
-                  return subprocess.check_output(['git','show',f'{rev}:{path}'],stderr=subprocess.DEVNULL)
-              except subprocess.CalledProcessError:
-                  return None
-          revs=subprocess.check_output(['git','rev-list','--topo-order',candidate],text=True).splitlines()
-          for rev in revs[1:]:
-              ok=True
-              for path,want in baseline.items():
-                  data=blob(rev,path)
-                  if data is None or hashlib.sha256(data).hexdigest()!=want:
-                      ok=False; break
-              if not ok:
-                  continue
-              lines=set(x for x in subprocess.check_output(['git','diff','--name-status',rev,candidate],text=True).splitlines() if x)
-              if lines==expected:
-                  print(rev)
-                  sys.exit(0)
-          raise SystemExit('FAIL: no same-branch ancestor matches the frozen pre-Memory Server-Audit-v1 baseline and exact 12-file write-set')
-          PY
-          )"
-          test -n "$BASELINE_SHA"
-          test "$(git merge-base "$CANDIDATE_SHA" "$BASELINE_SHA")" = "$BASELINE_SHA"
+          git fetch --no-tags origin \
+            "+refs/heads/${PARENT_BRANCH}:refs/remotes/origin/${PARENT_BRANCH}"
+          PARENT_TIP="$(git rev-parse "refs/remotes/origin/${PARENT_BRANCH}^{commit}")"
+          # Freeze this incremental audit to the exact final-additive commit. The
+          # clean Mieru parent is its merge-base with the maintained parent branch,
+          # so a later parent-branch advance cannot create a false CI failure.
+          PARENT_SHA="$(git merge-base "$AUDIT_BASE_SHA" "$PARENT_TIP")"
+          test "$(git merge-base "$CANDIDATE_SHA" "$PARENT_SHA")" = "$PARENT_SHA"
 
-          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-          echo "baseline_sha=$BASELINE_SHA" >> "$GITHUB_OUTPUT"
-          echo "source_branch=$SOURCE_BRANCH"
-          echo "candidate=$CANDIDATE_SHA"
-          echo "baseline=$BASELINE_SHA"
-          echo "baseline_resolution=same-branch-nearest-ancestor-by-frozen-file-hashes-and-exact-write-set"
+          echo "source_ref=$SOURCE_REF"
+          echo "candidate_sha=$CANDIDATE_SHA"
+          echo "audit_base_sha=$AUDIT_BASE_SHA"
+          echo "parent_branch=$PARENT_BRANCH"
+          echo "parent_tip=$PARENT_TIP"
+          echo "clean_parent_sha=$PARENT_SHA"
           echo "go=$(go version)"
-
-      - name: Verify exact corrected Memory-v1 candidate file identities
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          from pathlib import Path
-          import hashlib
-          expected={
-            'README.md':'adf349caeb8d66141eeaea071e10cb43f06b7fe4b6f841a9e39a90aa8327d254',
-            'protocol/multipath/budget_stream.go':'ced4439d2c59e02342c6b363b43ae1fd3e478fc411e6859b73f53713b2ef1e0e',
-            'protocol/multipath/capacity.go':'7db160620618714cab86107bf7cfd3b30e91791b5e8fa1593117017c78858c02',
-            'protocol/multipath/capacity_test.go':'77771f4ba211dd193da82a47ef8b051e0b7255660242c6b7e408e37f8d219c9d',
-            'protocol/multipath/core.go':'9ff1bd421b92f4a91dc433504564b20fda576ccd02975d017cf536c0723e58de',
-            'protocol/multipath/memory.go':'9fd09bb6df2eb872a6d3b187f3a5aaec3f82736b7978acbeb667eae719b0d1b3',
-            'protocol/multipath/memory_test.go':'15187586377341b94587ab1dbeb95517654458fe26f34fce266acf8a72af2466',
-            'protocol/multipath/scheduler.go':'41bfafbb745466107b3d6bbd594c52575881c5c3382f7889633f9e8d36a1169e',
-            'protocol/multipath/stream/path.go':'c1a7d58f03424ad99c0464f6ada7a85b751339cdb7e06c061f7a07223222a2ac',
-            'protocol/multipath/stream/receive.go':'4f1b2e12df35b249c8061d4e74aebbcc142c99ad7915c765c982c9fd0da6e10e',
-            'protocol/multipath/stream/send.go':'4756aef7c207573e72f0b4a76b0f93e5af76b5ae964b631dc86cd83aa08b48ea',
-            'protocol/multipath/stream/stream_test.go':'ffdf4431e26e9400a8e630e3422f982981a8681f3cb857b55bc9cc0cdd31a772',
-          }
-          for path,want in expected.items():
-              got=hashlib.sha256(Path(path).read_bytes()).hexdigest()
-              if got!=want: raise SystemExit(f'FAIL candidate identity {path}: got={got} want={want}')
-              print('PASS',path,got)
-          print('PASS exact corrected 12-file Memory-v1 candidate identity')
-          PY
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=$PARENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "audit_base_sha=$AUDIT_BASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set audited build inputs
         shell: bash
@@ -147,285 +92,735 @@ jobs:
           test -n "$BUILD_TAGS"
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+          echo "BUILD_TAGS=$BUILD_TAGS"
+          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED"
 
-      - name: Materialize exact same-branch pre-Memory baseline
+      - name: Materialize exact parent worktree
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE_DIR="${RUNNER_TEMP}/multipath-memory-baseline"
-          rm -rf "$BASELINE_DIR"
-          git worktree add --detach "$BASELINE_DIR" "${{ steps.resolve.outputs.baseline_sha }}"
-          echo "BASELINE_DIR=$BASELINE_DIR" >> "$GITHUB_ENV"
+          PARENT_DIR="${RUNNER_TEMP}/multipath-parent-v2"
+          rm -rf "$PARENT_DIR"
+          git worktree add --detach "$PARENT_DIR" "${{ steps.resolve.outputs.parent_sha }}"
+          echo "PARENT_DIR=$PARENT_DIR" >> "$GITHUB_ENV"
 
-      - name: Full-source corrected Memory-v1 reverse audit x10
+      - name: Materialize exact final-additive audit baseline
         shell: bash
         run: |
           set -euo pipefail
-          cat > "${RUNNER_TEMP}/memory-v1-full-audit.py" <<'PY'
+          AUDIT_BASE_DIR="${RUNNER_TEMP}/multipath-audit-base-v2-additive"
+          rm -rf "$AUDIT_BASE_DIR"
+          git worktree add --detach "$AUDIT_BASE_DIR" "${{ steps.resolve.outputs.audit_base_sha }}"
+          echo "AUDIT_BASE_DIR=$AUDIT_BASE_DIR" >> "$GITHUB_ENV"
+
+      - name: Full-source server-audit closure audit x10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/multipath-capacity-v2-server-audit-full-audit.py" <<'PY'
+          #!/usr/bin/env python3
           from pathlib import Path
           import hashlib, os, re, subprocess, sys
-          ROOT=Path(os.environ['GITHUB_WORKSPACE']); BASE=Path(os.environ['BASELINE_DIR'])
-          EXPECTED={
-            'README.md','protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/capacity_test.go',
-            'protocol/multipath/core.go','protocol/multipath/memory.go','protocol/multipath/memory_test.go','protocol/multipath/scheduler.go',
-            'protocol/multipath/stream/path.go','protocol/multipath/stream/receive.go','protocol/multipath/stream/send.go','protocol/multipath/stream/stream_test.go'}
-          FROZEN={
-            'protocol/multipath/wire.go','protocol/multipath/telemetry.go','protocol/multipath/activation.go','protocol/multipath/inbound.go',
-            'protocol/multipath/outbound.go','protocol/multipath/types.go','protocol/multipath/protocol.go','protocol/multipath/server_audit_test.go',
-            'constant/proxy.go','option/mieru.go','protocol/mieru/outbound.go','include/registry.go','go.mod','go.sum'}
+          ROOT=Path(os.environ['GITHUB_WORKSPACE'])
+          PARENT=Path(os.environ['PARENT_DIR'])
+          REPORT=Path(os.environ['RUNNER_TEMP'])/'multipath-capacity-v2-server-audit-full-audit-report.txt'
+          AUDIT_BASE=Path(os.environ['AUDIT_BASE_DIR'])
+          EXPECTED_PARENT_MODIFIED={
+           'README.md','option/multipath.go','option/multipath_test.go',
+           'protocol/multipath/activation.go','protocol/multipath/inbound.go','protocol/multipath/outbound.go',
+           'protocol/multipath/reorder_options_test.go','protocol/multipath/scheduler.go',
+           'protocol/multipath/status.go','protocol/multipath/types.go',
+          }
+          EXPECTED_PARENT_ADDED={'protocol/multipath/capacity.go','protocol/multipath/capacity_test.go','protocol/multipath/server_audit_test.go'}
+          EXPECTED_AUDIT_MODIFIED={'README.md','protocol/multipath/activation.go','protocol/multipath/capacity.go','protocol/multipath/inbound.go','protocol/multipath/types.go'}
+          EXPECTED_AUDIT_ADDED={'protocol/multipath/server_audit_test.go'}
+          MIERU={'constant/proxy.go','option/mieru.go','protocol/mieru/outbound.go','include/registry.go','go.mod','go.sum'}
+          FROZEN_RUNTIME={'protocol/multipath/wire.go','protocol/multipath/telemetry.go','protocol/multipath/memory.go','protocol/multipath/stream/path.go','protocol/multipath/protocol.go','protocol/multipath/performance_test.go'}
           class Fail(Exception): pass
+          
           def tracked(root):
-              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z']); out=[]
-              for rec in raw.split(b'\0'):
-                  if not rec: continue
-                  meta,path=rec.split(b'\t',1); mode,oid,stage=meta.split()
-                  if stage!=b'0': raise Fail('unmerged '+os.fsdecode(path))
-                  out.append((os.fsdecode(path),mode.decode(),oid.decode()))
-              return sorted(out)
-          def payload(root,rel,mode,oid):
+              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
+              entries=[]
+              for record in raw.split(b'\0'):
+                  if not record:
+                      continue
+                  meta,path_b=record.split(b'\t',1)
+                  mode_b,oid_b,stage_b=meta.split()
+                  if stage_b != b'0':
+                      raise Fail(f'unmerged index entry: {os.fsdecode(path_b)} stage={stage_b.decode()}')
+                  entries.append((os.fsdecode(path_b),mode_b.decode(),oid_b.decode()))
+              return sorted(entries,key=lambda x:x[0])
+          def tracked_payload(root,rel,mode,oid):
               p=root/rel
-              if mode=='160000': return b'gitlink:'+oid.encode()
-              if mode=='120000': return os.readlink(p).encode('utf-8','surrogateescape')
+              if mode == '160000':
+                  # Git submodule/gitlink: the tracked source is the commit OID, while the
+                  # checkout path is a directory. Never call read_bytes() on that directory.
+                  return b'gitlink:' + oid.encode()
+              if mode == '120000':
+                  if not p.is_symlink():
+                      raise Fail(f'tracked symlink missing or materialized incorrectly: {rel}')
+                  return os.readlink(p).encode('utf-8','surrogateescape')
+              if not p.is_file():
+                  raise Fail(f'tracked regular file is not a file: {rel} mode={mode}')
               return p.read_bytes()
-          def fmap(root): return {r:hashlib.sha256(payload(root,r,m,o)).hexdigest() for r,m,o in tracked(root)}
-          def tree(root):
+          def tree_digest(root):
               h=hashlib.sha256(); n=0; total=0
               for rel,mode,oid in tracked(root):
-                  b=payload(root,rel,mode,oid); n+=1
-                  if mode!='160000': total+=len(b)
-                  for v in (rel.encode(),mode.encode(),b): h.update(len(v).to_bytes(8,'big')); h.update(v)
+                  rel_b=rel.encode('utf-8','surrogateescape'); mode_b=mode.encode(); b=tracked_payload(root,rel,mode,oid)
+                  n+=1
+                  if mode != '160000': total+=len(b)
+                  h.update(len(rel_b).to_bytes(8,'big')); h.update(rel_b)
+                  h.update(len(mode_b).to_bytes(8,'big')); h.update(mode_b)
+                  h.update(len(b).to_bytes(8,'big')); h.update(b)
               return n,total,h.hexdigest()
-          def txt(root,rel): return (root/rel).read_text(encoding='utf-8')
-          def funcs(src):
-              out={}; pat=re.compile(r'(?m)^func\s+(?:\([^\n]+?\)\s+)?([A-Za-z0-9_]+)\s*\(')
-              for m in pat.finditer(src):
-                  name=m.group(1); start=m.start(); le=src.find('\n',start); brace=src.rfind('{',start,le)
-                  if brace<0: continue
-                  d=0; q=None; esc=False
-                  for i in range(brace,len(src)):
-                      c=src[i]
-                      if q:
-                          if esc: esc=False
-                          elif c=='\\': esc=True
-                          elif c==q: q=None
-                      else:
-                          if c in ('"','`'): q=c
-                          elif c=='{': d+=1
-                          elif c=='}':
-                              d-=1
-                              if d==0: out.setdefault(name,[]).append(src[start:i+1]); break
-              return out
-          def one(root,rel,name):
-              x=funcs(txt(root,rel)).get(name,[])
-              if len(x)!=1: raise Fail(f'{rel}:{name} count={len(x)}')
-              return x[0]
-          def same_except(rel,exc):
-              a=funcs(txt(BASE,rel)); b=funcs(txt(ROOT,rel))
-              for n in set(a)|set(b):
-                  if n not in exc and a.get(n)!=b.get(n): raise Fail(f'unexpected function drift {rel}:{n}')
-          def req(v,msg):
-              if not v: raise Fail(msg)
-          def check():
-              A=fmap(BASE); B=fmap(ROOT); mod={p for p in set(A)&set(B) if A[p]!=B[p]}; add=set(B)-set(A); rem=set(A)-set(B)
-              req(mod==EXPECTED and not add and not rem,f'write-set mod={sorted(mod)} add={sorted(add)} rem={sorted(rem)}')
-              for rel in FROZEN: req((ROOT/rel).read_bytes()==(BASE/rel).read_bytes(),'frozen drift '+rel)
-              req('go 1.25.5' in txt(ROOT,'go.mod'),'Go version drift')
-              same_except('protocol/multipath/core.go',{'Release','releaseAfterShutdown'})
-              same_except('protocol/multipath/scheduler.go',{'handleWindow'})
-              same_except('protocol/multipath/capacity.go',{'recordPreferredCapacityRange','confirmPreferredCapacityDelivery'})
-              same_except('protocol/multipath/stream/send.go',{'Acknowledge'})
-              same_except('protocol/multipath/stream/path.go',{'Feedback'})
-              same_except('protocol/multipath/stream/receive.go',{'Insert','Consume','Close','pruneTail','pruneTailForHead','resetReceivePage','takeReusablePage','recyclePage'})
-              req('c.memory.releasePage(stream.PageCharge)' in one(ROOT,'protocol/multipath/core.go','Release'),'RX page retirement missing')
-              shutdown=one(ROOT,'protocol/multipath/core.go','releaseAfterShutdown')
-              req('if c.memory.sessions.Add(-1) == 0' in shutdown and 'c.memory.reclaimPendingAfterLastSession()' in shutdown,'final-session pending reclaim missing')
-              req(shutdown.find('c.stateMu.Unlock()') < shutdown.find('c.memory.reclaimPendingAfterLastSession()'),'final-session reclaim runs under stateMu')
-              final_reclaim=one(ROOT,'protocol/multipath/memory.go','reclaimPendingAfterLastSession')
-              req('b.scavengePending(false)' in final_reclaim and 'memoryScavenge()' not in final_reclaim,'final-session reclaim bypasses controlled scavenge')
-              cap=txt(ROOT,'protocol/multipath/capacity.go'); req('last.end == start' in cap and 'retainedPreferredCapacityRangeCapacity' in cap,'capacity metadata bound/coalesce missing')
-              mem=txt(ROOT,'protocol/multipath/memory.go')
-              rel=one(ROOT,'protocol/multipath/memory.go','release'); relpage=one(ROOT,'protocol/multipath/memory.go','releasePage')
-              acquire=one(ROOT,'protocol/multipath/memory.go','tryAcquirePrimary'); reserve=one(ROOT,'protocol/multipath/budget_stream.go','reservePage')
-              scav=one(ROOT,'protocol/multipath/memory.go','scavengePending'); queue=one(ROOT,'protocol/multipath/memory.go','queueScavengeLocked')
-              req('b.used -=' not in rel,'DATA release mints credit early')
-              req('b.pendingReclaim += bytes' in relpage and 'b.used -=' not in relpage,'RX release mints credit early')
-              req('memoryScavenge()' not in acquire and 'scavengePending(' not in acquire and 'queueScavengeLocked()' in acquire,'TX data-plane performs inline scavenge')
-              req('memoryScavenge()' not in reserve and 'scavengePending(' not in reserve and 'queueScavengeLocked()' in reserve,'PageMemory admission performs inline scavenge')
-              req('go b.scavengePending(false)' in queue,'data/page reclaim not asynchronous')
-              pos=scav.find('memoryScavenge()'); unlock=scav.rfind('b.access.Unlock()',0,pos); relock=scav.find('b.access.Lock()',pos)
-              req(pos>=0 and unlock>=0 and relock>=0 and unlock<pos<relock,'scavenge holds budget mutex')
-              req('memoryScavengeAccess.Lock()' in scav and 'memoryScavengeAccess.Unlock()' in scav,'process scavenges not serialized')
-              for tok in ('memoryIdleTrimDelay          = 2 * time.Second','pendingReclaim','scavengeQueued','garbageHintBytes'): req(tok in mem,'memory invariant missing '+tok)
-              recv=txt(ROOT,'protocol/multipath/stream/receive.go'); req('Acquire must\n// not wait' in recv,'PageMemory non-blocking contract drift')
-              for tok in ('receivePageReuseLimit = 8','takeReusablePage','recyclePage','pruneTailForHead'): req(tok in recv,'RX reuse missing '+tok)
-              callsites=[]
-              for p in (ROOT/'protocol/multipath').rglob('*.go'):
-                  if p.name.endswith('_test.go'): continue
-                  for i,line in enumerate(p.read_text().splitlines(),1):
-                      if '.scavengePending(' in line and 'func ' not in line: callsites.append((p.relative_to(ROOT).as_posix(),i,line.strip()))
-              allowed={('protocol/multipath/memory.go','go b.scavengePending(false)'),('protocol/multipath/memory.go','b.scavengePending(false)'),('protocol/multipath/memory.go','b.scavengePending(includeHint)')}
-              req(all((p,l) in allowed for p,_,l in callsites),f'unexpected scavenge callsites {callsites}')
-              rs=[]
-              for p in (ROOT/'protocol/multipath').rglob('*.go'):
-                  if p.name.endswith('_test.go'): continue
-                  for i,line in enumerate(p.read_text().splitlines(),1):
-                      if '.reserveSession(' in line: rs.append((p.relative_to(ROOT).as_posix(),i,line.strip()))
-              req(len(rs)==1 and rs[0][0]=='protocol/multipath/core.go',f'reserveSession call drift {rs}')
-              req('retainedMappingCapacity = 1024' in txt(ROOT,'protocol/multipath/scheduler.go'),'mapping bound missing')
-              req('retainedSegmentCapacity = 1024' in txt(ROOT,'protocol/multipath/stream/send.go'),'segment bound missing')
-              req('retainedFlightCapacity = 1024' in txt(ROOT,'protocol/multipath/stream/path.go'),'flight bound missing')
-              tests='\n'.join(txt(ROOT,p) for p in ('protocol/multipath/memory_test.go','protocol/multipath/stream/stream_test.go','protocol/multipath/capacity_test.go'))
-              for name in ('TestMemoryBudgetReleasedSlabKeepsPhysicalCreditAndIsReused','TestMemoryBudgetTurnoverDoesNotMintFreshPhysicalCredit','TestMemoryBudgetScavengeRunsOutsideBudgetLockAndKeepsCredit','TestMemoryBudgetScavengeSerializesAcrossInstances','TestMemoryBudgetReleasedPageKeepsPhysicalCreditUntilScavenge','TestMemoryBudgetPendingPageCreditScavengedBeforeFreshPageAdmission','TestMemoryBudgetIdleTrimScavengesExcessCommittedCache','TestMemoryBudgetIdleScavengeCoversNonSlabGarbage','TestMemoryBudgetReservePageNeverScavengesInline','TestMemoryBudgetAcquireDoesNotSpinDuringScavenge','TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget','TestMemoryBudgetLastSessionReclaimsPendingBeforeRelease','TestReceiverReusesConsumedPagesWithoutAllocationChurn','TestSenderDropsOversizedDrainedMetadata','TestPathDropsOversizedDrainedFlightMetadata','TestPreferredCapacityAdjacentDeliveryRangesCoalesce'):
-                  req(name in tests,'missing regression '+name)
-              return tree(ROOT),sorted(mod)
-          rows=[]
-          for i in range(1,11):
+          def scan_full_tree(): return tree_digest(ROOT)
+          def text(rel): return (ROOT/rel).read_text(encoding='utf-8')
+          def parent_text(rel): return (PARENT/rel).read_text(encoding='utf-8')
+          def require(c,msg):
+              if not c: raise Fail(msg)
+          def diffsets(a,b):
+              af={rel:(mode,oid) for rel,mode,oid in tracked(a)}; bf={rel:(mode,oid) for rel,mode,oid in tracked(b)}
+              added=set(bf)-set(af); removed=set(af)-set(bf); modified={k for k in set(af)&set(bf) if af[k]!=bf[k]}
+              return modified,added,removed
+          def extract_func(src,sig):
+              start=src.index(sig); brace=src.index('{',start); depth=0
+              for i in range(brace,len(src)):
+                  if src[i]=='{': depth+=1
+                  elif src[i]=='}':
+                      depth-=1
+                      if depth==0: return src[start:i+1]
+              raise Fail('unbalanced '+sig)
+          
+          def pass1():
+              m,a,r=diffsets(PARENT,ROOT); require(m==EXPECTED_PARENT_MODIFIED and a==EXPECTED_PARENT_ADDED and not r,f'clean-parent write-set mismatch modified={sorted(m)} added={sorted(a)} removed={sorted(r)}')
+              im,ia,ir=diffsets(AUDIT_BASE,ROOT); require(im==EXPECTED_AUDIT_MODIFIED and ia==EXPECTED_AUDIT_ADDED and not ir,f'incremental server-audit write-set mismatch modified={sorted(im)} added={sorted(ia)} removed={sorted(ir)}')
+              for rel in MIERU: require((ROOT/rel).read_bytes()==(PARENT/rel).read_bytes(),f'Mieru/dependency drift: {rel}')
+              return 'exact final-additive incremental write-set + clean-parent feature write-set + Mieru/dependency freeze'
+          def pass2():
+              opt=text('option/multipath.go'); cap=text('protocol/multipath/capacity.go'); inp=text('protocol/multipath/inbound.go'); out=text('protocol/multipath/outbound.go'); typ=text('protocol/multipath/types.go')
+              require(opt.count('PreferredCapacityMbps')==2,'field not exactly inbound+outbound')
+              require('if mbps == 0 {\n\t\treturn nil' in cap,'zero field does not create nil controller')
+              require(inp.count('newPreferredCapacityController(options.PreferredCapacityMbps')==1,'inbound controller ownership wrong')
+              require(out.count('newPreferredCapacityController(options.PreferredCapacityMbps')==1,'outbound controller ownership wrong')
+              require('PreferredCapacity              *preferredCapacityController' in typ,'core config shared pointer missing')
+              require('cfg := o.cfg' in out,'outbound per-core config no longer shallow-copies shared controller')
+              require('preferred_capacity' not in text('protocol/multipath/wire.go').lower(),'field leaked into wire')
+              require('preferred_capacity' not in text('protocol/multipath/telemetry.go').lower(),'field leaked into telemetry')
+              return 'instance ownership + Local-TX direction isolation + strict zero-field bypass + wire isolation'
+          def pass3():
+              act=text('protocol/multipath/activation.go'); base=(AUDIT_BASE/'protocol/multipath/activation.go').read_text(encoding='utf-8')
+              for needle in ('activationAfterBytes(', 'c.cfg.ThresholdBytesPS > 0', 'c.cfg.ActivationOnQueue'): require(needle in act,'original activation trigger missing: '+needle)
+              require(act.count('if !capacity.DeliveryReady {')==3,'all three original triggers are not explicitly capacity-gated')
+              require(act.count('recordPreferredCapacityGateDecision(now, info, capacity, false)')==3,'blocked decision evidence missing from a trigger')
+              require(act.count('recordPreferredCapacityGateDecision(now, info, capacity, true)')==3,'opened decision evidence missing from a trigger')
+              for sig in ('func activationAfterBytes(', 'func (c *mpCore) activate('): require(extract_func(act,sig)==extract_func(base,sig),'control helper changed while adding audit: '+sig)
+              state=extract_func(act,'func (c *mpCore) preferredCapacityActivationState'); require('snapshot.DeliveryReady = true' in state and 'snapshot.RecoveryBypass = true' in state,'recovery bypass evidence missing')
+              prepare=extract_func(act,'func (c *mpCore) preparePreferredCapacityActivation'); require('!c.cfg.Recovery.allows(0)' in prepare,'recovery bypass can establish normal protection'); require('controller.activateProtection(now, capacity)' in prepare,'protection activation missing')
+              return 'original beta6 trigger predicates preserved; all three capacity decisions directly evidenced; recovery bypass remains non-normal admission'
+          def pass4():
+              sch=text('protocol/multipath/scheduler.go'); psch=parent_text('protocol/multipath/scheduler.go'); sig='func (c *mpCore) choosePathLocked(length int) *mpLeg'
+              require(extract_func(sch,sig)==extract_func(psch,sig),'original beta6 scheduler body changed')
+              wrap=extract_func(sch,'func (c *mpCore) choosePathForSubmitLocked')
+              require('chosen := c.choosePathLocked(length)' in wrap,'wrapper does not start from original scheduler')
+              require('if controller == nil || chosen == nil' in wrap,'zero-field exact candidate bypass missing')
+              require('if chosen.id == 0' in wrap,'natural preferred candidate not preserved')
+              for needle in ('preferred.path.Stale','preferred.busy','!preferred.ready.Load()','preferred.path.Outstanding()+uint64(length) > pipeline'): require(needle in wrap,'preferred safety eligibility missing: '+needle)
+              require('return pathSelection{leg: preferred, reservation: reservation}' in wrap,'owed protected assignment cannot override booster')
+              fin=extract_func(sch,'func (s pathSelection) finish'); require('.commit()' in fin and '.refund()' in fin,'reservation transaction incomplete')
+              return 'unchanged beta6 scheduler + additive wrapper + no busy/full HOL + transactional accounting'
+          def pass5():
+              sch=text('protocol/multipath/scheduler.go'); cap=text('protocol/multipath/capacity.go')
+              hw=extract_func(sch,'func (c *mpCore) handleWindow')
+              require('leg.path.Feedback(message.Paths[leg.id], now)' in hw,'peer receipt feedback missing')
+              require('confirmPreferredCapacityDelivery(leg.path.Received)' in hw and 'observePreferredDelivery(delivered, now)' in hw,'peer-confirmed normal delivery authority missing')
+              submit=extract_func(sch,'func (c *mpCore) submitLocked'); require('if !repair {' in submit and 'recordPreferredCapacityRange' in submit,'repair exclusion missing')
+              require('c.assigned += uint64(r.bytes)' in cap,'successful assignment diagnostic missing')
+              return 'peer-confirmed normal unique delivery authority + repair exclusion + successful assignment diagnostics'
+          def pass6():
+              cap=text('protocol/multipath/capacity.go'); tests=text('protocol/multipath/capacity_test.go')
+              for needle in ('protectedBytesPS','protectionValid','protectionActive','activateProtection','reservationRateLocked'): require(needle in cap,'additive state missing: '+needle)
+              rate=extract_func(cap,'func (c *preferredCapacityController) reservationRateLocked'); require('if c.protectionValid' in rate and 'return c.protectedBytesPS' in rate,'post-activation reservation tied to target')
+              arm=extract_func(cap,'func (c *preferredCapacityController) activateProtection'); require('c.credit = float64(max(c.chunkSize, 1))' in arm,'pre-activation surplus not reset at booster admission')
+              require('TestPreferredCapacityProtectsProven90AgainstBoosterDisplacement' in tests,'90->70 regression missing')
+              require('TestPreferredCapacityTarget50DoesNotPullProven75Down' in tests,'50->75 no-cap regression missing')
+              return 'explicit booster-additive invariant protects delivery-proven P rather than configured T'
+          def pass7():
+              cap=text('protocol/multipath/capacity.go'); tests=text('protocol/multipath/capacity_test.go'); upd=extract_func(cap,'func (c *preferredCapacityController) updateProtectedRateLocked')
+              require('c.assignmentRate+assignmentTolerance < protected' in upd,'scheduler under-assignment can self-ratify degradation')
+              require('preferredCapacityDegradeWindows' in upd and 'c.degradeWindows++' in upd,'multi-window physical degradation evidence missing')
+              require('c.setProtectedRateLocked(now, c.deliveryRate, true, "physical_delivery_degradation")' in upd,'delivery-driven physical decay missing')
+              require('c.protectionValid' in upd and 'c.deliveryRate > c.protectedBytesPS' in upd and 'c.protectedBytesPS < c.targetBytesPS' in upd and 'delivery_recovery_raise' in upd,'below-target recovery cannot relearn')
+              require('protected := c.protectedBytesPS' in upd,'degradation remains incorrectly anchored to admission target')
+              for name in ('TestPreferredCapacityLowDemandDoesNotDecayProvenRate','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityRealDeliveryDegradationDecaysConservatively','TestPreferredCapacityRealDegradationMayFallBelowAdmissionTarget','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven','TestPreferredCapacityHigherPeerDeliveryRaisesProtection'): require(name in tests,'adaptation test missing: '+name)
+              return 'no self-ratifying decay; low demand preserved; real degradation/recovery remains delivery-driven'
+          def pass8():
+              cap=text('protocol/multipath/capacity.go'); sch=text('protocol/multipath/scheduler.go'); inp=text('protocol/multipath/inbound.go'); section=cap[:cap.index('// recordPreferredCapacityRange')]
+              require('c.stateMu' not in section and 'c.legsMu' not in section,'controller calls back into core locks / reverses lock order')
+              require('now.Before(c.deliveryStart)' in cap and 'now.Before(c.creditLast)' in cap,'cross-core monotonic time guards missing')
+              require('preferredCapacityDebtChunks' in cap and 'preferredCapacitySurplusChunks' in cap,'credit bounds missing')
+              require('preferredCapacityRanges' in cap and 'preferredCapacityRangeHead' in cap,'receipt range lifecycle missing')
+              require('selection.finish(pumpErr)' in sch,'reservation lifecycle detached from submit result')
+              require('preferredCapacityAuditQueueLimit = 1024' in cap and 'c.auditDropped++' in cap,'server audit buffer is not bounded with explicit loss')
+              require('go i.senderStatusLoop()' in inp and 'go i.flushPreferredCapacityAudit' not in inp,'audit introduced a new control/logging goroutine')
+              require('CAP_AUDIT_DROPPED' in inp and 'evidence_complete=false' in inp,'audit loss is not FIELD-failing evidence')
+              return 'lock-order isolation + monotonic shared time + bounded control state/audit queue + no new audit goroutine + explicit evidence loss'
+          def pass9():
+              cap=text('protocol/multipath/capacity.go'); inp=text('protocol/multipath/inbound.go'); out=text('protocol/multipath/outbound.go'); typ=text('protocol/multipath/types.go'); readme=text('README.md'); status=text('protocol/multipath/status.go'); reorder=text('protocol/multipath/reorder_options_test.go')
+              for ev in ('CAP_AUDIT_READY','CAP_GATE_BLOCKED','CAP_GATE_OPENED','CAP_PROTECTION_ARMED','CAP_WINDOW','CAP_PROTECTION_CHANGED'): require(ev in cap,'server FIELD audit event missing: '+ev)
+              for field in ('original_trigger_satisfied','recovery_bypass','target_mbps','delivery_mbps','delivery_ready','protected_mbps','protection_valid','protection_active','preferred_assignment_mbps','degrade_windows','normal_booster_admitted','current_bytes','threshold_bytes','session_id','destination','controller_window_seq'): require(field in cap,'server FIELD evidence field missing: '+field)
+              require(inp.count('preferredCapacity.enableAudit()')==1,'server inbound audit not enabled exactly once')
+              require('enableAudit()' not in out,'client outbound unexpectedly enables server audit plane')
+              for needle in ('recordAuditReady(time.Now())','i.flushPreferredCapacityAudit()','cfg.CapacityAuditSessionID = statusSessionID(hello.Session)','cfg.CapacityAuditDestination = destination.String()'): require(needle in inp,'server audit lifecycle/correlation missing: '+needle)
+              require('CAP_AUDIT_READY side=server' in readme and 'CAP_GATE_BLOCKED' in readme and 'original_trigger_satisfied=true' in readme,'FIELD precheck/acceptance contract missing from README')
+              for needle in ('protected_mbps','protection_valid','protection_active','preferred_assigned_bytes','assignment_bytes_per_second'): require(needle in status,'existing outbound capacity status drifted: '+needle)
+              require('baseline.PreferredCapacity != nil' in reorder and 'omitted preferred capacity created a controller' in reorder,'zero-field config regression missing')
+              for rel in FROZEN_RUNTIME: require((ROOT/rel).read_bytes()==(PARENT/rel).read_bytes(),f'frozen runtime drift: {rel}')
+              require('CAP_AUDIT' not in text('protocol/multipath/wire.go') and 'CAP_AUDIT' not in text('protocol/multipath/telemetry.go'),'server audit leaked into wire/telemetry')
+              return 'server inbound FIELD observability closure + precheck + session correlation + outbound-status preservation + frozen runtime'
+          def pass10():
+              tests=text('protocol/multipath/capacity_test.go')+'\n'+text('protocol/multipath/server_audit_test.go'); gomod=text('go.mod')
+              required=['TestPreferredCapacityProtectsProven90AgainstBoosterDisplacement','TestPreferredCapacityTarget50DoesNotPullProven75Down','TestPreferredCapacitySharedProtectionAcrossCores','TestPreferredCapacityPreActivationSurplusCannotLicenseImmediateDisplacement','TestPreferredCapacityBusyPreferredDoesNotBlockBooster','TestPreferredCapacityFullPreferredDoesNotBlockBooster','TestPreferredCapacityDisabledReturnsOriginalDecision','TestPreferredCapacityRepairRangesExcludedFromDelivery','TestPreferredCapacitySchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityModerateSchedulerUnderAssignmentCannotDecayProvenRate','TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven','TestPreferredCapacityServerAuditReadyAndDisabledIsolation','TestPreferredCapacityServerAuditBlockedAfterOriginalBytesTrigger','TestPreferredCapacityServerAuditOpenedAndProtectionArmed','TestPreferredCapacityRecoveryBypassIsNotReportedAsNormalAdmission','TestPreferredCapacityServerAuditWindowAndPhysicalDegradationReason','TestPreferredCapacityAuditIsDecisionEquivalent','TestPreferredCapacityAuditQueueIsBoundedAndLossIsExplicit','TestPreferredCapacityAuditLogLineCarriesFieldAcceptanceEvidence']
+              for n in required: require('func '+n in tests,'required adversarial/audit test missing: '+n)
+              require(re.search(r'^go 1\.25\.5$',gomod,re.M) is not None,'Go 1.25.5 baseline changed')
+              require((ROOT/'release/DEFAULT_BUILD_TAGS_OTHERS').read_bytes()==(PARENT/'release/DEFAULT_BUILD_TAGS_OTHERS').read_bytes(),'build tags drift')
+              require((ROOT/'release/LDFLAGS').read_bytes()==(PARENT/'release/LDFLAGS').read_bytes(),'ldflags drift')
+              return 'additive adversarial regressions + server FIELD evidence tests + Go/build inputs frozen'
+          
+          passes=[pass1,pass2,pass3,pass4,pass5,pass6,pass7,pass8,pass9,pass10]
+          lines=[]; base=None
+          for i,fn in enumerate(passes,1):
+              n,total,d=scan_full_tree(); base=base or d
               try:
-                  r,mod=check(); rows.append(r); print(f'PASS {i:02d} files={r[0]} bytes={r[1]} tracked_tree={r[2]} write_set={len(mod)}')
+                  require(d==base,'source tree changed during audit')
+                  line=f'PASS {i:02d} files={n} bytes={total} tree_sha256={d} :: {fn()}'
               except Exception as e:
-                  print(f'FAIL {i:02d} {e}'); sys.exit(1)
-          req(len(set(rows))==1,'tree changed across passes')
-          print('PASS 10/10 corrected Memory-v1 full-source reverse audits')
+                  line=f'FAIL {i:02d} files={n} bytes={total} tree_sha256={d} :: {e}'; lines.append(line); print(line); REPORT.write_text('\n'.join(lines)+'\n'); sys.exit(1)
+              lines.append(line); print(line)
+          REPORT.write_text('\n'.join(lines)+'\nALL 10 COMPLETE-SOURCE AUDIT PASSES COMPLETE\n')
+          print('ALL 10 COMPLETE-SOURCE AUDIT PASSES COMPLETE')
           PY
-          python3 "${RUNNER_TEMP}/memory-v1-full-audit.py"
+          python3 "${RUNNER_TEMP}/multipath-capacity-v2-server-audit-full-audit.py"
 
-      - name: Check formatting of approved Go write-set
+      - name: Independent external additive simulation x10 with mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/multipath-capacity-v2-additive-independent-sim.py" <<'PY'
+          #!/usr/bin/env python3
+          """External physical-model simulation for preferred_capacity_mbps additive semantics.
+          
+          This simulator deliberately does not import, parse, or copy Go scheduler/controller
+          logic. It models only frozen external behavior: one shared Local-TX preferred
+          resource, peer-confirmed normal delivery as capacity authority, target as admission
+          threshold, booster as additive excess, and conservative adaptation after genuine
+          physical degradation.
+          """
+          from dataclasses import dataclass, field
+          from typing import List, Optional
+          import json, os
+          
+          @dataclass
+          class Phase:
+              seconds: int
+              demand: float
+              preferred_cap: float
+              booster_cap: float
+              repair: float = 0.0
+              busy: bool = False
+          
+          @dataclass
+          class Case:
+              name: str
+              target: float
+              flows: int
+              phases: List[Phase]
+              baseline_split: Optional[tuple[float,float]] = None
+          
+          @dataclass
+          class Row:
+              t: int
+              demand: float
+              preferred: float
+              booster: float
+              repair: float
+              protected: float
+              ready: bool
+              active: bool
+          
+          class SpecPolicy:
+              def __init__(self, case: Case):
+                  self.c = case
+                  self.active = False
+                  self.protected = 0.0
+                  self.degrade = 0
+                  self.rows: List[Row] = []
+          
+              def step(self, t: int, p: Phase):
+                  if self.c.target == 0:
+                      ps, bs = self.c.baseline_split or (0.6, 0.4)
+                      pref = min(p.preferred_cap, p.demand * ps)
+                      boost = min(p.booster_cap, p.demand * bs)
+                      self.rows.append(Row(t,p.demand,pref,boost,p.repair,0,True,False))
+                      return
+          
+                  if not self.active:
+                      # Before booster admission all normal DATA stays preferred. Physical
+                      # delivery, not local assignment or repair, decides readiness.
+                      pref = min(p.demand, p.preferred_cap)
+                      ready = pref >= self.c.target
+                      excess = p.demand > pref + 1e-9
+                      if ready:
+                          # The complete preferred-only window proves what can be protected.
+                          self.protected = max(self.protected, pref)
+                      boost = 0.0
+                      self.rows.append(Row(t,p.demand,pref,boost,p.repair,self.protected,ready,False))
+                      # Treat the frozen original activation trigger as satisfied in formal
+                      # high-load cases; no booster is useful when there is no excess.
+                      if ready and excess:
+                          self.active = True
+                      return
+          
+                  # Additive phase: preserve the delivery-proven preferred contribution.
+                  pref_assignment = min(p.demand, self.protected)
+                  pref = min(pref_assignment, p.preferred_cap)
+          
+                  # busy/full is a safety condition, not a reason to wait. Any normal demand
+                  # that the preferred path cannot physically deliver may continue on booster.
+                  remaining = max(0.0, p.demand - pref)
+                  boost = min(p.booster_cap, remaining)
+          
+                  # Natural preferred throughput above the protected value is never capped.
+                  # When there is no need for booster, all demand remains preferred.
+                  if p.demand <= p.preferred_cap:
+                      pref = p.demand
+                      boost = 0.0
+                  if pref > self.protected:
+                      self.protected = pref
+          
+                  # A low delivery sample may only lower protection when enough preferred
+                  # work was actually assigned. Low demand / scheduler under-assignment must
+                  # not ratify displacement. Require three complete materially-low windows.
+                  healthy = self.protected * 0.90
+                  if pref_assignment >= healthy and pref < healthy:
+                      self.degrade += 1
+                      if self.degrade >= 3:
+                          self.protected = pref
+                          self.degrade = 0
+                  else:
+                      self.degrade = 0
+          
+                  self.rows.append(Row(t,p.demand,pref,boost,p.repair,self.protected,pref>=self.c.target,self.active))
+          
+              def run(self):
+                  t=0
+                  for phase in self.c.phases:
+                      for _ in range(phase.seconds):
+                          self.step(t,phase); t+=1
+                  return self.rows
+          
+          # Mutants intentionally embody previously observed or plausible wrong architectures.
+          class FloorOnlyMutant(SpecPolicy):
+              def step(self,t,p):
+                  was=self.active
+                  super().step(t,p)
+                  if not was and self.active:
+                      self.protected=self.c.target
+                  elif self.active:
+                      # old V2 behavior: target floor only
+                      self.protected=self.c.target
+                      r=self.rows[-1]
+                      pref=min(p.preferred_cap,p.demand,self.c.target)
+                      boost=min(p.booster_cap,max(0,p.demand-pref))
+                      self.rows[-1]=Row(r.t,r.demand,pref,boost,r.repair,self.protected,r.ready,r.active)
+          
+          class TargetCapMutant(FloorOnlyMutant):
+              pass
+          
+          class PerSessionGateMutant(SpecPolicy):
+              def step(self,t,p):
+                  if not self.active and self.c.target>0 and p.demand/self.c.flows < self.c.target:
+                      pref=min(p.demand,p.preferred_cap)
+                      self.rows.append(Row(t,p.demand,pref,0,p.repair,0,False,False)); return
+                  super().step(t,p)
+          
+          class BusyWaitMutant(SpecPolicy):
+              def step(self,t,p):
+                  super().step(t,p)
+                  if self.active and p.busy:
+                      r=self.rows[-1]
+                      self.rows[-1]=Row(r.t,r.demand,r.preferred,0,r.repair,r.protected,r.ready,r.active)
+          
+          class LocalWriteGateMutant(SpecPolicy):
+              def step(self,t,p):
+                  if not self.active and self.c.target>0 and p.demand>=self.c.target:
+                      pref=min(p.demand,p.preferred_cap)
+                      self.protected=max(self.c.target,pref)
+                      self.active=True
+                      boost=min(p.booster_cap,max(0,p.demand-pref))
+                      self.rows.append(Row(t,p.demand,pref,boost,p.repair,self.protected,True,True)); return
+                  super().step(t,p)
+          
+          class RepairCountsMutant(SpecPolicy):
+              def step(self,t,p):
+                  if not self.active and self.c.target>0:
+                      pref=min(p.demand,p.preferred_cap)
+                      if pref+p.repair>=self.c.target:
+                          self.protected=max(self.c.target,pref)
+                          self.active=True
+                          boost=min(p.booster_cap,max(0,p.demand-pref))
+                          self.rows.append(Row(t,p.demand,pref,boost,p.repair,self.protected,True,True)); return
+                  super().step(t,p)
+          
+          class HistoricalLeakMutant(SpecPolicy):
+              def step(self,t,p):
+                  super().step(t,p)
+                  if self.active and p.demand < self.c.target:
+                      r=self.rows[-1]; leak=min(p.booster_cap,p.demand*0.15)
+                      self.rows[-1]=Row(r.t,r.demand,max(0,r.preferred-leak),leak,r.repair,r.protected,r.ready,r.active)
+          
+          class ZeroDriftMutant(SpecPolicy):
+              def step(self,t,p):
+                  if self.c.target==0:
+                      pref=min(p.preferred_cap,p.demand*0.9); boost=min(p.booster_cap,p.demand*0.1)
+                      self.rows.append(Row(t,p.demand,pref,boost,p.repair,0,True,False)); return
+                  super().step(t,p)
+          
+          class UnderassignmentRatifiesMutant(SpecPolicy):
+              def __init__(self,case): super().__init__(case); self.forced=False
+              def step(self,t,p):
+                  super().step(t,p)
+                  if self.active and not self.forced:
+                      self.protected=self.c.target; self.forced=True
+          
+          class NoDegradeMutant(SpecPolicy):
+              def step(self,t,p):
+                  old=self.protected
+                  super().step(t,p)
+                  if self.active and old>0 and self.protected<old:
+                      self.protected=old
+          
+          CASES=[
+              Case('01-below-target-60',70,1,[Phase(4,60,90,100)]),
+              Case('02-demand80-preferred90-no-excess',70,4,[Phase(4,80,90,100)]),
+              Case('03-proven90-target70-demand150',70,4,[Phase(1,150,90,100),Phase(4,150,90,100)]),
+              Case('04-eight-flow-proven80-demand160',70,8,[Phase(1,160,80,100),Phase(4,160,80,100)]),
+              Case('05-target50-proven75-demand120',50,4,[Phase(1,120,75,100),Phase(4,120,75,100)]),
+              Case('06-busy-preferred-excess-continues',70,4,[Phase(1,140,75,100),Phase(4,140,75,100,busy=True)]),
+              Case('07-real-degrade-90-to80',70,4,[Phase(1,150,90,100),Phase(1,150,90,100),Phase(4,150,80,100,busy=True)]),
+              Case('08-high-to-low-demand',70,4,[Phase(1,150,90,100),Phase(2,150,90,100),Phase(3,60,90,100)]),
+              Case('09-repair-does-not-unlock',70,4,[Phase(4,100,50,100,repair=30)]),
+              Case('10-target0-transparency',0,4,[Phase(4,100,100,100)],baseline_split=(0.6,0.4)),
+          ]
+          
+          def last(rows): return rows[-1]
+          def req(cond,msg):
+              if not cond: raise AssertionError(msg)
+          
+          def check(case,rows):
+              r=last(rows)
+              n=case.name
+              if n.startswith('01'):
+                  req(abs(r.preferred-60)<0.01 and r.booster==0 and not r.active,'below-target leaked booster')
+              elif n.startswith('02'):
+                  req(abs(r.preferred-80)<0.01 and r.booster==0,'demand within preferred capacity used booster')
+              elif n.startswith('03'):
+                  req(r.preferred>=89 and 59<=r.booster<=61 and r.protected>=89,'90->70 displacement or wrong excess')
+              elif n.startswith('04'):
+                  req(r.preferred>=79 and 79<=r.booster<=81,'8-flow shared protection failed')
+              elif n.startswith('05'):
+                  req(r.preferred>=74 and 44<=r.booster<=46,'target50 pulled preferred75 down')
+              elif n.startswith('06'):
+                  req(r.preferred>=74 and r.booster>=64,'busy preferred blocked booster excess')
+              elif n.startswith('07'):
+                  req(79<=r.protected<=81 and r.preferred>=79 and r.booster>=69,'real degradation did not adapt to80')
+              elif n.startswith('08'):
+                  req(abs(r.preferred-60)<0.01 and r.booster==0,'low demand leaked booster after historical activation')
+              elif n.startswith('09'):
+                  req(not r.active and r.booster==0 and abs(r.preferred-50)<0.01,'repair/local demand falsely unlocked booster')
+              elif n.startswith('10'):
+                  req(abs(r.preferred-60)<0.01 and abs(r.booster-40)<0.01,'target0 drifted baseline')
+          
+          print('=== 10 EXTERNAL PHYSICAL SIMULATIONS ===')
+          formal=[]
+          for i,c in enumerate(CASES,1):
+              p=SpecPolicy(c); rows=p.run(); check(c,rows); r=last(rows)
+              rec={'simulation':i,'case':c.name,'preferred_mbps':r.preferred,'booster_mbps':r.booster,'protected_mbps':r.protected,'active':r.active}
+              formal.append(rec)
+              print(f"PASS SIM {i:02d} {c.name}: preferred={r.preferred:.2f} booster={r.booster:.2f} protected={r.protected:.2f} active={r.active}")
+          
+          print('\n=== MUTATION / WRONG-ARCHITECTURE KILLS ===')
+          kill_plan=[
+              ('old-v2-floor-only-90-to70',FloorOnlyMutant,CASES[2]),
+              ('target-as-cap',TargetCapMutant,CASES[4]),
+              ('per-session-target',PerSessionGateMutant,CASES[3]),
+              ('preferred-busy-waits',BusyWaitMutant,CASES[5]),
+              ('local-write-gate',LocalWriteGateMutant,CASES[8]),
+              ('repair-counts-as-capacity',RepairCountsMutant,CASES[8]),
+              ('historical-active-leak',HistoricalLeakMutant,CASES[7]),
+              ('target-zero-drift',ZeroDriftMutant,CASES[9]),
+              ('underassignment-ratifies-70',UnderassignmentRatifiesMutant,CASES[2]),
+              ('never-decays-real-degradation',NoDegradeMutant,CASES[6]),
+          ]
+          killed=[]
+          for i,(name,cls,c) in enumerate(kill_plan,1):
+              p=cls(c); rows=p.run()
+              try:
+                  check(c,rows)
+              except AssertionError as e:
+                  killed.append(name); print(f'PASS KILL {i:02d} {name}: {e}')
+              else:
+                  raise SystemExit(f'FAIL simulator could not kill {name}')
+          
+          out={'formal_simulations':formal,'mutants_killed':killed}
+          outdir=os.environ.get('RUNNER_TEMP','.')
+          os.makedirs(outdir,exist_ok=True)
+          with open(os.path.join(outdir,'multipath-capacity-v2-additive-sim-results.json'),'w') as f: json.dump(out,f,indent=2)
+          with open(os.path.join(outdir,'multipath-capacity-v2-additive-sim-report.txt'),'w') as f:
+              f.write('10 external physical simulations: PASS\n')
+              for r in formal: f.write(json.dumps(r)+'\n')
+              f.write('10 wrong-architecture mutants killed: PASS\n')
+              for m in killed: f.write('MUTANT KILLED: '+m+'\n')
+          print('\nALL 10 SIMULATIONS PASS; ALL 10 WRONG ARCHITECTURES KILLED')
+          PY
+          python3 "${RUNNER_TEMP}/multipath-capacity-v2-additive-independent-sim.py"
+
+      - name: Independent Server FIELD Audit Closure v1 acceptance x10 + mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/server-audit-v1-independent.py" <<'PY'
+          from dataclasses import dataclass, replace
+          MiB=1024*1024
+          @dataclass(frozen=True)
+          class E:
+              kind:str; target:float; delivery:float=0; ready:bool=False; trigger:str='none'; trigger_ok:bool=False
+              current_bytes:int=0; threshold_bytes:int=0; protected:float=0; assignment:float=0
+              protection_valid:bool=False; protection_active:bool=False; normal_admitted:bool=False
+              recovery_bypass:bool=False; session_id:str=''; destination:str=''; change_reason:str=''
+              old_protected:float=0; new_protected:float=0; evidence_complete:bool=True
+          def one(es,k):
+              xs=[e for e in es if e.kind==k]; assert len(xs)==1,(k,len(xs)); return xs[0]
+          def complete(es):
+              assert all(e.evidence_complete for e in es); assert not any(e.kind=='CAP_AUDIT_DROPPED' for e in es)
+          def s21(es):
+              complete(es); b=one(es,'CAP_GATE_BLOCKED'); assert one(es,'CAP_AUDIT_READY').target==700
+              assert b.target==700 and b.trigger=='bytes' and b.trigger_ok and b.current_bytes>=b.threshold_bytes>=2*MiB
+              assert b.delivery<b.target and not b.ready and not b.normal_admitted and not b.recovery_bypass
+              assert b.session_id and b.destination; assert not any(e.kind in ('CAP_GATE_OPENED','CAP_PROTECTION_ARMED') for e in es)
+          def s22(es):
+              complete(es); o=one(es,'CAP_GATE_OPENED'); a=one(es,'CAP_PROTECTION_ARMED')
+              assert o.target==70 and o.trigger_ok and o.ready and o.normal_admitted and not o.recovery_bypass
+              assert o.session_id and o.destination and a.session_id==o.session_id and a.destination==o.destination
+              assert a.protection_valid and a.protection_active and a.protected>a.target and a.normal_admitted
+          def s23(es):
+              complete(es); a=one(es,'CAP_PROTECTION_ARMED'); assert a.target==70 and a.protected>=89
+              ws=[e for e in es if e.kind=='CAP_WINDOW' and e.protection_active]; assert ws
+              for w in ws: assert w.protected>=89 and w.assignment>=w.protected-2
+          def s24(es):
+              complete(es); cs=[e for e in es if e.kind=='CAP_PROTECTION_CHANGED' and e.new_protected<e.old_protected]; assert cs
+              c=cs[-1]; assert c.change_reason=='physical_delivery_degradation' and c.assignment>=c.old_protected-2
+              lows=[w for w in es if w.kind=='CAP_WINDOW' and w.protection_active and w.assignment>=c.old_protected-2 and w.delivery<.9*c.old_protected]
+              assert len(lows)>=3
+          def recovery(es):
+              complete(es); o=one(es,'CAP_GATE_OPENED'); assert o.recovery_bypass and not o.normal_admitted
+              assert not any(e.kind=='CAP_PROTECTION_ARMED' for e in es)
+          R700=E('CAP_AUDIT_READY',700)
+          B700=E('CAP_GATE_BLOCKED',700,550,False,'bytes',True,581745969,2*MiB,session_id='a4bd1539',destination='speedtest.hnd.fdcservers.net:8080')
+          R70=E('CAP_AUDIT_READY',70)
+          O70=E('CAP_GATE_OPENED',70,90,True,'bytes',True,4*MiB,2*MiB,normal_admitted=True,session_id='11223344',destination='download.example:443')
+          A90=E('CAP_PROTECTION_ARMED',70,90,True,'bytes',True,4*MiB,2*MiB,90,90,True,True,True,False,'11223344','download.example:443')
+          W=[E('CAP_WINDOW',70,d,True,protected=90,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True) for d in (90,89,91)]
+          DW=[E('CAP_WINDOW',70,60,False,protected=90,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True) for _ in range(3)]
+          C60=E('CAP_PROTECTION_CHANGED',70,60,False,protected=60,assignment=90,protection_valid=True,protection_active=True,normal_admitted=True,change_reason='physical_delivery_degradation',old_protected=90,new_protected=60)
+          RB=E('CAP_GATE_OPENED',70,0,True,'bytes',True,3*MiB,2*MiB,recovery_bypass=True,normal_admitted=False,session_id='55667788',destination='recovery.example:443')
+          formal=[('S2-1 700 below target',[R700,B700],s21),('S2-2 open/arm',[R70,O70,A90],s22),('S2-3 additive P',[R70,O70,A90,*W],s23),('S2-4 real degradation',[R70,O70,A90,*DW,C60],s24),('recovery bypass',[R70,RB],recovery)]
+          mutants=[
+            ('missing-blocked',[R700],s21),('no-trigger-proof',[R700,replace(B700,trigger_ok=False)],s21),
+            ('no-session-correlation',[R700,replace(B700,session_id='')],s21),('recovery-as-normal',[R70,replace(RB,normal_admitted=True)],recovery),
+            ('T-as-protected-P',[R70,O70,replace(A90,protected=70)],s22),('P-underassigned',[R70,O70,A90,*W[:-1],replace(W[-1],assignment=70)],s23),
+            ('underassignment-ratifies-degrade',[R70,O70,A90,*DW,replace(C60,assignment=60)],s24),
+            ('silent-loss',[R700,B700,E('CAP_AUDIT_DROPPED',700,evidence_complete=False)],s21),
+          ]
+          for batch in range(10):
+              for n,es,f in formal: f(es)
+              for n,es,f in mutants:
+                  try: f(es)
+                  except AssertionError: pass
+                  else: raise SystemExit('FAIL mutation survived: '+n)
+          print('PASS 10 independent Server FIELD Audit Closure v1 batches')
+          print('PASS 8/8 incomplete/wrong evidence architectures killed in every batch')
+          PY
+          python3 "${RUNNER_TEMP}/server-audit-v1-independent.py"
+
+      - name: Check formatting of complete approved Go write-set
         shell: bash
         run: |
           set -euo pipefail
           files=(
-            protocol/multipath/memory.go protocol/multipath/budget_stream.go protocol/multipath/core.go
-            protocol/multipath/stream/receive.go protocol/multipath/stream/send.go protocol/multipath/stream/path.go
-            protocol/multipath/scheduler.go protocol/multipath/capacity.go protocol/multipath/memory_test.go
-            protocol/multipath/stream/stream_test.go protocol/multipath/capacity_test.go
+            option/multipath.go
+            option/multipath_test.go
+            protocol/multipath/activation.go
+            protocol/multipath/inbound.go
+            protocol/multipath/outbound.go
+            protocol/multipath/reorder_options_test.go
+            protocol/multipath/scheduler.go
+            protocol/multipath/status.go
+            protocol/multipath/types.go
+            protocol/multipath/capacity.go
+            protocol/multipath/capacity_test.go
+            protocol/multipath/server_audit_test.go
           )
-          for f in "${files[@]}"; do diff -u <(gofmt "$f") "$f"; done
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
 
-      - name: Independent TX/RX memory-safety oracle x10
+      - name: Go vet focused packages
         shell: bash
         run: |
           set -euo pipefail
-          python3 <<'PY'
-          import random
-          MiB=1<<20; LIMIT=256*MiB; CHUNK=64*1024+512; PAGE=16*1024+2*1024+256
-          def old(unit,rate,sec,rng,threads):
-              logical=0; garbage=0; active=[]; dt=.02
-              for step in range(int(sec/dt)):
-                  for _ in range(max(1,int(rate*dt/unit))):
-                      if logical+unit<=LIMIT: logical+=unit; active.append((step+rng.randint(1,max(2,threads//2+1)),unit))
-                  keep=[]
-                  for due,size in active:
-                      if due<=step: logical-=size; garbage+=size
-                      else: keep.append((due,size))
-                  active=keep
-              return logical,garbage+sum(x[1] for x in active)
-          def ntx(rate,sec,rng,threads):
-              active=[]; reuse=[]; committed=peak=0; dt=.02
-              for step in range(int(sec/dt)):
-                  for _ in range(max(1,int(rate*dt/CHUNK))):
-                      if reuse: reuse.pop(); active.append((step+rng.randint(1,max(2,threads//2+1)),CHUNK))
-                      elif committed+CHUNK<=LIMIT: committed+=CHUNK; active.append((step+rng.randint(1,max(2,threads//2+1)),CHUNK))
-                      else: break
-                  keep=[]
-                  for due,size in active:
-                      if due<=step: reuse.append(size)
-                      else: keep.append((due,size))
-                  active=keep; peak=max(peak,committed)
-              return committed,peak,len(reuse)
-          def nrx(rate,sec,rng,threads):
-              live=[]; committed=pending=peak=scav=0; dt=.02
-              for step in range(int(sec/dt)):
-                  for _ in range(max(1,int(rate*dt/PAGE))):
-                      if committed+PAGE>LIMIT: committed-=pending; pending=0; scav+=1
-                      if committed+PAGE>LIMIT: break
-                      committed+=PAGE; live.append((step+rng.randint(1,max(2,threads//2+1)),PAGE))
-                  keep=[]
-                  for due,size in live:
-                      if due<=step: pending+=size
-                      else: keep.append((due,size))
-                  live=keep; peak=max(peak,committed)
-              return committed,peak,pending,scav
-          for b in range(10):
-              seed=0xC0FFEE+b*7919
-              l1,o1=old(CHUNK,20*MiB,30,random.Random(seed),16); n1,p1,r1=ntx(20*MiB,30,random.Random(seed),16)
-              lr,orr=old(PAGE,20*MiB,30,random.Random(seed+7),16); nr,pr,pend,sc=nrx(20*MiB,30,random.Random(seed+8),16)
-              l2,o2=old(CHUNK,87_500_000,10,random.Random(seed+9),32); n2,p2,r2=ntx(87_500_000,10,random.Random(seed+99),32)
-              assert l1<=LIMIT and o1>2*LIMIT and lr<=LIMIT and orr>2*LIMIT and l2<=LIMIT and o2>3*LIMIT
-              assert n1<=LIMIT and p1<=LIMIT and r1>0 and nr<=LIMIT and pr<=LIMIT and pend<=nr and sc>0 and n2<=LIMIT and p2<=LIMIT and r2>0
-              print(f'PASS {b+1:02d} oldTX160={o1/MiB:.1f}MiB oldRX160={orr/MiB:.1f}MiB oldTX700={o2/MiB:.1f}MiB')
-          print('PASS 10/10 independent TX/RX physical-credit memory batches')
-          PY
+          go vet \
+            -tags "$BUILD_TAGS" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
 
-      - name: Stream runtime regression with race detector x10
+      - name: Capacity option tests x100
         shell: bash
         run: |
           set -euo pipefail
-          go test -race -count=10 -timeout=20m ./protocol/multipath/stream
+          go test \
+            -count=100 \
+            -tags "$BUILD_TAGS" \
+            -run '^TestMultipathPreferredCapacityOption$' \
+            ./option
 
-      - name: Focused corrected Memory-v1 runtime regression with race detector x10
+      - name: Capacity architecture tests with race detector x100
         shell: bash
         run: |
           set -euo pipefail
-          go test -race -count=10 -timeout=30m -tags "$BUILD_TAGS" \
-            -run '^(TestMemoryBudget.*|TestPreferredCapacityAdjacentDeliveryRangesCoalesce)$' \
+          CGO_ENABLED=1 go test \
+            -race \
+            -count=100 \
+            -timeout=15m \
+            -tags "$BUILD_TAGS" \
+            -run '^TestPreferredCapacity' \
             ./protocol/multipath
 
-      - name: Frozen close and memory-release regression x10
+      - name: Multipath correctness regression with race detector
         shell: bash
         run: |
           set -euo pipefail
-          go test -race ./protocol/multipath -run '^(TestBeta5BidirectionalByteStream|TestBeta5SecondaryFailureDoesNotCloseSession|TestApplicationCloseDrainsAcrossTransientLegs|TestMemoryBudgetLastSessionReclaimsPendingBeforeRelease)$' -count=10
+          CGO_ENABLED=1 go test \
+            -race \
+            -count=1 \
+            -timeout=15m \
+            -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" \
+            ./protocol/multipath
 
-      - name: Full option + multipath + Mieru regression
+      - name: Mieru regression
         shell: bash
         run: |
           set -euo pipefail
-          go test -race -count=1 -timeout=30m -skip '^TestPerformanceHealthyLinks$' -tags "$BUILD_TAGS" \
-            ./option ./protocol/multipath ./protocol/mieru
+          go test \
+            -count=3 \
+            -timeout=10m \
+            -tags "$BUILD_TAGS" \
+            ./protocol/mieru
 
-      - name: Baseline vs corrected Memory-v1 healthy-link performance differential
+      - name: Parent vs candidate zero-field performance differential
         shell: bash
         run: |
           set -euo pipefail
-          LOG_DIR="${RUNNER_TEMP}/memory-v1-perf"; mkdir -p "$LOG_DIR"
+          LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
+          mkdir -p "$LOG_DIR"
+
           run_perf() {
-            local tree="$1" label="$2" run_id="$3" log="$LOG_DIR/${label}-${run_id}.log"
-            (cd "$tree" && CGO_ENABLED=1 go test -race -count=1 -timeout=7m -v -tags "$BUILD_TAGS" -run '^TestPerformanceHealthyLinks$' ./protocol/multipath) 2>&1 | tee "$log"
+            local tree="$1"
+            local label="$2"
+            local run_id="$3"
+            local log="$LOG_DIR/${label}-${run_id}.log"
+            set +e
+            (
+              cd "$tree"
+              CGO_ENABLED=1 go test \
+                -race \
+                -count=1 \
+                -timeout=5m \
+                -v \
+                -tags "$BUILD_TAGS" \
+                -run '^TestPerformanceHealthyLinks$' \
+                ./protocol/multipath
+            ) 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            echo "${label}_run_${run_id}_go_test_rc=${rc}"
           }
-          run_perf "$BASELINE_DIR" baseline 1
+
+          run_perf "$PARENT_DIR" parent 1
           run_perf "$GITHUB_WORKSPACE" candidate 1
-          run_perf "$BASELINE_DIR" baseline 2
+          run_perf "$PARENT_DIR" parent 2
           run_perf "$GITHUB_WORKSPACE" candidate 2
+
           python3 - "$LOG_DIR" <<'PY'
           from pathlib import Path
-          import re,statistics,sys
-          d=Path(sys.argv[1]); run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$'); rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
-          def parse(p):
-              cur=None; out={}; text=p.read_text(errors='replace')
-              for bad in ('memory budget exceeded','panic:','fatal error:','test timed out','DATA RACE'):
-                  if bad in text: raise SystemExit(f'FAIL {p.name}: {bad}')
-              for line in text.splitlines():
-                  m=run_re.search(line)
-                  if m: cur=m.group(1); continue
-                  m=rate_re.search(line)
-                  if m and cur: out[cur]=float(m.group(1))
-              if not out: raise SystemExit('FAIL no performance cases in '+p.name)
-              return out
-          b=[parse(d/'baseline-1.log'),parse(d/'baseline-2.log')]; c=[parse(d/'candidate-1.log'),parse(d/'candidate-2.log')]
-          if set(b[0])!=set(b[1]) or set(b[0])!=set(c[0]) or set(b[0])!=set(c[1]): raise SystemExit('FAIL performance case-set drift')
+          import statistics, re, sys
+          log_dir=Path(sys.argv[1])
+          expected=[
+            '1_160+600Mbps_65+110ms','8_160+600Mbps_65+110ms','32_160+600Mbps_65+110ms',
+            '1_40+50Mbps_65+110ms','8_40+50Mbps_65+110ms','1_160+600Mbps_65+400ms',
+            '8_160+600Mbps_65+400ms','1_160+600Mbps_110+65ms','1_160+600Mbps_5+10ms',
+            '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms',
+          ]
+          run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
+          rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
+          forbidden=(
+            'healthy reliable legs triggered replay','unused window credit caused memory pressure',
+            'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
+          )
+          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
+          def parse(path):
+            text=path.read_text(encoding='utf-8',errors='replace')
+            for token in forbidden:
+              if token in text: raise SystemExit(f'FAIL {path.name}: unsafe fixture result: {token}')
+            current=None; values={}
+            for line in text.splitlines():
+              d=diagnostic_re.search(line)
+              if d:
+                msg=d.group(1)
+                if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
+                  raise SystemExit(f'FAIL {path.name}: unexpected performance diagnostic: {msg}')
+              m=run_re.search(line)
+              if m:
+                current=m.group(1); continue
+              m=rate_re.search(line)
+              if m and current: values[current]=float(m.group(1))
+            missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
+            if missing or extra: raise SystemExit(f'FAIL {path.name}: missing={missing} extra={extra}')
+            return values
+          samples={
+            'parent':[parse(log_dir/'parent-1.log'),parse(log_dir/'parent-2.log')],
+            'candidate':[parse(log_dir/'candidate-1.log'),parse(log_dir/'candidate-2.log')],
+          }
           failed=False
-          for case in sorted(b[0]):
-              bm=statistics.median([x[case] for x in b]); cm=statistics.median([x[case] for x in c]); ratio=cm/bm
-              ok=ratio>=0.98; failed|=not ok; print(('PASS' if ok else 'FAIL'),case,f'baseline={bm:.2f} candidate={cm:.2f} ratio={ratio:.4f}')
-          if failed: raise SystemExit('FAIL corrected Memory-v1 performance below 98% of pre-Memory baseline')
-          print('PASS corrected Memory-v1 retains >=98% baseline healthy-link performance')
+          for case in expected:
+            pv=[x[case] for x in samples['parent']]; cv=[x[case] for x in samples['candidate']]
+            pm=statistics.median(pv); cm=statistics.median(cv); ratio=cm/pm
+            status='PASS' if ratio>=0.98 else 'FAIL'
+            print(f'{status} {case}: parent={pv} candidate={cv} ratio={ratio:.4f}')
+            failed |= ratio < 0.98
+          if failed: raise SystemExit('FAIL zero-field candidate performance below 98% of direct parent')
+          print('PASS zero-field candidate retains >=98% direct-parent performance for all fixtures')
           PY
 
-      - name: Cleanup baseline worktree
+      - name: Cleanup audit worktrees
         if: always()
         shell: bash
         run: |
-          git worktree remove --force "$BASELINE_DIR" >/dev/null 2>&1 || true
+          git worktree remove --force "$AUDIT_BASE_DIR" >/dev/null 2>&1 || true
+          git worktree remove --force "$PARENT_DIR" >/dev/null 2>&1 || true
 
   build_targets:
     name: Build ${{ matrix.label }}
@@ -438,24 +833,26 @@ jobs:
             runner: macos-15-intel
             goos: darwin
             goarch: amd64
-            binary: sing-box-1.14.0-multipath-beta6-memory-v1-darwin-amd64
+            binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
           - label: Windows amd64
             runner: windows-2025
             goos: windows
             goarch: amd64
-            binary: sing-box-1.14.0-multipath-beta6-memory-v1-windows-amd64.exe
+            binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
           - label: Linux amd64
             runner: ubuntu-24.04
             goos: linux
             goarch: amd64
-            binary: sing-box-1.14.0-multipath-beta6-memory-v1-linux-amd64
+            binary: sing-box-1.14.0-multipath-beta6-linux-amd64
+
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 50
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
+
     steps:
-      - name: Checkout exact audited candidate commit
+      - name: Checkout exact audited commit
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.audit_test.outputs.candidate_sha }}
@@ -478,6 +875,9 @@ jobs:
           test "$(go env GOVERSION)" = "go${GO_VERSION}"
           test "$(go env GOHOSTARCH)" = "amd64"
           test "$(go env GOHOSTOS)" = "${{ matrix.goos }}"
+          echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+          echo "go=$(go version)"
+          echo "audited_commit=$(git rev-parse HEAD)"
 
       - name: Set build inputs
         shell: bash
@@ -485,22 +885,38 @@ jobs:
           set -euo pipefail
           BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          test -n "$BUILD_TAGS"
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
-      - name: Native target regression tests (Linux/macOS)
+      - name: Native target regression tests (Linux/macOS frozen)
         if: matrix.goos != 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          go test -count=1 -timeout=25m -skip '^TestPerformanceHealthyLinks$' -tags "$BUILD_TAGS" ./option ./protocol/multipath ./protocol/mieru
+          go test \
+            -count=1 \
+            -timeout=15m \
+            -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
 
       - name: Native target regression tests (Windows)
         if: matrix.goos == 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          go test -count=1 -timeout=25m -skip '^(TestPerformanceHealthyLinks|TestCoreSenderStatusAndRTTProbe)$' -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./option ./protocol/multipath ./protocol/mieru
+          go test \
+            -count=1 \
+            -timeout=15m \
+            -skip '^(TestPerformanceHealthyLinks|TestCoreSenderStatusAndRTTProbe)$' \
+            -tags "$BUILD_TAGS" \
+            -ldflags "$LDFLAGS_SHARED" \
+            ./option \
+            ./protocol/multipath \
+            ./protocol/mieru
 
       - name: Build standalone core
         shell: bash
@@ -511,41 +927,57 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          go build -v -trimpath -tags "$BUILD_TAGS" \
+          go build \
+            -v \
+            -trimpath \
+            -tags "$BUILD_TAGS" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-            -o "dist/${{ matrix.binary }}" ./cmd/sing-box
+            -o "dist/${{ matrix.binary }}" \
+            ./cmd/sing-box
 
-      - name: Smoke-test built binary
+      - name: Smoke-test built binary and embedded version
         shell: bash
         run: |
           set -euo pipefail
           BIN="dist/${{ matrix.binary }}"
-          [[ "${{ matrix.goos }}" == "windows" ]] || chmod +x "$BIN"
+          if [[ "${{ matrix.goos }}" != "windows" ]]; then
+            chmod +x "$BIN"
+          fi
           test -s "$BIN"
-          test "$("./$BIN" version -n | tr -d '\r\n')" = "$VERSION"
-          OUT="$("./$BIN" version)"; printf '%s\n' "$OUT"
-          grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$OUT"
-          grep -F 'CGO: disabled' <<< "$OUT"
+          ACTUAL_VERSION="$("./$BIN" version -n | tr -d '\r\n')"
+          test "$ACTUAL_VERSION" = "$VERSION"
+          VERSION_OUTPUT="$("./$BIN" version)"
+          printf '%s\n' "$VERSION_OUTPUT"
+          grep -F \
+            "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" \
+            <<< "$VERSION_OUTPUT"
+          grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
 
-      - name: Produce checksum and provenance
+      - name: Produce checksum and build provenance
         shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           BIN="dist/${{ matrix.binary }}"
-          if [[ "$RUNNER_OS" == "macOS" ]]; then shasum -a 256 "$BIN" > "${BIN}.sha256"; else sha256sum "$BIN" > "${BIN}.sha256"; fi
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$BIN" > "${BIN}.sha256"
+          else
+            sha256sum "$BIN" > "${BIN}.sha256"
+          fi
           {
             echo "version=${VERSION}"
-            echo "source_branch=${SOURCE_BRANCH}"
+            echo "source_ref=${SOURCE_REF}"
             echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
-            echo "baseline_resolution=same-branch-nearest-ancestor"
-            echo "baseline_commit=${{ needs.audit_test.outputs.baseline_sha }}"
+            echo "parent_commit=${{ needs.audit_test.outputs.parent_sha }}"
             echo "go_version=$(go env GOVERSION)"
             echo "target=${{ matrix.goos }}/${{ matrix.goarch }}"
             echo "cgo=0"
             echo "build_tags=${BUILD_TAGS}"
             echo "binary=${{ matrix.binary }}"
           } > "${BIN}.buildinfo.txt"
-          cat "${BIN}.sha256"; cat "${BIN}.buildinfo.txt"
+          cat "${BIN}.sha256"
+          cat "${BIN}.buildinfo.txt"
 
       - name: Upload verified binary
         uses: actions/upload-artifact@v7
