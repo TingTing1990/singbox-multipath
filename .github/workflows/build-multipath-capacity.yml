@@ -1,4 +1,4 @@
-name: Build Multipath Mieru Inbound v1
+name: Build Multipath Capacity
 
 on:
   workflow_dispatch:
@@ -113,19 +113,31 @@ jobs:
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
-      - name: Materialize fixed Golden and fixed repair base
+      - name: Materialize fixed Golden and fixed repair base outside candidate workspace
         shell: bash
         run: |
           set -euo pipefail
           GOLDEN_DIR="${RUNNER_TEMP}/frozen-golden"
           REPAIR_DIR="${RUNNER_TEMP}/repair-base"
-          rm -rf "$GOLDEN_DIR" "$REPAIR_DIR"
+          EVIDENCE_DIR="${RUNNER_TEMP}/mieru-inbound-freeze-audit-evidence"
+          INDEPENDENT_WORKTREE="${RUNNER_TEMP}/independent-candidate"
+          MUTANT_ROOT="${RUNNER_TEMP}/real-mutants"
+
+          git worktree prune || true
+          rm -rf "$GOLDEN_DIR" "$REPAIR_DIR" "$EVIDENCE_DIR" "$INDEPENDENT_WORKTREE" "$MUTANT_ROOT"
+          mkdir -p "$EVIDENCE_DIR" "$MUTANT_ROOT"
+
           git worktree add --detach "$GOLDEN_DIR" "$FROZEN_GOLDEN_SHA"
           git worktree add --detach "$REPAIR_DIR" "$REPAIR_BASE_SHA"
+
           echo "GOLDEN_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
           echo "REPAIR_DIR=$REPAIR_DIR" >> "$GITHUB_ENV"
           echo "PARENT_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
-          mkdir -p ci-evidence
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
+          echo "INDEPENDENT_WORKTREE=$INDEPENDENT_WORKTREE" >> "$GITHUB_ENV"
+          echo "MUTANT_ROOT=$MUTANT_ROOT" >> "$GITHUB_ENV"
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Full-source architecture audit - 10 independent domains
         shell: bash
@@ -260,7 +272,8 @@ jobs:
           passline(10,'build-registry','registry/options/build tags/ldflags bounded and frozen')
           print('ALL 10 DISTINCT FULL-SOURCE ARCHITECTURE AUDIT DOMAINS PASS')
           PYAUDIT
-          python3 "${RUNNER_TEMP}/freeze-audit.py" | tee ci-evidence/full-source-audit.log
+          python3 "${RUNNER_TEMP}/freeze-audit.py" | tee "${EVIDENCE_DIR}/full-source-audit.log"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Materialize independent external contract tests
         shell: bash
@@ -270,353 +283,373 @@ jobs:
           mkdir -p "$INDEPENDENT_DIR/protocol/mieru" "$INDEPENDENT_DIR/protocol/multipath"
           cat > "$INDEPENDENT_DIR/protocol/mieru/freeze_independent_test.go" <<'GOEOF'
           package mieru
-
+          
           import (
-              "context"
-              "errors"
-              "net"
-              "net/netip"
-              "strings"
-              "testing"
-              "time"
-
-              mierucommon "github.com/enfein/mieru/v3/apis/common"
-              "github.com/sagernet/sing-box/adapter"
-              "github.com/sagernet/sing-box/log"
-              "github.com/sagernet/sing-box/option"
-              "github.com/sagernet/sing/common/buf"
-              "github.com/sagernet/sing/common/json/badoption"
-              M "github.com/sagernet/sing/common/metadata"
+          	"context"
+          	"errors"
+          	"net"
+          	"net/netip"
+          	"strings"
+          	"testing"
+          	"time"
+          
+          	mierucommon "github.com/enfein/mieru/v3/apis/common"
+          	"github.com/sagernet/sing-box/adapter"
+          	"github.com/sagernet/sing-box/log"
+          	"github.com/sagernet/sing-box/option"
+          	"github.com/sagernet/sing/common/buf"
+          	"github.com/sagernet/sing/common/json/badoption"
+          	M "github.com/sagernet/sing/common/metadata"
           )
-
+          
           type freezePacketConn struct {
-              read     []byte
-              write    []byte
-              writeErr error
+          	read     []byte
+          	write    []byte
+          	writeErr error
           }
-
+          
           func (c *freezePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-              if c.read == nil {
-                  return 0, nil, errors.New("no packet")
-              }
-              n := copy(p, c.read)
-              c.read = nil
-              return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil
+          	if c.read == nil {
+          		return 0, nil, errors.New("no packet")
+          	}
+          	n := copy(p, c.read)
+          	c.read = nil
+          	return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil
           }
-
+          
           func (c *freezePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-              if c.writeErr != nil {
-                  return 0, c.writeErr
-              }
-              c.write = append([]byte(nil), p...)
-              return len(p), nil
+          	if c.writeErr != nil {
+          		return 0, c.writeErr
+          	}
+          	c.write = append([]byte(nil), p...)
+          	return len(p), nil
           }
-
-          func (c *freezePacketConn) Close() error                       { return nil }
-          func (c *freezePacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
-          func (c *freezePacketConn) SetDeadline(time.Time) error        { return nil }
-          func (c *freezePacketConn) SetReadDeadline(time.Time) error    { return nil }
-          func (c *freezePacketConn) SetWriteDeadline(time.Time) error   { return nil }
-
+          
+          func (c *freezePacketConn) Close() error                     { return nil }
+          func (c *freezePacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+          func (c *freezePacketConn) SetDeadline(time.Time) error      { return nil }
+          func (c *freezePacketConn) SetReadDeadline(time.Time) error  { return nil }
+          func (c *freezePacketConn) SetWriteDeadline(time.Time) error { return nil }
+          
           func freezeOptions(transport string, port uint16) option.MieruInboundOptions {
-              return option.MieruInboundOptions{
-                  ListenOptions: option.ListenOptions{ListenPort: port},
-                  Transport:     transport,
-                  Users:         []option.MieruUser{{Name: "u", Password: "p"}},
-              }
+          	return option.MieruInboundOptions{
+          		ListenOptions: option.ListenOptions{ListenPort: port},
+          		Transport:     transport,
+          		Users:         []option.MieruUser{{Name: "u", Password: "p"}},
+          	}
           }
-
+          
           func freezeReserve(t *testing.T, network, address string) (uint16, bool) {
-              t.Helper()
-              if network == "tcp4" || network == "tcp6" {
-                  listener, err := net.Listen(network, net.JoinHostPort(address, "0"))
-                  if err != nil {
-                      return 0, false
-                  }
-                  port := uint16(listener.Addr().(*net.TCPAddr).Port)
-                  _ = listener.Close()
-                  return port, true
-              }
-              packetConn, err := net.ListenPacket(network, net.JoinHostPort(address, "0"))
-              if err != nil {
-                  return 0, false
-              }
-              port := uint16(packetConn.LocalAddr().(*net.UDPAddr).Port)
-              _ = packetConn.Close()
-              return port, true
+          	t.Helper()
+          	if network == "tcp4" || network == "tcp6" {
+          		listener, err := net.Listen(network, net.JoinHostPort(address, "0"))
+          		if err != nil {
+          			return 0, false
+          		}
+          		port := uint16(listener.Addr().(*net.TCPAddr).Port)
+          		_ = listener.Close()
+          		return port, true
+          	}
+          	packetConn, err := net.ListenPacket(network, net.JoinHostPort(address, "0"))
+          	if err != nil {
+          		return 0, false
+          	}
+          	port := uint16(packetConn.LocalAddr().(*net.UDPAddr).Port)
+          	_ = packetConn.Close()
+          	return port, true
           }
-
+          
           func TestFreezeIndependentExplicitListen(t *testing.T) {
-              tests := []struct {
-                  name      string
-                  transport string
-                  address   string
-                  network   string
-              }{
-                  {name: "tcp4", transport: "TCP", address: "127.0.0.1", network: "tcp4"},
-                  {name: "udp4", transport: "UDP", address: "127.0.0.1", network: "udp4"},
-                  {name: "tcp6", transport: "TCP", address: "::1", network: "tcp6"},
-                  {name: "udp6", transport: "UDP", address: "::1", network: "udp6"},
-              }
-              for _, tt := range tests {
-                  t.Run(tt.name, func(t *testing.T) {
-                      port, ok := freezeReserve(t, tt.network, tt.address)
-                      if !ok {
-                          t.Skip("address family unavailable")
-                      }
-                      options := freezeOptions(tt.transport, port)
-                      listenAddress := badoption.Addr(netip.MustParseAddr(tt.address))
-                      options.Listen = &listenAddress
-                      raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-listen", options)
-                      if err != nil {
-                          t.Fatal(err)
-                      }
-                      inbound := raw.(*Inbound)
-                      if err := inbound.Start(adapter.StartStateStart); err != nil {
-                          t.Fatal(err)
-                      }
-                      defer inbound.Close()
-
-                      var actual net.Addr
-                      if tt.transport == "TCP" {
-                          if inbound.listener.TCPListener() == nil {
-                              t.Fatal("TCP factory not used")
-                          }
-                          actual = inbound.listener.TCPListener().Addr()
-                      } else {
-                          if inbound.listener.UDPConn() == nil {
-                              t.Fatal("UDP factory not used")
-                          }
-                          actual = inbound.listener.UDPConn().LocalAddr()
-                      }
-                      host, _, err := net.SplitHostPort(actual.String())
-                      if err != nil {
-                          t.Fatal(err)
-                      }
-                      if netip.MustParseAddr(host).Unmap() != netip.MustParseAddr(tt.address).Unmap() {
-                          t.Fatalf("configured=%s actual=%s", tt.address, host)
-                      }
-                      if err := inbound.Close(); err != nil {
-                          t.Fatal(err)
-                      }
-                      if inbound.server.IsRunning() {
-                          t.Fatal("server still running after Close")
-                      }
-                  })
-              }
+          	tests := []struct {
+          		name      string
+          		transport string
+          		address   string
+          		network   string
+          	}{
+          		{name: "tcp4", transport: "TCP", address: "127.0.0.1", network: "tcp4"},
+          		{name: "udp4", transport: "UDP", address: "127.0.0.1", network: "udp4"},
+          		{name: "tcp6", transport: "TCP", address: "::1", network: "tcp6"},
+          		{name: "udp6", transport: "UDP", address: "::1", network: "udp6"},
+          	}
+          	for _, tt := range tests {
+          		t.Run(tt.name, func(t *testing.T) {
+          			port, ok := freezeReserve(t, tt.network, tt.address)
+          			if !ok {
+          				t.Skip("address family unavailable")
+          			}
+          			options := freezeOptions(tt.transport, port)
+          			listenAddress := badoption.Addr(netip.MustParseAddr(tt.address))
+          			options.Listen = &listenAddress
+          			raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-listen", options)
+          			if err != nil {
+          				t.Fatal(err)
+          			}
+          			inbound := raw.(*Inbound)
+          			if err := inbound.Start(adapter.StartStateStart); err != nil {
+          				t.Fatal(err)
+          			}
+          			defer inbound.Close()
+          
+          			var actual net.Addr
+          			if tt.transport == "TCP" {
+          				if inbound.listener.TCPListener() == nil {
+          					t.Fatal("TCP factory not used")
+          				}
+          				actual = inbound.listener.TCPListener().Addr()
+          			} else {
+          				if inbound.listener.UDPConn() == nil {
+          					t.Fatal("UDP factory not used")
+          				}
+          				actual = inbound.listener.UDPConn().LocalAddr()
+          			}
+          			host, _, err := net.SplitHostPort(actual.String())
+          			if err != nil {
+          				t.Fatal(err)
+          			}
+          			if netip.MustParseAddr(host).Unmap() != netip.MustParseAddr(tt.address).Unmap() {
+          				t.Fatalf("configured=%s actual=%s", tt.address, host)
+          			}
+          			if err := inbound.Close(); err != nil {
+          				t.Fatal(err)
+          			}
+          			if inbound.server.IsRunning() {
+          				t.Fatal("server still running after Close")
+          			}
+          		})
+          	}
           }
-
+          
           func TestFreezeIndependentOmittedListenCompatibility(t *testing.T) {
-              port, ok := freezeReserve(t, "tcp4", "127.0.0.1")
-              if !ok {
-                  t.Fatal("IPv4 unavailable")
-              }
-              raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-default", freezeOptions("TCP", port))
-              if err != nil {
-                  t.Fatal(err)
-              }
-              inbound := raw.(*Inbound)
-              if err := inbound.Start(adapter.StartStateStart); err != nil {
-                  t.Fatal(err)
-              }
-              defer inbound.Close()
-              address := inbound.listener.TCPListener().Addr().(*net.TCPAddr)
-              if !address.IP.IsUnspecified() || address.IP.To4() == nil {
-                  t.Fatalf("omitted listen drifted: %v", address)
-              }
+          	port, ok := freezeReserve(t, "tcp4", "127.0.0.1")
+          	if !ok {
+          		t.Fatal("IPv4 unavailable")
+          	}
+          	raw, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "freeze-default", freezeOptions("TCP", port))
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	inbound := raw.(*Inbound)
+          	if err := inbound.Start(adapter.StartStateStart); err != nil {
+          		t.Fatal(err)
+          	}
+          	defer inbound.Close()
+          	address := inbound.listener.TCPListener().Addr().(*net.TCPAddr)
+          	if !address.IP.IsUnspecified() || address.IP.To4() == nil {
+          		t.Fatalf("omitted listen drifted: %v", address)
+          	}
           }
-
+          
           func TestFreezeIndependentWriteBufferOwnership(t *testing.T) {
-              for _, fail := range []bool{false, true} {
-                  name := "success"
-                  if fail {
-                      name = "write_error"
-                  }
-                  t.Run(name, func(t *testing.T) {
-                      packetConn := &freezePacketConn{}
-                      if fail {
-                          packetConn.writeErr = errors.New("injected")
-                      }
-                      wrapped := &mieruPacketConn{PacketConn: packetConn}
-                      buffer := buf.NewSize(1024)
-                      _, _ = buffer.Write([]byte("payload"))
-                      err := wrapped.WritePacket(buffer, M.ParseSocksaddr("203.0.113.7:53"))
-                      if (err != nil) != fail {
-                          t.Fatalf("unexpected error %v", err)
-                      }
-                      if buffer.RawCap() != 0 {
-                          t.Fatalf("transferred buffer retained cap=%d", buffer.RawCap())
-                      }
-                  })
-              }
+          	for _, fail := range []bool{false, true} {
+          		name := "success"
+          		if fail {
+          			name = "write_error"
+          		}
+          		t.Run(name, func(t *testing.T) {
+          			packetConn := &freezePacketConn{}
+          			if fail {
+          				packetConn.writeErr = errors.New("injected")
+          			}
+          			wrapped := &mieruPacketConn{PacketConn: packetConn}
+          			buffer := buf.NewSize(1024)
+          			_, _ = buffer.Write([]byte("payload"))
+          			err := wrapped.WritePacket(buffer, M.ParseSocksaddr("203.0.113.7:53"))
+          			if (err != nil) != fail {
+          				t.Fatalf("unexpected error %v", err)
+          			}
+          			if buffer.RawCap() != 0 {
+          				t.Fatalf("transferred buffer retained cap=%d", buffer.RawCap())
+          			}
+          		})
+          	}
           }
-
+          
           func TestFreezeIndependentAddressEncodingErrorConsumesBuffer(t *testing.T) {
-              wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{}}
-              buffer := buf.NewSize(1024)
-              _, _ = buffer.Write([]byte("payload"))
-              err := wrapped.WritePacket(buffer, M.Socksaddr{Fqdn: strings.Repeat("a", 256), Port: 53})
-              if err == nil {
-                  t.Fatal("expected SOCKS5 address encoding error")
-              }
-              if buffer.RawCap() != 0 {
-                  t.Fatalf("address encoding error retained transferred buffer cap=%d", buffer.RawCap())
-              }
+          	wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{}}
+          	buffer := buf.NewSize(1024)
+          	_, _ = buffer.Write([]byte("payload"))
+          	err := wrapped.WritePacket(buffer, M.Socksaddr{Fqdn: strings.Repeat("a", 256), Port: 53})
+          	if err == nil {
+          		t.Fatal("expected SOCKS5 address encoding error")
+          	}
+          	if buffer.RawCap() != 0 {
+          		t.Fatalf("address encoding error retained transferred buffer cap=%d", buffer.RawCap())
+          	}
           }
-
+          
           func TestFreezeIndependentUDPHeaderBoundary(t *testing.T) {
-              packets := [][]byte{
-                  {1, 0, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
-                  {0, 1, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
-                  {0, 0, 1, 1, 203, 0, 113, 7, 0, 53, 'x'},
-              }
-              for _, packet := range packets {
-                  wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
-                  buffer := buf.NewSize(1024)
-                  _, err := wrapped.ReadPacket(buffer)
-                  buffer.Release()
-                  if err == nil {
-                      t.Fatalf("invalid UDP header accepted: %x", packet[:3])
-                  }
-              }
+          	packets := [][]byte{
+          		{1, 0, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
+          		{0, 1, 0, 1, 203, 0, 113, 7, 0, 53, 'x'},
+          		{0, 0, 1, 1, 203, 0, 113, 7, 0, 53, 'x'},
+          	}
+          	for _, packet := range packets {
+          		wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
+          		buffer := buf.NewSize(1024)
+          		_, err := wrapped.ReadPacket(buffer)
+          		buffer.Release()
+          		if err == nil {
+          			t.Fatalf("invalid UDP header accepted: %x", packet[:3])
+          		}
+          	}
           }
-
+          
           func TestFreezeIndependentMalformedUDPAddress(t *testing.T) {
-              packets := [][]byte{
-                  {},
-                  {0},
-                  {0, 0},
-                  {0, 0, 0},
-                  {0, 0, 0, 9},
-                  {0, 0, 0, 1, 127},
-              }
-              for _, packet := range packets {
-                  wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
-                  buffer := buf.NewSize(1024)
-                  _, err := wrapped.ReadPacket(buffer)
-                  buffer.Release()
-                  if err == nil {
-                      t.Fatalf("malformed UDP packet accepted: %x", packet)
-                  }
-              }
+          	packets := [][]byte{
+          		{},
+          		{0},
+          		{0, 0},
+          		{0, 0, 0},
+          		{0, 0, 0, 9},
+          		{0, 0, 0, 1, 127},
+          	}
+          	for _, packet := range packets {
+          		wrapped := &mieruPacketConn{PacketConn: &freezePacketConn{read: append([]byte(nil), packet...)}}
+          		buffer := buf.NewSize(1024)
+          		_, err := wrapped.ReadPacket(buffer)
+          		buffer.Release()
+          		if err == nil {
+          			t.Fatalf("malformed UDP packet accepted: %x", packet)
+          		}
+          	}
           }
-
+          
           func TestFreezeIndependentUpstreamUDPInterop(t *testing.T) {
-              for _, address := range []string{"203.0.113.7:53", "[2001:db8::7]:5353"} {
-                  t.Run(address, func(t *testing.T) {
-                      destination := M.ParseSocksaddr(address)
-                      packetConn := &freezePacketConn{}
-                      wrapped := &mieruPacketConn{PacketConn: packetConn}
-                      buffer := buf.NewSize(1024)
-                      _, _ = buffer.Write([]byte("payload"))
-                      if err := wrapped.WritePacket(buffer, destination); err != nil {
-                          t.Fatal(err)
-                      }
-                      upstream := mierucommon.NewUDPAssociateWrapper(&freezePacketConn{read: packetConn.write})
-                      payload := make([]byte, 1024)
-                      n, actual, err := upstream.ReadFrom(payload)
-                      if err != nil {
-                          t.Fatal(err)
-                      }
-                      if actual.String() != destination.String() || string(payload[:n]) != "payload" {
-                          t.Fatalf("got=%s payload=%q", actual, payload[:n])
-                      }
-                  })
-              }
+          	for _, address := range []string{"203.0.113.7:53", "[2001:db8::7]:5353"} {
+          		t.Run(address, func(t *testing.T) {
+          			destination := M.ParseSocksaddr(address)
+          			packetConn := &freezePacketConn{}
+          			wrapped := &mieruPacketConn{PacketConn: packetConn}
+          			buffer := buf.NewSize(1024)
+          			_, _ = buffer.Write([]byte("payload"))
+          			if err := wrapped.WritePacket(buffer, destination); err != nil {
+          				t.Fatal(err)
+          			}
+          			upstream := mierucommon.NewUDPAssociateWrapper(&freezePacketConn{read: packetConn.write})
+          			payload := make([]byte, 1024)
+          			n, actual, err := upstream.ReadFrom(payload)
+          			if err != nil {
+          				t.Fatal(err)
+          			}
+          			if actual.String() != destination.String() || string(payload[:n]) != "payload" {
+          				t.Fatalf("got=%s payload=%q", actual, payload[:n])
+          			}
+          		})
+          	}
           }
-
+          
           func TestFreezeIndependentValidationBoundaries(t *testing.T) {
-              cases := []option.MieruInboundOptions{
-                  freezeOptions("QUIC", 8964),
-                  freezeOptions("TCP", 8964),
-                  freezeOptions("TCP", 8964),
-                  freezeOptions("TCP", 8964),
-              }
-              cases[1].Users = nil
-              cases[2].Users[0].Name = ""
-              cases[3].Users[0].Password = ""
-              for index, options := range cases {
-                  if err := validateMieruInboundOptions(options); err == nil {
-                      t.Fatalf("invalid validation case %d accepted", index)
-                  }
-              }
-
-              zeroPort := freezeOptions("TCP", 0)
-              if _, _, err := buildMieruServerConfig(context.Background(), zeroPort); err == nil {
-                  t.Fatal("zero listen_port accepted")
-              }
+          	cases := []option.MieruInboundOptions{
+          		freezeOptions("QUIC", 8964),
+          		freezeOptions("TCP", 8964),
+          		freezeOptions("TCP", 8964),
+          		freezeOptions("TCP", 8964),
+          	}
+          	cases[1].Users = nil
+          	cases[2].Users[0].Name = ""
+          	cases[3].Users[0].Password = ""
+          	for index, options := range cases {
+          		if err := validateMieruInboundOptions(options); err == nil {
+          			t.Fatalf("invalid validation case %d accepted", index)
+          		}
+          	}
+          
+          	zeroPort := freezeOptions("TCP", 0)
+          	if _, _, err := buildMieruServerConfig(context.Background(), zeroPort); err == nil {
+          		t.Fatal("zero listen_port accepted")
+          	}
           }
           GOEOF
 
           cat > "$INDEPENDENT_DIR/protocol/multipath/freeze_independent_test.go" <<'GOEOF'
           package multipath
-
+          
           import (
-              "context"
-              "fmt"
-              "strings"
-              "testing"
-              "time"
-
-              "github.com/sagernet/sing-box/adapter/inbound"
-              "github.com/sagernet/sing-box/log"
+          	"context"
+          	"fmt"
+          	"strings"
+          	"testing"
+          	"time"
+          
+          	"github.com/sagernet/sing-box/adapter/inbound"
+          	"github.com/sagernet/sing-box/log"
           )
-
+          
           type freezeAuditLogger struct {
-              log.ContextLogger
-              lines []string
+          	log.ContextLogger
+          	lines []string
           }
-
+          
           func (l *freezeAuditLogger) ErrorContext(_ context.Context, args ...any) {
-              l.lines = append(l.lines, fmt.Sprint(args...))
+          	l.lines = append(l.lines, fmt.Sprint(args...))
           }
-
+          
           func (l *freezeAuditLogger) InfoContext(_ context.Context, args ...any) {
-              l.lines = append(l.lines, fmt.Sprint(args...))
+          	l.lines = append(l.lines, fmt.Sprint(args...))
           }
-
+          
           func TestFreezeIndependentAuditDropFilter(t *testing.T) {
-              controller := newPreferredCapacityController(70, time.Second, 64<<10)
-              controller.enableAudit()
-              for i := 0; i < preferredCapacityAuditQueueLimit+1; i++ {
-                  controller.recordAuditReady(time.Unix(int64(10000+i), 0))
-              }
-              logger := &freezeAuditLogger{ContextLogger: log.NewNOPFactory().Logger()}
-              inbound := &Inbound{
-                  Adapter: inbound.NewAdapter("multipath", "mp-in-39002"),
-                  ctx:     context.Background(),
-                  logger:  logger,
-                  cfg:     coreConfig{PreferredCapacity: controller},
-              }
-              inbound.flushPreferredCapacityAudit()
-
-              found := false
-              for _, line := range logger.lines {
-                  if strings.Contains(line, "CAP_AUDIT_DROPPED") &&
-                      strings.Contains(line, `instance="mp-in-39002"`) &&
-                      strings.Contains(line, "evidence_complete=false") {
-                      found = true
-                  }
-              }
-              if !found {
-                  t.Fatal("DROPPED evidence lost by quoted instance filter")
-              }
+          	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+          	controller.enableAudit()
+          	for i := 0; i < preferredCapacityAuditQueueLimit+1; i++ {
+          		controller.recordAuditReady(time.Unix(int64(10000+i), 0))
+          	}
+          	logger := &freezeAuditLogger{ContextLogger: log.NewNOPFactory().Logger()}
+          	inbound := &Inbound{
+          		Adapter: inbound.NewAdapter("multipath", "mp-in-39002"),
+          		ctx:     context.Background(),
+          		logger:  logger,
+          		cfg:     coreConfig{PreferredCapacity: controller},
+          	}
+          	inbound.flushPreferredCapacityAudit()
+          
+          	found := false
+          	for _, line := range logger.lines {
+          		if strings.Contains(line, "CAP_AUDIT_DROPPED") &&
+          			strings.Contains(line, `instance="mp-in-39002"`) &&
+          			strings.Contains(line, "evidence_complete=false") {
+          			found = true
+          		}
+          	}
+          	if !found {
+          		t.Fatal("DROPPED evidence lost by quoted instance filter")
+          	}
           }
           GOEOF
           echo "INDEPENDENT_DIR=$INDEPENDENT_DIR" >> "$GITHUB_ENV"
 
-      - name: Independent repaired-contract execution
+      - name: Independent repaired-contract execution in isolated worktree
         shell: bash
         run: |
           set -euo pipefail
-          cp "$INDEPENDENT_DIR/protocol/mieru/freeze_independent_test.go" protocol/mieru/zz_freeze_independent_test.go
-          cp "$INDEPENDENT_DIR/protocol/multipath/freeze_independent_test.go" protocol/multipath/zz_freeze_independent_test.go
-          trap 'rm -f protocol/mieru/zz_freeze_independent_test.go protocol/multipath/zz_freeze_independent_test.go' EXIT
-          CGO_ENABLED=1 go test \
-            -race -count=1 -timeout=15m \
-            -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" \
-            -run '^TestFreezeIndependent' \
-            ./protocol/mieru ./protocol/multipath | tee ci-evidence/independent-contracts.log
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          rm -rf "$INDEPENDENT_WORKTREE"
+          git worktree add --detach "$INDEPENDENT_WORKTREE" "${{ steps.resolve.outputs.candidate_sha }}"
+          cleanup_independent() {
+            git worktree remove --force "$INDEPENDENT_WORKTREE" 2>/dev/null || true
+            git worktree prune || true
+          }
+          trap cleanup_independent EXIT
+
+          cp "$INDEPENDENT_DIR/protocol/mieru/freeze_independent_test.go" \
+            "$INDEPENDENT_WORKTREE/protocol/mieru/zz_freeze_independent_test.go"
+          cp "$INDEPENDENT_DIR/protocol/multipath/freeze_independent_test.go" \
+            "$INDEPENDENT_WORKTREE/protocol/multipath/zz_freeze_independent_test.go"
+
+          (
+            cd "$INDEPENDENT_WORKTREE"
+            test "$(git rev-parse HEAD)" = "${{ steps.resolve.outputs.candidate_sha }}"
+            CGO_ENABLED=1 go test \
+              -race -count=1 -timeout=15m \
+              -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" \
+              -run '^TestFreezeIndependent' \
+              ./protocol/mieru ./protocol/multipath
+          ) 2>&1 | tee "${EVIDENCE_DIR}/independent-contracts.log"
+
+          cleanup_independent
+          trap - EXIT
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Actual mutation controls - 10 executable wrong variants
         shell: bash
@@ -627,10 +660,10 @@ jobs:
           import os, shutil, subprocess, sys
 
           root=Path(os.environ['GITHUB_WORKSPACE'])
-          temp=Path(os.environ['RUNNER_TEMP'])/'real-mutants'
+          temp=Path(os.environ['MUTANT_ROOT'])
           temp.mkdir(parents=True,exist_ok=True)
           independent=Path(os.environ['INDEPENDENT_DIR'])
-          evidence=root/'ci-evidence'/'mutations'
+          evidence=Path(os.environ['EVIDENCE_DIR'])/'mutations'
           evidence.mkdir(parents=True,exist_ok=True)
           candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
           tags=os.environ['BUILD_TAGS']; ldflags=os.environ['LDFLAGS_SHARED']
@@ -688,6 +721,7 @@ jobs:
               subprocess.run(['git','worktree','prune'],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
           print('ALL 10 EXECUTABLE WRONG VARIANTS KILLED')
           PYMUT
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Check formatting of exact Mieru inbound write-set
         shell: bash
@@ -831,12 +865,24 @@ jobs:
           print('PASS zero-field candidate retains >=98% direct-parent performance for all fixtures')
           PY
 
+      - name: Verify candidate workspace remained pristine after all audit mutation and test stages
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$STATUS" ]]; then
+            printf '%s\n' "$STATUS"
+            echo 'FAIL: candidate workspace was modified by CI infrastructure' >&2
+            exit 1
+          fi
+          echo 'PASS candidate workspace remained pristine'
+
       - name: Upload audit evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: mieru-inbound-freeze-audit-evidence
-          path: ci-evidence
+          path: ${{ runner.temp }}/mieru-inbound-freeze-audit-evidence
           if-no-files-found: warn
           retention-days: 30
 
@@ -845,8 +891,14 @@ jobs:
         shell: bash
         run: |
           set +e
+          git worktree remove --force "$INDEPENDENT_WORKTREE" 2>/dev/null || true
           git worktree remove --force "$GOLDEN_DIR" 2>/dev/null || true
           git worktree remove --force "$REPAIR_DIR" 2>/dev/null || true
+          if [[ -d "$MUTANT_ROOT" ]]; then
+            while IFS= read -r -d '' dir; do
+              git worktree remove --force "$dir" 2>/dev/null || true
+            done < <(find "$MUTANT_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+          fi
           git worktree prune || true
 
   build_targets:
