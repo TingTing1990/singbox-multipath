@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,30 +17,16 @@ const (
 	automaticMemoryLimitCap      = 512 << 20
 	automaticMemoryLimitFallback = 256 << 20
 	memoryCacheLimitCap          = 16 << 20
-	memoryIdleTrimDelay          = 2 * time.Second
-	memoryMaintenanceInterval    = 250 * time.Millisecond
 	sessionMemoryBase            = 128 << 10
 	wireFrameMemoryEstimate      = int64(unsafe.Sizeof(wireFrame{}))
 )
 
-var (
-	errMemoryLimit = errors.New("multipath memory limit reached")
-	// Kept as a variable so memory tests can verify trim decisions without
-	// forcing process-wide GC on every unit-test assertion. Production always
-	// uses runtime/debug.FreeOSMemory.
-	memoryScavenge = debug.FreeOSMemory
-	// debug.FreeOSMemory is process-wide. Serialize it across all multipath
-	// inbound/outbound budgets so simultaneous idle trims do not launch
-	// overlapping forced-GC/scavenge cycles. Individual budget mutexes are never
-	// held while this mutex or the runtime operation is active.
-	memoryScavengeAccess sync.Mutex
-)
+var errMemoryLimit = errors.New("multipath memory limit reached")
 
 type memorySnapshot struct {
 	LimitBytes         int64
 	UsedBytes          int64
 	CachedBytes        int64
-	ActiveBytes        int64
 	BoosterLimitBytes  int64
 	BoosterResumeBytes int64
 	Automatic          bool
@@ -51,10 +36,6 @@ type memorySnapshot struct {
 	BackpressureEvents uint64
 	PeakUsedBytes      int64
 	PeakCachedBytes    int64
-	FreshAllocations   uint64
-	ReusedAllocations  uint64
-	TrimEvents         uint64
-	TrimmedBytes       uint64
 }
 
 type memoryPressureEvent struct {
@@ -72,36 +53,18 @@ type memoryBudget struct {
 	boosterResume int64
 	cacheLimit    int64
 	automatic     bool
-
-	// used is the total charged memory, including reusable TX/data slabs in
-	// cache. A released slab stays charged until it is either reused or actually
-	// dropped and scavenged. This is the key physical-credit invariant: a logical
-	// Release must not immediately mint credit for another fresh make() while the
-	// old backing array is still resident in the Go heap.
-	used   int64
-	cached int64
-	cache  map[int][][]byte
-
+	used          int64
+	cached        int64
+	cache         map[int][][]byte
 	pressure      bool
 	pressureSince time.Time
 	pressureCount uint64
 	waitCount     uint64
 	peakUsed      int64
 	peakCached    int64
-
-	lastActivity      time.Time
-	freshAllocations  uint64
-	reusedAllocations uint64
-	trimCount         uint64
-	trimmedBytes      uint64
-	pendingReclaim    int64
-	garbageHintBytes  int64
-	scavenging        bool
-	scavengeQueued    bool
-
-	changed chan struct{}
-	events  chan memoryPressureEvent
-	logOnce sync.Once
+	changed       chan struct{}
+	events        chan memoryPressureEvent
+	logOnce       sync.Once
 }
 
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {
@@ -140,7 +103,6 @@ func newMemoryBudget(limit int64, automatic bool) *memoryBudget {
 		cacheLimit:    cacheLimit,
 		automatic:     automatic,
 		cache:         make(map[int][][]byte),
-		lastActivity:  time.Now(),
 		changed:       make(chan struct{}),
 		events:        make(chan memoryPressureEvent, 4),
 	}
@@ -154,208 +116,35 @@ func sessionMemoryReservation(cfg coreConfig) int64 {
 	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
 }
 
-func (b *memoryBudget) activeBytesLocked() int64 {
-	active := b.used - b.cached
-	if active < 0 {
-		return 0
-	}
-	return active
-}
-
-func (b *memoryBudget) noteActivityLocked(now time.Time) {
-	b.lastActivity = now
-}
-
-// takeCachedLocked returns the smallest reusable slab whose capacity satisfies
-// size. The slab remains charged in b.used; only its cached subset changes.
-func (b *memoryBudget) takeCachedLocked(size int) []byte {
-	best := 0
-	for capacity, buffers := range b.cache {
-		if len(buffers) == 0 || capacity < size {
-			continue
-		}
-		if best == 0 || capacity < best {
-			best = capacity
-		}
-	}
-	if best == 0 {
-		return nil
-	}
-	buffers := b.cache[best]
-	last := len(buffers) - 1
-	buffer := buffers[last]
-	buffers[last] = nil
-	if last == 0 {
-		delete(b.cache, best)
-	} else {
-		b.cache[best] = buffers[:last]
-	}
-	b.cached -= int64(best)
-	if b.cached < 0 {
-		b.cached = 0
-	}
-	b.reusedAllocations++
-	return buffer[:size]
-}
-
-// detachCachedBytesLocked severs references to at least requested bytes of
-// reusable backing storage without immediately minting fresh-allocation credit.
-// The detached bytes stay charged in b.used and move to pendingReclaim until a
-// process-wide GC/scavenge has completed. This closes the race where old slabs
-// remained resident while the same memory_limit credit was reused for new make().
-func (b *memoryBudget) detachCachedBytesLocked(requested int64) int64 {
-	if requested <= 0 || b.cached <= 0 || b.scavenging {
-		return 0
-	}
-	var detached int64
-	for detached < requested && b.cached > 0 {
-		largest := 0
-		for capacity, buffers := range b.cache {
-			if len(buffers) > 0 && capacity > largest {
-				largest = capacity
-			}
-		}
-		if largest == 0 {
-			break
-		}
-		buffers := b.cache[largest]
-		need := int((requested - detached + int64(largest) - 1) / int64(largest))
-		if need > len(buffers) {
-			need = len(buffers)
-		}
-		start := len(buffers) - need
-		clear(buffers[start:])
-		if start == 0 {
-			delete(b.cache, largest)
-		} else {
-			b.cache[largest] = buffers[:start]
-		}
-		bytes := int64(need * largest)
-		detached += bytes
-		b.cached -= bytes
-	}
-	if b.cached < 0 {
-		b.cached = 0
-	}
-	b.pendingReclaim += detached
-	return detached
-}
-
-// scavengePending performs the expensive process-wide GC/scavenge without
-// holding the memory-budget mutex. Detached slabs remain charged in b.used for
-// the entire scavenge, so concurrent callers cannot spend their credit early.
-// queueScavengeLocked schedules a reclaim cycle without blocking the caller.
-// It is used by data-plane admission paths which may execute while another
-// protocol lock is held. At most one queued cycle exists per budget.
-// Caller holds b.access.
-func (b *memoryBudget) queueScavengeLocked() {
-	if b == nil || b.scavengeQueued || b.scavenging || b.pendingReclaim == 0 {
-		return
-	}
-	b.scavengeQueued = true
-	go b.scavengePending(false)
-}
-
-func (b *memoryBudget) scavengePending(includeGarbageHint bool) int64 {
-	if b == nil {
-		return 0
-	}
-	b.access.Lock()
-	// A queued worker owns this flag until it reaches this critical section,
-	// eliminating duplicate process-wide scavenges before b.scavenging is visible.
-	b.scavengeQueued = false
-	if b.scavenging || b.pendingReclaim == 0 && (!includeGarbageHint || b.garbageHintBytes == 0) {
-		b.access.Unlock()
-		return 0
-	}
-	b.scavenging = true
-	pending := b.pendingReclaim
-	hint := int64(0)
-	if includeGarbageHint {
-		hint = b.garbageHintBytes
-	}
-	b.access.Unlock()
-
-	// FreeOSMemory forces a GC and asks the runtime to return free pages to the
-	// OS. It is intentionally outside b.access: a process-wide runtime operation
-	// must never hold a multipath data-plane mutex.
-	memoryScavengeAccess.Lock()
-	memoryScavenge()
-	memoryScavengeAccess.Unlock()
-
-	b.access.Lock()
-	if pending > b.pendingReclaim {
-		pending = b.pendingReclaim
-	}
-	b.pendingReclaim -= pending
-	b.used -= pending
-	if b.used < 0 {
-		b.used = 0
-	}
-	if includeGarbageHint {
-		if hint > b.garbageHintBytes {
-			hint = b.garbageHintBytes
-		}
-		b.garbageHintBytes -= hint
-	}
-	b.scavenging = false
-	if pending > 0 || hint > 0 {
-		b.trimCount++
-		b.trimmedBytes += uint64(max(int64(0), pending))
-	}
-	b.updatePressureLocked(time.Now())
-	b.signalLocked()
-	b.access.Unlock()
-	return pending
-}
-
 func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
-	if b == nil || size <= 0 {
-		return nil, nil
-	}
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
-	if buffer := b.takeCachedLocked(size); buffer != nil {
-		b.updatePressureLocked(now)
-		b.access.Unlock()
-		return buffer, nil
+	defer b.access.Unlock()
+	if buffers := b.cache[size]; len(buffers) > 0 {
+		buffer := buffers[len(buffers)-1]
+		if len(buffers) == 1 {
+			delete(b.cache, size)
+		} else {
+			b.cache[size] = buffers[:len(buffers)-1]
+		}
+		b.cached -= int64(size)
+		return buffer[:size], nil
+	}
+	if b.used+int64(size) > b.limit && b.cached > 0 {
+		b.dropCacheLocked()
 	}
 	if b.used+int64(size) <= b.limit {
 		b.used += int64(size)
-		b.freshAllocations++
-		b.updatePressureLocked(now)
-		b.access.Unlock()
+		b.updatePressureLocked(time.Now())
 		return make([]byte, size), nil
 	}
-
-	// Data-plane allocation must not run a process-wide forced GC inline. This
-	// function is also used by recovery assembly while its own mutex is held.
-	// Detach incompatible cached slabs, queue one background reclaim cycle, and
-	// return the existing change notification so blocking callers sleep instead
-	// of spinning. Best-effort callers may drop this attempt and rely on protocol
-	// retransmission/recovery.
-	if !b.scavenging {
-		b.detachCachedBytesLocked(b.used + int64(size) - b.limit)
-	}
-	if b.pendingReclaim > 0 {
-		b.queueScavengeLocked()
-	}
-	b.waitCount++
-	b.enterPressureLocked(now)
-	changed := b.changed
-	b.access.Unlock()
-	return nil, changed
+	return nil, b.changed
 }
 
 // The caller has already charged a reusable session scratch/TX reservation.
 func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
 	if buffers := b.cache[size]; len(buffers) > 0 {
 		buffer := buffers[len(buffers)-1]
-		buffers[len(buffers)-1] = nil
 		if len(buffers) == 1 {
 			delete(b.cache, size)
 		} else {
@@ -363,36 +152,25 @@ func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 		}
 		b.cached -= int64(size)
 		b.used -= int64(size)
-		b.reusedAllocations++
-		b.updatePressureLocked(now)
+		b.updatePressureLocked(time.Now())
 		b.access.Unlock()
 		return buffer[:size]
 	}
-	b.freshAllocations++
 	b.access.Unlock()
 	return make([]byte, size)
 }
 
-// Returning a reserved buffer transfers it from the session reservation into
-// the reusable physical cache when there is budget room. If not, it is left to
-// the runtime; this path is bounded by the fixed per-session reservation and is
-// not the high-volume DATA allocator.
+// Returning a reserved buffer does not release its session reservation. Cache
+// storage is charged separately until reused or dropped.
 func (b *memoryBudget) putReservedBuffer(buffer []byte) {
-	if b == nil || cap(buffer) == 0 {
-		return
-	}
 	size := cap(buffer)
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
-	if b.used+int64(size) <= b.limit {
+	if !b.pressure && b.cached+int64(size) <= b.cacheLimit && b.used+int64(size) <= b.limit {
 		b.cache[size] = append(b.cache[size], buffer[:size])
 		b.cached += int64(size)
 		b.used += int64(size)
-	} else if b.garbageHintBytes < b.limit {
-		b.garbageHintBytes = min(b.limit, b.garbageHintBytes+int64(size))
 	}
-	b.updatePressureLocked(now)
+	b.updatePressureLocked(time.Now())
 	b.signalLocked()
 	b.access.Unlock()
 }
@@ -401,76 +179,17 @@ func (b *memoryBudget) reserveSession(bytes int64) bool {
 	if b == nil || bytes <= 0 {
 		return true
 	}
-	for {
-		b.access.Lock()
-		now := time.Now()
-		b.noteActivityLocked(now)
-		if b.used+bytes <= b.limit {
-			b.used += bytes
-			b.updatePressureLocked(now)
-			b.access.Unlock()
-			return true
-		}
-		if b.scavenging {
-			changed := b.changed
-			b.access.Unlock()
-			<-changed
-			continue
-		}
-		detached := b.detachCachedBytesLocked(b.used + bytes - b.limit)
-		pending := b.pendingReclaim
-		b.access.Unlock()
-		if detached == 0 && pending == 0 {
-			return false
-		}
-		b.scavengePending(false)
-	}
-}
-
-// releasePage retires receive-page physical credit without immediately making
-// it spendable again. The Receiver has dropped its last structural reference before
-// this returns to the caller, but the Go heap backing object can remain resident until
-// a later GC. Keep the credit charged in pendingReclaim until scavenge completes.
-func (b *memoryBudget) releasePage(bytes int64) {
-	if b == nil || bytes <= 0 {
-		return
-	}
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
-	b.pendingReclaim += bytes
-	b.updatePressureLocked(now)
-	b.signalLocked()
-	b.access.Unlock()
-}
-
-// reclaimPendingAfterLastSession closes the accounting gap between a core's
-// structural shutdown and physical page reclamation. releasePage keeps retired
-// receive pages charged in pendingReclaim until a process-wide GC/scavenge has
-// completed. When the final session using this shared budget has exited, there
-// is no live protocol work left that can legitimately own those pending pages.
-// Wait for any already-queued reclaim, or run one synchronously, before the
-// core publishes its released signal. Reusable DATA cache is intentionally left
-// alone here; ordinary idle maintenance still trims it after memoryIdleTrimDelay.
-func (b *memoryBudget) reclaimPendingAfterLastSession() {
-	if b == nil || b.sessions.Load() != 0 {
-		return
+	defer b.access.Unlock()
+	if b.used+bytes > b.limit {
+		b.dropCacheLocked()
 	}
-	for {
-		b.access.Lock()
-		if b.sessions.Load() != 0 || b.pendingReclaim == 0 {
-			b.access.Unlock()
-			return
-		}
-		if b.scavenging || b.scavengeQueued {
-			changed := b.changed
-			b.access.Unlock()
-			<-changed
-			continue
-		}
-		b.access.Unlock()
-		b.scavengePending(false)
+	if b.used+bytes > b.limit {
+		return false
 	}
+	b.used += bytes
+	b.updatePressureLocked(time.Now())
+	return true
 }
 
 func (b *memoryBudget) releaseSession(bytes int64) {
@@ -478,19 +197,11 @@ func (b *memoryBudget) releaseSession(bytes int64) {
 		return
 	}
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
 	b.used -= bytes
 	if b.used < 0 {
 		b.used = 0
 	}
-	// Session/page/metadata releases can make heap objects unreachable without
-	// passing through the DATA slab cache. Record a bounded hint so the next idle
-	// maintenance cycle does not wait for the runtime's long forced-GC interval.
-	if b.garbageHintBytes < b.limit {
-		b.garbageHintBytes = min(b.limit, b.garbageHintBytes+bytes)
-	}
-	b.updatePressureLocked(now)
+	b.updatePressureLocked(time.Now())
 	b.signalLocked()
 	b.access.Unlock()
 }
@@ -501,15 +212,17 @@ func (b *memoryBudget) release(buffer []byte) {
 	}
 	size := cap(buffer)
 	b.access.Lock()
-	now := time.Now()
-	b.noteActivityLocked(now)
-	// DATA slabs always remain physically charged while reusable. The previous
-	// implementation dropped this charge under pressure/cache overflow even
-	// though the Go backing array was still resident until a later GC, allowing
-	// repeated fresh allocations to multiply RSS far beyond memory_limit.
-	b.cache[size] = append(b.cache[size], buffer[:size])
-	b.cached += int64(size)
-	b.updatePressureLocked(now)
+	b.updatePressureLocked(time.Now())
+	if !b.pressure && b.cached+int64(size) <= b.cacheLimit {
+		b.cache[size] = append(b.cache[size], buffer[:size])
+		b.cached += int64(size)
+	} else {
+		b.used -= int64(size)
+		if b.used < 0 {
+			b.used = 0
+		}
+	}
+	b.updatePressureLocked(time.Now())
 	b.signalLocked()
 	b.access.Unlock()
 }
@@ -520,7 +233,7 @@ func (b *memoryBudget) boosterAllowed() bool {
 	}
 	b.access.Lock()
 	b.updatePressureLocked(time.Now())
-	allowed := !b.pressure && b.activeBytesLocked() < b.boosterLimit
+	allowed := !b.pressure && b.used < b.boosterLimit
 	b.access.Unlock()
 	return allowed
 }
@@ -531,17 +244,10 @@ func (b *memoryBudget) snapshot() memorySnapshot {
 	}
 	b.access.Lock()
 	b.updatePressureLocked(time.Now())
-	snapshot := b.snapshotLocked()
-	b.access.Unlock()
-	return snapshot
-}
-
-func (b *memoryBudget) snapshotLocked() memorySnapshot {
-	return memorySnapshot{
+	snapshot := memorySnapshot{
 		LimitBytes:         b.limit,
 		UsedBytes:          b.used,
 		CachedBytes:        b.cached,
-		ActiveBytes:        b.activeBytesLocked(),
 		BoosterLimitBytes:  b.boosterLimit,
 		BoosterResumeBytes: b.boosterResume,
 		Automatic:          b.automatic,
@@ -551,18 +257,15 @@ func (b *memoryBudget) snapshotLocked() memorySnapshot {
 		BackpressureEvents: b.waitCount,
 		PeakUsedBytes:      b.peakUsed,
 		PeakCachedBytes:    b.peakCached,
-		FreshAllocations:   b.freshAllocations,
-		ReusedAllocations:  b.reusedAllocations,
-		TrimEvents:         b.trimCount,
-		TrimmedBytes:       b.trimmedBytes,
 	}
+	b.access.Unlock()
+	return snapshot
 }
 
 func (b *memoryBudget) updatePressureLocked(now time.Time) {
 	b.updatePeaksLocked()
-	active := b.activeBytesLocked()
 	if b.pressure {
-		if active <= b.boosterResume {
+		if b.used <= b.boosterResume {
 			duration := now.Sub(b.pressureSince)
 			b.pressure = false
 			b.pressureSince = time.Time{}
@@ -571,7 +274,7 @@ func (b *memoryBudget) updatePressureLocked(now time.Time) {
 		}
 		return
 	}
-	if active >= b.boosterLimit {
+	if b.used >= b.boosterLimit {
 		b.enterPressureLocked(now)
 	}
 }
@@ -600,48 +303,25 @@ func (b *memoryBudget) emitEventLocked(entered bool, duration time.Duration) {
 	event := memoryPressureEvent{
 		entered:  entered,
 		duration: duration,
-		snapshot: b.snapshotLocked(),
+		snapshot: memorySnapshot{
+			LimitBytes:         b.limit,
+			UsedBytes:          b.used,
+			CachedBytes:        b.cached,
+			BoosterLimitBytes:  b.boosterLimit,
+			BoosterResumeBytes: b.boosterResume,
+			Automatic:          b.automatic,
+			Pressure:           b.pressure,
+			PressureSince:      b.pressureSince,
+			PressureEvents:     b.pressureCount,
+			BackpressureEvents: b.waitCount,
+			PeakUsedBytes:      b.peakUsed,
+			PeakCachedBytes:    b.peakCached,
+		},
 	}
 	select {
 	case b.events <- event:
 	default:
 	}
-}
-
-// trimIdle drops excess reusable DATA slabs after the node has been quiet long
-// enough to distinguish end-of-burst from ordinary ACK turnover. When no
-// multipath session remains, the target is zero. Detached slab credit is not
-// returned until the subsequent process-wide scavenge completes. The scavenge
-// also covers non-slab garbage hints (receive pages, session metadata, stacks).
-func (b *memoryBudget) trimIdle(now time.Time) int64 {
-	if b == nil {
-		return 0
-	}
-	b.access.Lock()
-	if now.Sub(b.lastActivity) < memoryIdleTrimDelay || b.scavenging {
-		b.access.Unlock()
-		return 0
-	}
-	target := b.cacheLimit
-	if b.sessions.Load() == 0 {
-		target = 0
-	}
-	detached := int64(0)
-	if b.cached > target {
-		detached = b.detachCachedBytesLocked(b.cached - target)
-	}
-	// Scavenge when physical slabs were detached, when a closed instance/session
-	// left any garbage hint, or when a live instance accumulated a meaningful
-	// amount of non-slab garbage. This makes single-thread and multi-thread idle
-	// release use the same bounded path.
-	threshold := max(int64(1<<20), b.cacheLimit/2)
-	includeHint := b.garbageHintBytes >= threshold || b.sessions.Load() == 0 && b.garbageHintBytes > 0
-	pending := b.pendingReclaim
-	b.access.Unlock()
-	if pending > 0 || includeHint {
-		b.scavengePending(includeHint)
-	}
-	return detached
 }
 
 func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogger, side string) {
@@ -661,26 +341,19 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 			" source=", source,
 			" high=", byteformats.FormatMemoryBytes(uint64(snapshot.BoosterLimitBytes)),
 			" resume=", byteformats.FormatMemoryBytes(uint64(snapshot.BoosterResumeBytes)),
-			" idle_cache_limit=", byteformats.FormatMemoryBytes(uint64(b.cacheLimit)),
-			" idle_trim=", memoryIdleTrimDelay,
+			" cache_limit=", byteformats.FormatMemoryBytes(uint64(b.cacheLimit)),
 		)
 		go func() {
-			ticker := time.NewTicker(memoryMaintenanceInterval)
-			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case now := <-ticker.C:
-					b.trimIdle(now)
 				case event := <-b.events:
-					active := event.snapshot.ActiveBytes
 					if event.entered {
 						logger.InfoContext(
 							ctx,
 							"multipath memory pressure entered: side=", side,
-							" active=", byteformats.FormatMemoryBytes(uint64(max(int64(0), active))),
-							" committed=", byteformats.FormatMemoryBytes(uint64(max(int64(0), event.snapshot.UsedBytes))),
+							" used=", byteformats.FormatMemoryBytes(uint64(event.snapshot.UsedBytes)),
 							" high=", byteformats.FormatMemoryBytes(uint64(event.snapshot.BoosterLimitBytes)),
 							" limit=", byteformats.FormatMemoryBytes(uint64(event.snapshot.LimitBytes)),
 						)
@@ -688,8 +361,7 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 						logger.InfoContext(
 							ctx,
 							"multipath memory pressure cleared: side=", side,
-							" active=", byteformats.FormatMemoryBytes(uint64(max(int64(0), active))),
-							" committed=", byteformats.FormatMemoryBytes(uint64(max(int64(0), event.snapshot.UsedBytes))),
+							" used=", byteformats.FormatMemoryBytes(uint64(event.snapshot.UsedBytes)),
 							" resume=", byteformats.FormatMemoryBytes(uint64(event.snapshot.BoosterResumeBytes)),
 							" duration=", event.duration.Round(time.Millisecond),
 						)
@@ -698,6 +370,15 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 			}
 		}()
 	})
+}
+
+func (b *memoryBudget) dropCacheLocked() {
+	if b.cached == 0 {
+		return
+	}
+	b.used -= b.cached
+	b.cached = 0
+	b.cache = make(map[int][][]byte)
 }
 
 func (b *memoryBudget) signalLocked() {

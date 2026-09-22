@@ -202,8 +202,6 @@ type preferredCapacityPathRange struct {
 	end  uint64
 }
 
-const retainedPreferredCapacityRangeCapacity = 1024
-
 func (c *preferredCapacityController) enableAudit() {
 	if c == nil {
 		return
@@ -722,16 +720,6 @@ func (l *mpLeg) recordPreferredCapacityRange(start uint64, length int) {
 		return
 	}
 	end := start + uint64(length)
-	// Normal first transmissions on one path are normally contiguous. Merge
-	// adjacent ranges so high-throughput traffic does not allocate one metadata
-	// record per DATA mapping. Repair/reinjection ranges never enter this list.
-	if n := len(l.preferredCapacityRanges); n > l.preferredCapacityRangeHead {
-		last := &l.preferredCapacityRanges[n-1]
-		if last.end == start {
-			last.end = end
-			return
-		}
-	}
 	l.preferredCapacityRanges = append(l.preferredCapacityRanges, preferredCapacityPathRange{next: start, end: end})
 }
 
@@ -761,11 +749,7 @@ func (l *mpLeg) confirmPreferredCapacityDelivery(received uint64) uint64 {
 		l.preferredCapacityRangeHead++
 	}
 	if l.preferredCapacityRangeHead == len(l.preferredCapacityRanges) {
-		if cap(l.preferredCapacityRanges) > retainedPreferredCapacityRangeCapacity {
-			l.preferredCapacityRanges = nil
-		} else {
-			l.preferredCapacityRanges = l.preferredCapacityRanges[:0]
-		}
+		l.preferredCapacityRanges = l.preferredCapacityRanges[:0]
 		l.preferredCapacityRangeHead = 0
 	} else if l.preferredCapacityRangeHead >= 256 && l.preferredCapacityRangeHead*2 >= len(l.preferredCapacityRanges) {
 		n := copy(l.preferredCapacityRanges, l.preferredCapacityRanges[l.preferredCapacityRangeHead:])

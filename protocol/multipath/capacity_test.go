@@ -536,22 +536,3 @@ func TestPreferredCapacityBelowTargetDegradationAndRecoveryRemainDeliveryDriven(
 		t.Fatalf("below-target recovery did not raise delivery-proven protection: got=%d want=%d", got, 65_000_000/8)
 	}
 }
-
-func TestPreferredCapacityAdjacentDeliveryRangesCoalesce(t *testing.T) {
-	leg := &mpLeg{}
-	leg.recordPreferredCapacityRange(0, 64<<10)
-	leg.recordPreferredCapacityRange(64<<10, 64<<10)
-	leg.recordPreferredCapacityRange(128<<10, 64<<10)
-	if len(leg.preferredCapacityRanges) != 1 {
-		t.Fatalf("adjacent preferred ranges not coalesced: len=%d", len(leg.preferredCapacityRanges))
-	}
-	if got := leg.confirmPreferredCapacityDelivery(96 << 10); got != 96<<10 {
-		t.Fatalf("partial coalesced delivery=%d, want %d", got, 96<<10)
-	}
-	if got := leg.confirmPreferredCapacityDelivery(192 << 10); got != 96<<10 {
-		t.Fatalf("remaining coalesced delivery=%d, want %d", got, 96<<10)
-	}
-	if len(leg.preferredCapacityRanges) != 0 || leg.preferredCapacityRangeHead != 0 {
-		t.Fatalf("coalesced range bookkeeping not drained: len=%d head=%d", len(leg.preferredCapacityRanges), leg.preferredCapacityRangeHead)
-	}
-}

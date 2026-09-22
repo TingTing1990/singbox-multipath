@@ -102,7 +102,7 @@ func (c *mpCore) Release(head bool) {
 			return
 		}
 	}
-	c.memory.releasePage(stream.PageCharge)
+	c.memory.releaseSession(stream.PageCharge)
 }
 
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
@@ -127,9 +127,7 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	default:
 	}
 	c.memory.releaseSession(c.sessionBytes)
-	if c.memory.sessions.Add(-1) == 0 {
-		c.memory.reclaimPendingAfterLastSession()
-	}
+	c.memory.sessions.Add(-1)
 	close(c.released)
 }
 

@@ -8,8 +8,6 @@ import (
 	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
-const retainedMappingCapacity = 1024
-
 // pumpLoop is the only assignment owner. Transport workers may block, but they
 // never hold stateMu and cannot block feedback, application reads or reinjection.
 func (c *mpCore) pumpLoop() {
@@ -168,11 +166,7 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 		c.mappings[c.mappingHead].seq = max(c.mappings[c.mappingHead].seq, c.tx.Una)
 	}
 	if c.mappingHead == len(c.mappings) {
-		if cap(c.mappings) > retainedMappingCapacity {
-			c.mappings = nil
-		} else {
-			c.mappings = c.mappings[:0]
-		}
+		c.mappings = c.mappings[:0]
 		c.mappingHead = 0
 	} else if c.mappingHead >= 1024 && c.mappingHead*2 >= len(c.mappings) {
 		n := copy(c.mappings, c.mappings[c.mappingHead:])
