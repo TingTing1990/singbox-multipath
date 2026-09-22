@@ -258,7 +258,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test -run '^$' -count=1 -timeout=20m -tags "$BUILD_TAGS" ./...
+          go test \
+            -run '^$' \
+            -count=1 \
+            -timeout=20m \
+            -tags "$BUILD_TAGS" \
+            -ldflags "$LDFLAGS_SHARED" \
+            ./...
 
       - name: Mieru inbound and registry tests with race detector x10
         shell: bash
