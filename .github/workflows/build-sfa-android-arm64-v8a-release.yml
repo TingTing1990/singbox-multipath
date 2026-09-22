@@ -8,6 +8,14 @@ on:
         required: true
         default: feature/multipath-capacity-v2-beta6
         type: string
+      signing_mode:
+        description: "Release signing mode (first run generate; later reuse with both repository secrets)"
+        required: true
+        default: generate
+        type: choice
+        options:
+          - generate
+          - reuse
 
 permissions:
   contents: read
@@ -90,7 +98,7 @@ jobs:
           grep -F 'applicationId = "io.nekohasekai.sfa"' sing-box-for-android/app/build.gradle.kts
           grep -F 'ndkVersion = "28.0.13004108"' sing-box-for-android/app/build.gradle.kts
           grep -F 'create("other") {' sing-box-for-android/app/build.gradle.kts
-          grep -F 'minSdk = 23' sing-box-for-android/app/build.gradle.kts
+          grep -A2 -F 'create("other") {' sing-box-for-android/app/build.gradle.kts | grep -F 'minSdk = 24'
           grep -F 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' sing-box-for-android/app/build.gradle.kts
           grep -F '<string name="app_name" translatable="false">sing-box</string>' sing-box-for-android/app/src/main/res/values/strings.xml
           grep -F 'android:authorities="${applicationId}.cache"' sing-box-for-android/app/src/main/AndroidManifest.xml
@@ -98,7 +106,7 @@ jobs:
           git -C sing-box-for-android submodule update --init --recursive -v
 
       - name: Setup exact Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: false
@@ -118,9 +126,10 @@ jobs:
           java-version: 17
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        uses: gradle/actions/setup-gradle@v6
         with:
-          cache-provider: basic
+          cache-disabled: true
+          add-job-summary: 'on-failure'
 
       - name: Verify exact Android build toolchain
         shell: bash
@@ -170,6 +179,12 @@ jobs:
               if text.count(old) != 1:
                   raise SystemExit(f'unexpected source state for {old!r}: count={text.count(old)}')
               text = text.replace(old, new, 1)
+
+          old_other = 'create("other") {\n            minSdk = 23\n        }'
+          new_other = 'create("other") {\n            minSdk = 24\n        }'
+          if text.count(old_other) != 1:
+              raise SystemExit(f'unexpected other flavor minSdk source state: count={text.count(old_other)}')
+          text = text.replace(old_other, new_other, 1)
           gradle.write_text(text, encoding='utf-8')
 
           strings = Path('sing-box-for-android/app/src/main/res/values/strings.xml')
@@ -222,106 +237,156 @@ jobs:
           test "${abis[0]}" = "$TARGET_ABI"
           sha256sum sing-box/libbox.aar | tee "$RUNNER_TEMP/libbox.aar.sha256"
 
-      - name: Prepare persistent release signing
+      - name: Prepare and independently verify release signing
         id: signing
         shell: bash
         env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
           EXISTING_KEYSTORE_B64: ${{ secrets.SFA_KEYSTORE_B64 }}
           EXISTING_LOCAL_PROPERTIES_B64: ${{ secrets.SFA_LOCAL_PROPERTIES_B64 }}
         run: |
-          set -euo pipefail
-          KEYSTORE='sing-box-for-android/app/release.keystore'
+          set -Eeuo pipefail
+          trap 'rc=$?; echo "SIGNING_GATE_FAIL line=${LINENO} command=${BASH_COMMAND@Q} rc=${rc}" >&2; exit "$rc"' ERR
+
+          command -v keytool >/dev/null
+          command -v openssl >/dev/null
+          command -v base64 >/dev/null
+
+          KEYSTORE="$GITHUB_WORKSPACE/sing-box-for-android/app/release.keystore"
           PROPS="$RUNNER_TEMP/sfa-signing.properties"
           BACKUP="$RUNNER_TEMP/sfa-signing-backup"
+          rm -rf "$BACKUP" "$KEYSTORE" "$PROPS"
           mkdir -p "$BACKUP"
 
-          if [[ -n "$EXISTING_KEYSTORE_B64" || -n "$EXISTING_LOCAL_PROPERTIES_B64" ]]; then
-            test -n "$EXISTING_KEYSTORE_B64" || { echo 'SFA_KEYSTORE_B64 is missing while signing properties secret exists' >&2; exit 1; }
-            test -n "$EXISTING_LOCAL_PROPERTIES_B64" || { echo 'SFA_LOCAL_PROPERTIES_B64 is missing while keystore secret exists' >&2; exit 1; }
-            printf '%s' "$EXISTING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
-            printf '%s' "$EXISTING_LOCAL_PROPERTIES_B64" | base64 --decode > "$PROPS"
-            echo 'generated=false' >> "$GITHUB_OUTPUT"
-            echo 'Signing mode: existing repository secrets'
-          else
-            STORE_PASS="$(openssl rand -hex 32)"
-            ALIAS_NAME='sfa-release'
-            echo "::add-mask::$STORE_PASS"
+          case "$SIGNING_MODE" in
+            generate)
+              echo 'Signing mode: GENERATE_NEW_KEY (no repository signing secrets are required)'
+              STORE_PASS="$(openssl rand -hex 32)"
+              ALIAS_NAME='sfa-release'
+              echo "::add-mask::$STORE_PASS"
 
-            keytool -genkeypair \
-              -keystore "$KEYSTORE" \
-              -storetype JKS \
-              -storepass "$STORE_PASS" \
-              -keypass "$STORE_PASS" \
-              -alias "$ALIAS_NAME" \
-              -keyalg RSA \
-              -keysize 4096 \
-              -validity 36500 \
-              -dname 'CN=SFA Custom Release, OU=Personal, O=Personal, L=Local, ST=Local, C=US' \
-              -noprompt >/dev/null
+              keytool -genkeypair \
+                -keystore "$KEYSTORE" \
+                -storetype JKS \
+                -storepass "$STORE_PASS" \
+                -keypass "$STORE_PASS" \
+                -alias "$ALIAS_NAME" \
+                -keyalg RSA \
+                -keysize 4096 \
+                -validity 36500 \
+                -dname 'CN=SFA Custom Release, OU=Personal, O=Personal, L=Local, ST=Local, C=US' \
+                -noprompt >/dev/null
 
-            cat > "$PROPS" <<EOF
-          KEYSTORE_PASS=$STORE_PASS
-          ALIAS_NAME=$ALIAS_NAME
-          ALIAS_PASS=$STORE_PASS
+              {
+                printf 'KEYSTORE_PASS=%s\n' "$STORE_PASS"
+                printf 'ALIAS_NAME=%s\n' "$ALIAS_NAME"
+                printf 'ALIAS_PASS=%s\n' "$STORE_PASS"
+              } > "$PROPS"
+
+              cp "$KEYSTORE" "$BACKUP/release.keystore"
+              cp "$PROPS" "$BACKUP/local.properties"
+              cat > "$BACKUP/README.txt" <<'EOF'
+          PRIVATE RELEASE SIGNING MATERIAL — KEEP PRIVATE.
+          
+          This key signs package custom.singbox.sfa.
+          Future APKs can update the installed app only when signed by this same key.
+          
+          After downloading this backup, store it privately. For future GitHub builds:
+            SFA_KEYSTORE_B64 = base64 of release.keystore
+            SFA_LOCAL_PROPERTIES_B64 = base64 of local.properties
+          Then run the workflow with signing_mode=reuse.
           EOF
+              chmod 600 "$BACKUP/release.keystore" "$BACKUP/local.properties"
+              echo 'generated=true' >> "$GITHUB_OUTPUT"
+              ;;
 
-            cp "$KEYSTORE" "$BACKUP/release.keystore"
-            cp "$PROPS" "$BACKUP/local.properties"
-            cat > "$BACKUP/README.txt" <<'EOF'
-          PRIVATE SIGNING BACKUP — KEEP THIS FILE SET PRIVATE.
+            reuse)
+              echo 'Signing mode: REUSE_EXISTING_KEY'
+              if [[ -z "$EXISTING_KEYSTORE_B64" || -z "$EXISTING_LOCAL_PROPERTIES_B64" ]]; then
+                echo 'ERROR: signing_mode=reuse requires BOTH SFA_KEYSTORE_B64 and SFA_LOCAL_PROPERTIES_B64 repository secrets.' >&2
+                exit 21
+              fi
+              printf '%s' "$EXISTING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE" || { echo 'ERROR: SFA_KEYSTORE_B64 is not valid base64.' >&2; exit 22; }
+              printf '%s' "$EXISTING_LOCAL_PROPERTIES_B64" | base64 --decode > "$PROPS" || { echo 'ERROR: SFA_LOCAL_PROPERTIES_B64 is not valid base64.' >&2; exit 23; }
+              echo 'generated=false' >> "$GITHUB_OUTPUT"
+              ;;
 
-          This keystore signs custom.singbox.sfa.
-          Losing it means future APKs cannot update the currently installed app.
+            *)
+              echo "ERROR: invalid signing_mode=$SIGNING_MODE" >&2
+              exit 20
+              ;;
+          esac
 
-          For future GitHub Actions runs, create these repository secrets:
-          1. SFA_KEYSTORE_B64 = base64 of release.keystore
-          2. SFA_LOCAL_PROPERTIES_B64 = base64 of local.properties
+          test -s "$KEYSTORE" || { echo 'ERROR: release.keystore was not created/restored.' >&2; exit 24; }
+          test -s "$PROPS" || { echo 'ERROR: signing properties were not created/restored.' >&2; exit 25; }
 
-          Linux/macOS:
-            base64 -w0 release.keystore
-            base64 -w0 local.properties
-          EOF
-            chmod 600 "$BACKUP/release.keystore" "$BACKUP/local.properties"
-            echo 'generated=true' >> "$GITHUB_OUTPUT"
-            echo 'Signing mode: generated new persistent release key for first run'
-          fi
+          eval "$(python3 - "$PROPS" <<'PY'
+          import shlex, sys
+          from pathlib import Path
+          values = {}
+          for raw in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+              if not raw or raw.lstrip().startswith('#') or '=' not in raw:
+                  continue
+              k, v = raw.split('=', 1)
+              values[k.strip()] = v.strip()
+          for key in ('KEYSTORE_PASS', 'ALIAS_NAME', 'ALIAS_PASS'):
+              if not values.get(key):
+                  raise SystemExit(f'ERROR: missing {key} in signing properties')
+          print('KS_PASS=' + shlex.quote(values['KEYSTORE_PASS']))
+          print('KS_ALIAS=' + shlex.quote(values['ALIAS_NAME']))
+          print('KS_KEY_PASS=' + shlex.quote(values['ALIAS_PASS']))
+          PY
+          )"
+          echo "::add-mask::$KS_PASS"
+          echo "::add-mask::$KS_KEY_PASS"
 
-          test -s "$KEYSTORE"
-          grep -Eq '^KEYSTORE_PASS=.+' "$PROPS"
-          grep -Eq '^ALIAS_NAME=.+' "$PROPS"
-          grep -Eq '^ALIAS_PASS=.+' "$PROPS"
+          keytool -list \
+            -keystore "$KEYSTORE" \
+            -storepass "$KS_PASS" \
+            -alias "$KS_ALIAS" >/dev/null || { echo 'ERROR: keystore/store password/alias validation failed.' >&2; exit 26; }
+
+          KEY_TMP="$RUNNER_TEMP/sfa-signing-key-check.p12"
+          rm -f "$KEY_TMP"
+          keytool -importkeystore \
+            -srckeystore "$KEYSTORE" \
+            -srcstorepass "$KS_PASS" \
+            -srcalias "$KS_ALIAS" \
+            -srckeypass "$KS_KEY_PASS" \
+            -destkeystore "$KEY_TMP" \
+            -deststoretype PKCS12 \
+            -deststorepass "$KS_PASS" \
+            -destkeypass "$KS_PASS" \
+            -noprompt >/dev/null || { echo 'ERROR: key password validation failed.' >&2; exit 27; }
+          rm -f "$KEY_TMP"
 
           PROPS_B64="$(base64 -w0 < "$PROPS")"
           echo "::add-mask::$PROPS_B64"
           echo "LOCAL_PROPERTIES=$PROPS_B64" >> "$GITHUB_ENV"
 
-          # Validate keystore using values from the properties without printing secrets.
-          python3 - "$PROPS" > "$RUNNER_TEMP/signing-env" <<'PY'
-          import sys
-          from pathlib import Path
-          values = {}
-          for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
-              if '=' in line:
-                  k, v = line.split('=', 1)
-                  values[k] = v
-          for key in ('KEYSTORE_PASS', 'ALIAS_NAME', 'ALIAS_PASS'):
-              if not values.get(key):
-                  raise SystemExit(f'missing {key}')
-          print(values['KEYSTORE_PASS'])
-          print(values['ALIAS_NAME'])
-          PY
-          mapfile -t signing_values < "$RUNNER_TEMP/signing-env"
-          keytool -list -keystore "$KEYSTORE" -storepass "${signing_values[0]}" -alias "${signing_values[1]}" >/dev/null
-          rm -f "$RUNNER_TEMP/signing-env"
+          CERT_SHA256="$(keytool -list -v -keystore "$KEYSTORE" -storepass "$KS_PASS" -alias "$KS_ALIAS" 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -n1 | tr -d ':')"
+          test -n "$CERT_SHA256" || { echo 'ERROR: unable to read signing certificate SHA256.' >&2; exit 28; }
+          echo "signing_cert_sha256=$CERT_SHA256" >> "$GITHUB_OUTPUT"
+          echo "Release signing gate PASS; certificate_sha256=$CERT_SHA256"
+
+      - name: Validate SFA release signing configuration with Gradle
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cd sing-box-for-android
+          ./gradlew --no-daemon :app:signingReport | tee "$RUNNER_TEMP/signing-report.txt"
+          grep -F 'Variant: otherRelease' "$RUNNER_TEMP/signing-report.txt" >/dev/null
+          grep -F 'Config: release' "$RUNNER_TEMP/signing-report.txt" >/dev/null
 
       - name: Upload first-run release signing backup
         if: steps.signing.outputs.generated == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SFA-RELEASE-SIGNING-KEY-FIRST-RUN-PRIVATE
           path: ${{ runner.temp }}/sfa-signing-backup
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
           compression-level: 0
 
       - name: Build upstream SFA OtherRelease
@@ -331,7 +396,7 @@ jobs:
         run: |
           set -euo pipefail
           cd sing-box-for-android
-          ./gradlew --build-cache --parallel :app:clean :app:assembleOtherRelease
+          ./gradlew --no-daemon --parallel :app:clean :app:assembleOtherRelease
           ./gradlew --stop
 
       - name: Verify package identity, label, ABI, libbox and release signature
@@ -402,7 +467,7 @@ jobs:
           test -z "$(git -C sing-box status --porcelain=v1 --untracked-files=all)"
 
       - name: Upload verified SFA release APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SFA-${{ env.APP_VERSION }}-${{ env.TARGET_ABI }}-release
           path: |
