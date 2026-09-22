@@ -622,3 +622,32 @@ func TestMemoryBudgetQueuedScavengeIsSingleFlightPerBudget(t *testing.T) {
 		t.Fatal("queued scavenge did not finish")
 	}
 }
+
+func TestMemoryBudgetLastSessionReclaimsPendingBeforeRelease(t *testing.T) {
+	const page = int64(32 << 10)
+	budget := newMemoryBudget(4*page, false)
+	budget.sessions.Store(1)
+	if !budget.reservePage(page, true) {
+		t.Fatal("page reservation failed")
+	}
+	budget.releasePage(page)
+	if budget.pendingReclaim != page || budget.snapshot().UsedBytes != page {
+		t.Fatalf("fixture pending page mismatch: snapshot=%+v pending=%d", budget.snapshot(), budget.pendingReclaim)
+	}
+
+	oldScavenge := memoryScavenge
+	var calls atomic.Int32
+	memoryScavenge = func() { calls.Add(1) }
+	t.Cleanup(func() { memoryScavenge = oldScavenge })
+
+	if remaining := budget.sessions.Add(-1); remaining != 0 {
+		t.Fatalf("remaining sessions=%d, want 0", remaining)
+	}
+	budget.reclaimPendingAfterLastSession()
+	if calls.Load() != 1 {
+		t.Fatalf("scavenge calls=%d, want 1", calls.Load())
+	}
+	if snapshot := budget.snapshot(); snapshot.UsedBytes != 0 || snapshot.ActiveBytes != 0 || budget.pendingReclaim != 0 {
+		t.Fatalf("final-session reclaim incomplete: snapshot=%+v pending=%d", snapshot, budget.pendingReclaim)
+	}
+}

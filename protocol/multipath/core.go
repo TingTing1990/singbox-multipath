@@ -127,7 +127,9 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	default:
 	}
 	c.memory.releaseSession(c.sessionBytes)
-	c.memory.sessions.Add(-1)
+	if c.memory.sessions.Add(-1) == 0 {
+		c.memory.reclaimPendingAfterLastSession()
+	}
 	close(c.released)
 }
 

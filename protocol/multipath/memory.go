@@ -444,6 +444,35 @@ func (b *memoryBudget) releasePage(bytes int64) {
 	b.access.Unlock()
 }
 
+// reclaimPendingAfterLastSession closes the accounting gap between a core's
+// structural shutdown and physical page reclamation. releasePage keeps retired
+// receive pages charged in pendingReclaim until a process-wide GC/scavenge has
+// completed. When the final session using this shared budget has exited, there
+// is no live protocol work left that can legitimately own those pending pages.
+// Wait for any already-queued reclaim, or run one synchronously, before the
+// core publishes its released signal. Reusable DATA cache is intentionally left
+// alone here; ordinary idle maintenance still trims it after memoryIdleTrimDelay.
+func (b *memoryBudget) reclaimPendingAfterLastSession() {
+	if b == nil || b.sessions.Load() != 0 {
+		return
+	}
+	for {
+		b.access.Lock()
+		if b.sessions.Load() != 0 || b.pendingReclaim == 0 {
+			b.access.Unlock()
+			return
+		}
+		if b.scavenging || b.scavengeQueued {
+			changed := b.changed
+			b.access.Unlock()
+			<-changed
+			continue
+		}
+		b.access.Unlock()
+		b.scavengePending(false)
+	}
+}
+
 func (b *memoryBudget) releaseSession(bytes int64) {
 	if b == nil || bytes <= 0 {
 		return
