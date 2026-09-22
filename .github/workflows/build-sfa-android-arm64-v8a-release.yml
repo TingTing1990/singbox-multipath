@@ -1,0 +1,414 @@
+name: Build SFA Android arm64-v8a Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: sing-box source branch/tag/commit to build
+        required: true
+        default: feature/multipath-capacity-v2-beta6
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sfa-android-arm64-v8a-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.5'
+  APP_VERSION: '1.14.0-multipath-beta6'
+  PACKAGE_ID: custom.singbox.sfa
+  APP_NAME: SFA
+  TARGET_ABI: arm64-v8a
+  GOMOBILE_TARGET: android/arm64
+
+jobs:
+  build_sfa:
+    name: Build SFA arm64-v8a Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout requested sing-box source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: sing-box
+
+      - name: Resolve and verify exact core / Android client identities
+        id: identity
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REF"
+          CORE_COMMIT="$(git -C sing-box rev-parse HEAD)"
+          ANDROID_COMMIT="$(git -C sing-box ls-tree "$CORE_COMMIT" clients/android | awk '{print $3}')"
+          test -n "$ANDROID_COMMIT"
+          test "$(grep '^go ' sing-box/go.mod)" = "go ${GO_VERSION}"
+          grep -F 'url = https://github.com/SagerNet/sing-box-for-android.git' sing-box/.gitmodules
+
+          # Required custom-core registrations / repaired paths.
+          grep -F 'mieru.RegisterInbound(registry)' sing-box/include/registry.go
+          grep -F 'mieru.RegisterOutbound(registry)' sing-box/include/registry.go
+          grep -F 'multipath.RegisterInbound(registry)' sing-box/include/registry.go
+          grep -F 'multipath.RegisterOutbound(registry)' sing-box/include/registry.go
+          grep -F 'github.com/enfein/mieru/v3 v3.36.1' sing-box/go.mod
+          grep -F 'config.StreamListenerFactory = listenerFactory' sing-box/protocol/mieru/inbound.go
+          grep -F 'config.PacketListenerFactory = listenerFactory' sing-box/protocol/mieru/inbound.go
+          grep -F 'UDP fragment is not supported' sing-box/protocol/mieru/inbound.go
+          grep -F 'strconv.Quote(i.Tag())' sing-box/protocol/multipath/inbound.go
+
+          test -z "$(git -C sing-box status --porcelain=v1 --untracked-files=all)"
+
+          echo "CORE_COMMIT=$CORE_COMMIT" >> "$GITHUB_ENV"
+          echo "ANDROID_COMMIT=$ANDROID_COMMIT" >> "$GITHUB_ENV"
+          echo "core_commit=$CORE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "android_commit=$ANDROID_COMMIT" >> "$GITHUB_OUTPUT"
+          printf 'core_commit=%s\nandroid_commit=%s\n' "$CORE_COMMIT" "$ANDROID_COMMIT"
+
+      - name: Checkout exact upstream SFA client from core gitlink
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: ${{ steps.identity.outputs.android_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: sing-box-for-android
+
+      - name: Verify pristine upstream SFA and checkout nested submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C sing-box-for-android rev-parse HEAD)" = "$ANDROID_COMMIT"
+          grep -F 'namespace = "io.nekohasekai.sfa"' sing-box-for-android/app/build.gradle.kts
+          grep -F 'applicationId = "io.nekohasekai.sfa"' sing-box-for-android/app/build.gradle.kts
+          grep -F 'ndkVersion = "28.0.13004108"' sing-box-for-android/app/build.gradle.kts
+          grep -F 'create("other") {' sing-box-for-android/app/build.gradle.kts
+          grep -F 'minSdk = 23' sing-box-for-android/app/build.gradle.kts
+          grep -F 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' sing-box-for-android/app/build.gradle.kts
+          grep -F '<string name="app_name" translatable="false">sing-box</string>' sing-box-for-android/app/src/main/res/values/strings.xml
+          grep -F 'android:authorities="${applicationId}.cache"' sing-box-for-android/app/src/main/AndroidManifest.xml
+          test -z "$(git -C sing-box-for-android status --porcelain=v1 --untracked-files=all)"
+          git -C sing-box-for-android submodule update --init --recursive -v
+
+      - name: Setup exact Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Setup Android NDK r28
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Setup OpenJDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+
+      - name: Verify exact Android build toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          java --version 2>&1 | tee "$RUNNER_TEMP/java-version.txt"
+          grep -F 'openjdk 17' "$RUNNER_TEMP/java-version.txt"
+          test -d "${{ steps.setup-ndk.outputs.ndk-path }}"
+          test "$(basename "${{ steps.setup-ndk.outputs.ndk-path }}")" = '28.0.13004108' || true
+          grep -F 'ndkVersion = "28.0.13004108"' sing-box-for-android/app/build.gradle.kts
+
+      - name: Set exact custom core version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C sing-box tag -f "v${APP_VERSION}" "$CORE_COMMIT"
+          test "$(git -C sing-box describe --tags --exact-match HEAD)" = "v${APP_VERSION}"
+          test -z "$(git -C sing-box status --porcelain=v1 --untracked-files=all)"
+
+      - name: Update SFA version using upstream sing-box helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd sing-box
+            go run -v ./cmd/internal/update_android_version
+          )
+          grep -Fx "VERSION_NAME=${APP_VERSION}" sing-box-for-android/version.properties
+          grep -Fx "GO_VERSION=go${GO_VERSION}" sing-box-for-android/version.properties
+
+      - name: Apply minimal SFA packaging customization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          gradle = Path('sing-box-for-android/app/build.gradle.kts')
+          text = gradle.read_text(encoding='utf-8')
+          replacements = {
+              'applicationId = "io.nekohasekai.sfa"': 'applicationId = "custom.singbox.sfa"',
+              'isUniversalApk = true': 'isUniversalApk = false',
+              'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")': 'include("arm64-v8a")',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected source state for {old!r}: count={text.count(old)}')
+              text = text.replace(old, new, 1)
+          gradle.write_text(text, encoding='utf-8')
+
+          strings = Path('sing-box-for-android/app/src/main/res/values/strings.xml')
+          text = strings.read_text(encoding='utf-8')
+          old = '<string name="app_name" translatable="false">sing-box</string>'
+          new = '<string name="app_name" translatable="false">SFA</string>'
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected app_name source state: count={text.count(old)}')
+          strings.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+          # Namespace intentionally remains upstream; applicationId is the install identity.
+          grep -F 'namespace = "io.nekohasekai.sfa"' sing-box-for-android/app/build.gradle.kts
+          grep -F 'applicationId = "custom.singbox.sfa"' sing-box-for-android/app/build.gradle.kts
+          grep -F 'isUniversalApk = false' sing-box-for-android/app/build.gradle.kts
+          grep -F 'include("arm64-v8a")' sing-box-for-android/app/build.gradle.kts
+          grep -F 'minSdk = 23' sing-box-for-android/app/build.gradle.kts
+          grep -F '<string name="app_name" translatable="false">SFA</string>' sing-box-for-android/app/src/main/res/values/strings.xml
+
+          mapfile -t changed < <(git -C sing-box-for-android diff --name-only | sort)
+          expected=(
+            'app/build.gradle.kts'
+            'app/src/main/res/values/strings.xml'
+            'version.properties'
+          )
+          printf 'SFA tracked changes:\n'; printf '  %s\n' "${changed[@]}"
+          test "${changed[*]}" = "${expected[*]}"
+
+      - name: Build official release libbox AAR for arm64-v8a only
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          mkdir -p sing-box-for-android/app/libs
+          (
+            cd sing-box
+            make lib_install
+            export PATH="$PATH:$(go env GOPATH)/bin"
+            go run ./cmd/internal/build_libbox -target android -platform "$GOMOBILE_TARGET"
+          )
+
+          test -s sing-box/libbox.aar
+          test -s sing-box-for-android/app/libs/libbox.aar
+          cmp sing-box/libbox.aar sing-box-for-android/app/libs/libbox.aar
+          unzip -t sing-box/libbox.aar >/dev/null
+          mapfile -t abis < <(unzip -Z1 sing-box/libbox.aar | awk -F/ '/^(jni|lib)\// && NF >= 3 {print $2}' | sort -u)
+          printf 'libbox ABI(s): %s\n' "${abis[*]:-<none>}"
+          test "${#abis[@]}" -eq 1
+          test "${abis[0]}" = "$TARGET_ABI"
+          sha256sum sing-box/libbox.aar | tee "$RUNNER_TEMP/libbox.aar.sha256"
+
+      - name: Prepare persistent release signing
+        id: signing
+        shell: bash
+        env:
+          EXISTING_KEYSTORE_B64: ${{ secrets.SFA_KEYSTORE_B64 }}
+          EXISTING_LOCAL_PROPERTIES_B64: ${{ secrets.SFA_LOCAL_PROPERTIES_B64 }}
+        run: |
+          set -euo pipefail
+          KEYSTORE='sing-box-for-android/app/release.keystore'
+          PROPS="$RUNNER_TEMP/sfa-signing.properties"
+          BACKUP="$RUNNER_TEMP/sfa-signing-backup"
+          mkdir -p "$BACKUP"
+
+          if [[ -n "$EXISTING_KEYSTORE_B64" || -n "$EXISTING_LOCAL_PROPERTIES_B64" ]]; then
+            test -n "$EXISTING_KEYSTORE_B64" || { echo 'SFA_KEYSTORE_B64 is missing while signing properties secret exists' >&2; exit 1; }
+            test -n "$EXISTING_LOCAL_PROPERTIES_B64" || { echo 'SFA_LOCAL_PROPERTIES_B64 is missing while keystore secret exists' >&2; exit 1; }
+            printf '%s' "$EXISTING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+            printf '%s' "$EXISTING_LOCAL_PROPERTIES_B64" | base64 --decode > "$PROPS"
+            echo 'generated=false' >> "$GITHUB_OUTPUT"
+            echo 'Signing mode: existing repository secrets'
+          else
+            STORE_PASS="$(openssl rand -hex 32)"
+            ALIAS_NAME='sfa-release'
+            echo "::add-mask::$STORE_PASS"
+
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -storetype JKS \
+              -storepass "$STORE_PASS" \
+              -keypass "$STORE_PASS" \
+              -alias "$ALIAS_NAME" \
+              -keyalg RSA \
+              -keysize 4096 \
+              -validity 36500 \
+              -dname 'CN=SFA Custom Release, OU=Personal, O=Personal, L=Local, ST=Local, C=US' \
+              -noprompt >/dev/null
+
+            cat > "$PROPS" <<EOF
+          KEYSTORE_PASS=$STORE_PASS
+          ALIAS_NAME=$ALIAS_NAME
+          ALIAS_PASS=$STORE_PASS
+          EOF
+
+            cp "$KEYSTORE" "$BACKUP/release.keystore"
+            cp "$PROPS" "$BACKUP/local.properties"
+            cat > "$BACKUP/README.txt" <<'EOF'
+          PRIVATE SIGNING BACKUP — KEEP THIS FILE SET PRIVATE.
+
+          This keystore signs custom.singbox.sfa.
+          Losing it means future APKs cannot update the currently installed app.
+
+          For future GitHub Actions runs, create these repository secrets:
+          1. SFA_KEYSTORE_B64 = base64 of release.keystore
+          2. SFA_LOCAL_PROPERTIES_B64 = base64 of local.properties
+
+          Linux/macOS:
+            base64 -w0 release.keystore
+            base64 -w0 local.properties
+          EOF
+            chmod 600 "$BACKUP/release.keystore" "$BACKUP/local.properties"
+            echo 'generated=true' >> "$GITHUB_OUTPUT"
+            echo 'Signing mode: generated new persistent release key for first run'
+          fi
+
+          test -s "$KEYSTORE"
+          grep -Eq '^KEYSTORE_PASS=.+' "$PROPS"
+          grep -Eq '^ALIAS_NAME=.+' "$PROPS"
+          grep -Eq '^ALIAS_PASS=.+' "$PROPS"
+
+          PROPS_B64="$(base64 -w0 < "$PROPS")"
+          echo "::add-mask::$PROPS_B64"
+          echo "LOCAL_PROPERTIES=$PROPS_B64" >> "$GITHUB_ENV"
+
+          # Validate keystore using values from the properties without printing secrets.
+          python3 - "$PROPS" > "$RUNNER_TEMP/signing-env" <<'PY'
+          import sys
+          from pathlib import Path
+          values = {}
+          for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+              if '=' in line:
+                  k, v = line.split('=', 1)
+                  values[k] = v
+          for key in ('KEYSTORE_PASS', 'ALIAS_NAME', 'ALIAS_PASS'):
+              if not values.get(key):
+                  raise SystemExit(f'missing {key}')
+          print(values['KEYSTORE_PASS'])
+          print(values['ALIAS_NAME'])
+          PY
+          mapfile -t signing_values < "$RUNNER_TEMP/signing-env"
+          keytool -list -keystore "$KEYSTORE" -storepass "${signing_values[0]}" -alias "${signing_values[1]}" >/dev/null
+          rm -f "$RUNNER_TEMP/signing-env"
+
+      - name: Upload first-run release signing backup
+        if: steps.signing.outputs.generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFA-RELEASE-SIGNING-KEY-FIRST-RUN-PRIVATE
+          path: ${{ runner.temp }}/sfa-signing-backup
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Build upstream SFA OtherRelease
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cd sing-box-for-android
+          ./gradlew --build-cache --parallel :app:clean :app:assembleOtherRelease
+          ./gradlew --stop
+
+      - name: Verify package identity, label, ABI, libbox and release signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT='sing-box-for-android/app/build/outputs/apk/other/release'
+          find "$OUT" -maxdepth 1 -type f -name '*.apk' -print | sort
+          mapfile -t apks < <(find "$OUT" -maxdepth 1 -type f -name '*arm64-v8a*.apk' -print | sort)
+          if [[ "${#apks[@]}" -ne 1 ]]; then
+            echo "Expected exactly one arm64-v8a APK, found ${#apks[@]}" >&2
+            exit 1
+          fi
+          APK="${apks[0]}"
+
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n1)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+
+          BADGING="$($AAPT dump badging "$APK")"
+          grep -F "package: name='${PACKAGE_ID}'" <<<"$BADGING"
+          grep -F "application-label:'${APP_NAME}'" <<<"$BADGING"
+
+          mapfile -t apk_abis < <(unzip -Z1 "$APK" | awk -F/ '/^lib\// && NF >= 3 {print $2}' | sort -u)
+          printf 'APK ABI(s): %s\n' "${apk_abis[*]:-<none>}"
+          test "${#apk_abis[@]}" -eq 1
+          test "${apk_abis[0]}" = "$TARGET_ABI"
+          unzip -Z1 "$APK" | grep -E "^lib/${TARGET_ABI}/lib(box|gojni)\.so$" >/dev/null
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "$RUNNER_TEMP/apksigner.txt"
+          grep -F 'Verifies' "$RUNNER_TEMP/apksigner.txt" >/dev/null || true
+
+          mkdir -p dist
+          FINAL="dist/SFA-${APP_VERSION}-${TARGET_ABI}.apk"
+          cp "$APK" "$FINAL"
+          sha256sum "$FINAL" | tee "${FINAL}.sha256"
+
+          CERT_SHA256="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n1)"
+          test -n "$CERT_SHA256"
+          {
+            echo "core_commit=${CORE_COMMIT}"
+            echo "android_commit=${ANDROID_COMMIT}"
+            echo "version=${APP_VERSION}"
+            echo "package_id=${PACKAGE_ID}"
+            echo "namespace=io.nekohasekai.sfa"
+            echo "app_name=${APP_NAME}"
+            echo "abi=${TARGET_ABI}"
+            echo "go_version=$(go env GOVERSION)"
+            echo "java_version=$(java --version 2>&1 | head -n1)"
+            echo "libbox_sha256=$(sha256sum sing-box/libbox.aar | awk '{print $1}')"
+            echo "apk_sha256=$(sha256sum "$FINAL" | awk '{print $1}')"
+            echo "signing_cert_sha256=${CERT_SHA256}"
+          } > "${FINAL}.buildinfo.txt"
+          cat "${FINAL}.buildinfo.txt"
+
+      - name: Verify no unintended tracked SFA changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git -C sing-box-for-android diff --name-only | sort)
+          expected=(
+            'app/build.gradle.kts'
+            'app/src/main/res/values/strings.xml'
+            'version.properties'
+          )
+          test "${changed[*]}" = "${expected[*]}"
+          test -z "$(git -C sing-box status --porcelain=v1 --untracked-files=all)"
+
+      - name: Upload verified SFA release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFA-${{ env.APP_VERSION }}-${{ env.TARGET_ABI }}-release
+          path: |
+            dist/SFA-${{ env.APP_VERSION }}-${{ env.TARGET_ABI }}.apk
+            dist/SFA-${{ env.APP_VERSION }}-${{ env.TARGET_ABI }}.apk.sha256
+            dist/SFA-${{ env.APP_VERSION }}-${{ env.TARGET_ABI }}.apk.buildinfo.txt
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
