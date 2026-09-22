@@ -8,14 +8,6 @@ on:
         required: true
         default: feature/multipath-capacity-v2-beta6
         type: string
-      signing_mode:
-        description: Release signing mode
-        required: true
-        default: generate
-        type: choice
-        options:
-          - generate
-          - reuse
 
 permissions:
   contents: read
@@ -242,118 +234,50 @@ jobs:
           grep -F 'include("arm64-v8a")' sing-box-for-android/app/build.gradle.kts
           grep -F '<string name="app_name" translatable="false">SFA</string>' sing-box-for-android/app/src/main/res/values/strings.xml
 
-      - name: Prepare persistent release signing
+      - name: Prepare ephemeral release signing
         id: signing
         shell: bash
-        env:
-          SIGNING_MODE: ${{ inputs.signing_mode }}
-          EXISTING_KEYSTORE_B64: ${{ secrets.SFA_KEYSTORE_B64 }}
-          EXISTING_LOCAL_PROPERTIES_B64: ${{ secrets.SFA_LOCAL_PROPERTIES_B64 }}
         run: |-
           set -euo pipefail
           KEYSTORE="$GITHUB_WORKSPACE/sing-box-for-android/app/release.keystore"
           PROPS="$RUNNER_TEMP/sfa-signing.properties"
-          BACKUP="$RUNNER_TEMP/sfa-signing-backup"
-          rm -rf "$BACKUP" "$KEYSTORE" "$PROPS"
-          mkdir -p "$BACKUP"
+          rm -f "$KEYSTORE" "$PROPS"
 
-          case "$SIGNING_MODE" in
-            generate)
-              STORE_PASS="$(openssl rand -hex 32)"
-              ALIAS_NAME='sfa-release'
-              echo "::add-mask::$STORE_PASS"
-              keytool -genkeypair \
-                -keystore "$KEYSTORE" \
-                -storetype JKS \
-                -storepass "$STORE_PASS" \
-                -keypass "$STORE_PASS" \
-                -alias "$ALIAS_NAME" \
-                -keyalg RSA \
-                -keysize 4096 \
-                -validity 36500 \
-                -dname 'CN=SFA Custom Release, OU=Personal, O=Personal, L=Local, ST=Local, C=US' \
-                -noprompt >/dev/null
-              {
-                printf 'KEYSTORE_PASS=%s\n' "$STORE_PASS"
-                printf 'ALIAS_NAME=%s\n' "$ALIAS_NAME"
-                printf 'ALIAS_PASS=%s\n' "$STORE_PASS"
-              } > "$PROPS"
-              cp "$KEYSTORE" "$BACKUP/release.keystore"
-              cp "$PROPS" "$BACKUP/local.properties"
-              chmod 600 "$BACKUP/release.keystore" "$BACKUP/local.properties"
-              echo 'generated=true' >> "$GITHUB_OUTPUT"
-              ;;
-            reuse)
-              test -n "$EXISTING_KEYSTORE_B64"
-              test -n "$EXISTING_LOCAL_PROPERTIES_B64"
-              printf '%s' "$EXISTING_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
-              printf '%s' "$EXISTING_LOCAL_PROPERTIES_B64" | base64 --decode > "$PROPS"
-              echo 'generated=false' >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "invalid signing_mode=$SIGNING_MODE" >&2
-              exit 1
-              ;;
-          esac
+          STORE_PASS="$(openssl rand -hex 32)"
+          ALIAS_NAME='sfa-release'
+          echo "::add-mask::$STORE_PASS"
 
-          test -s "$KEYSTORE"
-          test -s "$PROPS"
-          eval "$(python3 - "$PROPS" <<'PY'
-          import shlex, sys
-          from pathlib import Path
-          values = {}
-          for raw in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
-              if '=' not in raw or raw.lstrip().startswith('#'):
-                  continue
-              key, value = raw.split('=', 1)
-              values[key.strip()] = value.strip()
-          for key in ('KEYSTORE_PASS', 'ALIAS_NAME', 'ALIAS_PASS'):
-              if not values.get(key):
-                  raise SystemExit(f'missing {key}')
-          print('KS_PASS=' + shlex.quote(values['KEYSTORE_PASS']))
-          print('KS_ALIAS=' + shlex.quote(values['ALIAS_NAME']))
-          print('KS_KEY_PASS=' + shlex.quote(values['ALIAS_PASS']))
-          PY
-          )"
-          echo "::add-mask::$KS_PASS"
-          echo "::add-mask::$KS_KEY_PASS"
+          keytool -genkeypair \
+            -keystore "$KEYSTORE" \
+            -storetype JKS \
+            -storepass "$STORE_PASS" \
+            -keypass "$STORE_PASS" \
+            -alias "$ALIAS_NAME" \
+            -keyalg RSA \
+            -keysize 4096 \
+            -validity 36500 \
+            -dname 'CN=SFA Custom Release, OU=Personal, O=Personal, L=Local, ST=Local, C=US' \
+            -noprompt >/dev/null
+
+          {
+            printf 'KEYSTORE_PASS=%s\n' "$STORE_PASS"
+            printf 'ALIAS_NAME=%s\n' "$ALIAS_NAME"
+            printf 'ALIAS_PASS=%s\n' "$STORE_PASS"
+          } > "$PROPS"
 
           keytool -list \
             -keystore "$KEYSTORE" \
-            -storepass "$KS_PASS" \
-            -alias "$KS_ALIAS" >/dev/null
-
-          KEYCHECK="$RUNNER_TEMP/sfa-signing-key-check.p12"
-          rm -f "$KEYCHECK"
-          keytool -importkeystore \
-            -srckeystore "$KEYSTORE" \
-            -srcstorepass "$KS_PASS" \
-            -srcalias "$KS_ALIAS" \
-            -srckeypass "$KS_KEY_PASS" \
-            -destkeystore "$KEYCHECK" \
-            -deststoretype PKCS12 \
-            -deststorepass "$KS_PASS" \
-            -destkeypass "$KS_PASS" \
-            -noprompt >/dev/null
-          rm -f "$KEYCHECK"
+            -storepass "$STORE_PASS" \
+            -alias "$ALIAS_NAME" >/dev/null
 
           LOCAL_PROPERTIES_B64="$(base64 -w0 < "$PROPS")"
           echo "::add-mask::$LOCAL_PROPERTIES_B64"
           echo "LOCAL_PROPERTIES=$LOCAL_PROPERTIES_B64" >> "$GITHUB_ENV"
 
-          CERT_SHA256="$(keytool -list -v -keystore "$KEYSTORE" -storepass "$KS_PASS" -alias "$KS_ALIAS" 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -n1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          CERT_SHA256="$(keytool -list -v -keystore "$KEYSTORE" -storepass "$STORE_PASS" -alias "$ALIAS_NAME" 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -n1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
           test -n "$CERT_SHA256"
           echo "cert_sha256=$CERT_SHA256" >> "$GITHUB_OUTPUT"
-
-      - name: Upload first-run signing backup
-        if: steps.signing.outputs.generated == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: SFA-RELEASE-SIGNING-KEY-FIRST-RUN-PRIVATE
-          path: ${{ runner.temp }}/sfa-signing-backup
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+          echo "Ephemeral release signing ready; certificate_sha256=$CERT_SHA256"
 
       - name: Build SFA OtherRelease using upstream Gradle task
         shell: bash
@@ -400,7 +324,8 @@ jobs:
           printf 'APK ABI(s): %s\n' "${APK_ABIS[*]:-<none>}"
           test "${#APK_ABIS[@]}" -eq 1
           test "${APK_ABIS[0]}" = "$TARGET_ABI"
-          unzip -Z1 "$APK" | grep -F "lib/${TARGET_ABI}/libgojni.so" >/dev/null
+          APK_ENTRIES="$(unzip -Z1 "$APK")"
+          grep -Fx "lib/${TARGET_ABI}/libbox.so" <<<"$APK_ENTRIES" >/dev/null
 
           "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "$RUNNER_TEMP/apksigner.txt"
           APK_CERT_SHA256="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
