@@ -1,9 +1,14 @@
 package multipath
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/log"
 )
 
 func waitForAuditEvent(t *testing.T, controller *preferredCapacityController, kind preferredCapacityAuditEventKind, timeout time.Duration) preferredCapacityAuditEvent {
@@ -335,6 +340,51 @@ func TestPreferredCapacityAuditLogLineCarriesFieldAcceptanceEvidence(t *testing.
 	} {
 		if !strings.Contains(line, required) {
 			t.Fatalf("audit log line missing %q: %s", required, line)
+		}
+	}
+}
+
+type capacityAuditCaptureLogger struct {
+	log.ContextLogger
+	lines []string
+}
+
+func (l *capacityAuditCaptureLogger) ErrorContext(_ context.Context, args ...any) {
+	l.lines = append(l.lines, fmt.Sprint(args...))
+}
+
+func (l *capacityAuditCaptureLogger) InfoContext(_ context.Context, args ...any) {
+	l.lines = append(l.lines, fmt.Sprint(args...))
+}
+
+func TestPreferredCapacityAuditDroppedSurvivesInstanceFilter(t *testing.T) {
+	controller := newPreferredCapacityController(70, time.Second, 64<<10)
+	controller.enableAudit()
+	for n := 0; n < preferredCapacityAuditQueueLimit+1; n++ {
+		controller.recordAuditReady(time.Unix(int64(9000+n), 0))
+	}
+	logger := &capacityAuditCaptureLogger{ContextLogger: log.NewNOPFactory().Logger()}
+	h := &Inbound{
+		Adapter: inbound.NewAdapter("multipath", "mp-in-39002"),
+		ctx:     context.Background(),
+		logger:  logger,
+		cfg:     coreConfig{PreferredCapacity: controller},
+	}
+	h.flushPreferredCapacityAudit()
+
+	var droppedLine string
+	for _, line := range logger.lines {
+		if strings.Contains(line, "event=CAP_AUDIT_DROPPED") {
+			droppedLine = line
+			break
+		}
+	}
+	if droppedLine == "" {
+		t.Fatal("CAP_AUDIT_DROPPED not emitted")
+	}
+	for _, required := range []string{`instance="mp-in-39002"`, "evidence_complete=false"} {
+		if !strings.Contains(droppedLine, required) {
+			t.Fatalf("DROPPED evidence does not survive instance filter requirement %q: %s", required, droppedLine)
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -420,7 +421,7 @@ func (i *Inbound) flushPreferredCapacityAudit() {
 		i.logger.ErrorContext(
 			i.ctx,
 			"CAP_AUDIT schema_version=", preferredCapacityAuditSchema,
-			" event=CAP_AUDIT_DROPPED side=server instance=", i.Tag(),
+			" event=CAP_AUDIT_DROPPED side=server instance=", strconv.Quote(i.Tag()),
 			" dropped_events=", dropped,
 			" evidence_complete=false",
 		)
