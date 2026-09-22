@@ -196,6 +196,20 @@ jobs:
                   raise SystemExit(f'unexpected source state for {old!r}: count={text.count(old)}')
               text = text.replace(old, new, 1)
 
+          # The pinned SFA gitlink still declares other=minSdk 23, while this
+          # core's official build_libbox main AAR is built for Android API 24.
+          # Raise only the target flavor to 24; do not use overrideLibrary and
+          # do not lower libbox's upstream Android API contract.
+          import re
+          text, count = re.subn(
+              r'(create\("other"\)\s*\{\s*minSdk\s*=\s*)23(\s*\})',
+              r'\g<1>24\2',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f'unexpected other minSdk source state: replacements={count}')
+
           gradle.write_text(text, encoding='utf-8')
 
           strings = Path('sing-box-for-android/app/src/main/res/values/strings.xml')
@@ -220,7 +234,7 @@ jobs:
               'namespace_preserved': text.count('namespace = "io.nekohasekai.sfa"') == 1,
               'custom_application_id': text.count('applicationId = "custom.singbox.sfa"') == 1,
               'upstream_application_id_removed': 'applicationId = "io.nekohasekai.sfa"' not in text,
-              'other_minSdk_23_preserved': re.search(r'create\("other"\)\s*\{\s*minSdk\s*=\s*23\s*\}', text) is not None,
+              'other_minSdk_24_matches_libbox': re.search(r'create\("other"\)\s*\{\s*minSdk\s*=\s*24\s*\}', text) is not None,
               'no_universal_apk': text.count('isUniversalApk = false') == 1,
               'arm64_only': text.count('include("arm64-v8a")') == 1,
               'old_abi_set_removed': 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' not in text,
@@ -240,6 +254,35 @@ jobs:
           )
           printf 'SFA tracked changes:\n'; printf '  %s\n' "${changed[@]}"
           test "${changed[*]}" = "${expected[*]}"
+
+      - name: Verify SFA/libbox Android API contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PYAPI'
+          import re
+          from pathlib import Path
+
+          core = Path('sing-box/cmd/internal/build_libbox/main.go').read_text(encoding='utf-8')
+          app = Path('sing-box-for-android/app/build.gradle.kts').read_text(encoding='utf-8')
+
+          main_aar_api24 = re.search(
+              r'AndroidAPI:\s*24,\s*OutputName:\s*"libbox\.aar"',
+              core,
+              re.S,
+          ) is not None
+          other_api24 = re.search(
+              r'create\("other"\)\s*\{\s*minSdk\s*=\s*24\s*\}',
+              app,
+              re.S,
+          ) is not None
+
+          if not main_aar_api24:
+              raise SystemExit('libbox main AAR AndroidAPI contract is no longer 24; audit required')
+          if not other_api24:
+              raise SystemExit('SFA other flavor minSdk must equal libbox main AAR API 24')
+          print('PASS Android API contract: libbox.aar=24, SFA other minSdk=24')
+          PYAPI
 
       - name: Build official release libbox AAR for arm64-v8a only
         shell: bash
