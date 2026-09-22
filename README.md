@@ -190,17 +190,6 @@ growth pause at 7/8 and resume below 3/4; head progress remains reserved. Advert
 but unused window space is not an allocation. This budget is not process RSS and
 does not include child TCP/QUIC buffers.
 
-Released DATA slabs remain charged to that same budget while they are reusable; the
-allocator reuses their backing storage before making new slabs. If incompatible cached
-size classes must be discarded, their budget credit is returned only after runtime
-GC/scavenging completes, so one logical `memory_limit` credit cannot be spent twice
-while the old heap pages are still resident. After roughly two seconds without memory
-activity, excess reusable slabs are trimmed (all of them when no multipath session
-remains) and the runtime is asked to return free heap pages promptly. Receive pages use
-a small charged reuse pool for the same reason. These controls bound multipath-owned
-heap churn; `memory_limit` is still not a process RSS hard limit because Go runtime
-overhead and child transport/kernel buffers remain outside this protocol budget.
-
 Omitted receive/send-history ceilings are derived from the node budget: half of
 its ordinary allocation region (7/16 of the total, capped at 512 MiB and at least
 one chunk). With a 512 MiB budget this is 224 MiB per direction. These are ceilings,
