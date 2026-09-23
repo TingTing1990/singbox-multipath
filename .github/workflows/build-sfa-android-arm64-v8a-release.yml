@@ -150,12 +150,33 @@ jobs:
         shell: bash
         run: |-
           set -euo pipefail
-          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+
+          GO_ACTUAL="$(go env GOVERSION)"
+          printf 'Go actual=%s expected=go%s\n' "$GO_ACTUAL" "$GO_VERSION"
+          if [[ "$GO_ACTUAL" != "go${GO_VERSION}" ]]; then
+            echo 'ERROR: unexpected Go version' >&2
+            exit 31
+          fi
+
           NDK_PATH='${{ steps.setup-ndk.outputs.ndk-path }}'
-          test -d "$NDK_PATH"
-          test "$(basename "$NDK_PATH")" = "$NDK_REVISION"
-          java --version 2>&1 | tee "$RUNNER_TEMP/java-version.txt"
-          grep -F 'openjdk 17' "$RUNNER_TEMP/java-version.txt"
+          test -d "$NDK_PATH" || { echo "ERROR: NDK path does not exist: $NDK_PATH" >&2; exit 32; }
+          NDK_PROPERTIES="$NDK_PATH/source.properties"
+          test -f "$NDK_PROPERTIES" || { echo "ERROR: missing NDK source.properties: $NDK_PROPERTIES" >&2; exit 33; }
+          NDK_ACTUAL="$(sed -n 's/^Pkg\.Revision[[:space:]]*=[[:space:]]*//p' "$NDK_PROPERTIES" | head -n1 | tr -d '\r')"
+          printf 'NDK path=%s\nNDK actual=%s expected=%s\n' "$NDK_PATH" "$NDK_ACTUAL" "$NDK_REVISION"
+          if [[ "$NDK_ACTUAL" != "$NDK_REVISION" ]]; then
+            echo 'ERROR: unexpected Android NDK revision' >&2
+            exit 34
+          fi
+
+          JAVA_INFO="$(java -XshowSettings:properties -version 2>&1)"
+          JAVA_SPEC="$(awk -F= '/^[[:space:]]*java\.specification\.version[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' <<<"$JAVA_INFO")"
+          printf 'Java specification actual=%s expected=17\n' "$JAVA_SPEC"
+          java --version
+          if [[ "$JAVA_SPEC" != '17' ]]; then
+            echo 'ERROR: unexpected Java specification version' >&2
+            exit 35
+          fi
 
       - name: Set exact core version tag
         shell: bash
@@ -290,9 +311,33 @@ jobs:
         shell: bash
         run: |-
           set -euo pipefail
-          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+
+          GO_ACTUAL="$(go env GOVERSION)"
+          printf 'Go actual=%s expected=go%s\n' "$GO_ACTUAL" "$GO_VERSION"
+          if [[ "$GO_ACTUAL" != "go${GO_VERSION}" ]]; then
+            echo 'ERROR: unexpected Go version' >&2
+            exit 41
+          fi
+
           NDK_PATH='${{ steps.setup-ndk.outputs.ndk-path }}'
-          test "$(basename "$NDK_PATH")" = "$NDK_REVISION"
+          test -d "$NDK_PATH" || { echo "ERROR: NDK path does not exist: $NDK_PATH" >&2; exit 42; }
+          NDK_PROPERTIES="$NDK_PATH/source.properties"
+          test -f "$NDK_PROPERTIES" || { echo "ERROR: missing NDK source.properties: $NDK_PROPERTIES" >&2; exit 43; }
+          NDK_ACTUAL="$(sed -n 's/^Pkg\.Revision[[:space:]]*=[[:space:]]*//p' "$NDK_PROPERTIES" | head -n1 | tr -d '\r')"
+          printf 'NDK path=%s\nNDK actual=%s expected=%s\n' "$NDK_PATH" "$NDK_ACTUAL" "$NDK_REVISION"
+          if [[ "$NDK_ACTUAL" != "$NDK_REVISION" ]]; then
+            echo 'ERROR: unexpected Android NDK revision' >&2
+            exit 44
+          fi
+
+          JAVA_INFO="$(java -XshowSettings:properties -version 2>&1)"
+          JAVA_SPEC="$(awk -F= '/^[[:space:]]*java\.specification\.version[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' <<<"$JAVA_INFO")"
+          printf 'Java specification actual=%s expected=17\n' "$JAVA_SPEC"
+          if [[ "$JAVA_SPEC" != '17' ]]; then
+            echo 'ERROR: unexpected Java specification version' >&2
+            exit 45
+          fi
+
           test "$(git -C sing-box rev-parse HEAD)" = "$CORE_COMMIT"
           test "$(git -C sing-box rev-parse HEAD:clients/android)" = "$CORE_ANDROID_GITLINK"
           test "$(git -C sing-box-for-android rev-parse HEAD)" = "$SFA_COMMIT"
@@ -382,7 +427,7 @@ jobs:
                   raise SystemExit(f'core SetupOptions missing {go_field}')
               if kt_fragment not in app_kt:
                   raise SystemExit(f'SFA setup missing semantic assignment for {go_field}')
-          contracts.append('SetupOptions coreâ†”SFA assignments PASS')
+          contracts.append('SetupOptions core↔SFA assignments PASS')
 
           vpn = (sfa / 'app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt').read_text(encoding='utf-8')
           box = (sfa / 'app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt').read_text(encoding='utf-8')
