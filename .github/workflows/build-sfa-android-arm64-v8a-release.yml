@@ -2,17 +2,21 @@ name: Build SFA Android arm64-v8a Release Final Audit
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: sing-box fork branch/tag/commit to build
+        required: true
+        default: feature/multipath-capacity-v2-beta6
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: sfa-android-arm64-v8a-e4245b3e7c79
+  group: sfa-android-arm64-v8a-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
-  CORE_COMMIT: e4245b3e7c79b1b90f2b36ddec36e8af2e63c2a6
-  CORE_ANDROID_GITLINK: af61098358a8141dea71f232b7eaebf4ccee8868
   SFA_COMMIT: 5d5479d8bb60f7eb45e86402a8aa3a6131dd9ba3
   APP_VERSION: 1.14.0-multipath-beta6
   VERSION_CODE: '731'
@@ -30,32 +34,42 @@ jobs:
     timeout-minutes: 120
     outputs:
       core_commit: ${{ steps.identity.outputs.core_commit }}
+      core_android_gitlink: ${{ steps.identity.outputs.core_android_gitlink }}
+      sfa_pairing: ${{ steps.identity.outputs.sfa_pairing }}
       libbox_aar_sha256: ${{ steps.libbox.outputs.libbox_aar_sha256 }}
       libbox_so_sha256: ${{ steps.libbox.outputs.libbox_so_sha256 }}
     steps:
-      - name: Checkout exact audited fork core
+      - name: Checkout requested sing-box fork source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          ref: ${{ env.CORE_COMMIT }}
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 1
           persist-credentials: false
           path: sing-box
 
-      - name: Verify exact core identity and recorded Android gitlink
+      - name: Resolve exact core identity and Android gitlink
         id: identity
         shell: bash
         run: |-
           set -euo pipefail
           ACTUAL_CORE="$(git -C sing-box rev-parse HEAD)"
-          test "$ACTUAL_CORE" = "$CORE_COMMIT"
+          test -n "$ACTUAL_CORE"
           test "$(git -C sing-box ls-tree HEAD clients/android | awk '{print $1}')" = '160000'
           ACTUAL_GITLINK="$(git -C sing-box rev-parse HEAD:clients/android)"
-          test "$ACTUAL_GITLINK" = "$CORE_ANDROID_GITLINK"
-          test "$CORE_ANDROID_GITLINK" != "$SFA_COMMIT"
+          test -n "$ACTUAL_GITLINK"
           test -z "$(git -C sing-box status --porcelain=v1 --untracked-files=all)"
+          if [[ "$ACTUAL_GITLINK" = "$SFA_COMMIT" ]]; then
+            SFA_PAIRING='gitlink-equal'
+          else
+            SFA_PAIRING='explicit-pinned-override'
+          fi
+          echo "CORE_COMMIT=$ACTUAL_CORE" >> "$GITHUB_ENV"
+          echo "CORE_ANDROID_GITLINK=$ACTUAL_GITLINK" >> "$GITHUB_ENV"
           echo "core_commit=$ACTUAL_CORE" >> "$GITHUB_OUTPUT"
-          printf 'core_commit=%s\ncore_android_gitlink=%s\nselected_sfa_commit=%s\npairing=explicit-pinned-override\n' \
-            "$ACTUAL_CORE" "$ACTUAL_GITLINK" "$SFA_COMMIT"
+          echo "core_android_gitlink=$ACTUAL_GITLINK" >> "$GITHUB_OUTPUT"
+          echo "sfa_pairing=$SFA_PAIRING" >> "$GITHUB_OUTPUT"
+          printf 'source_ref=%s\ncore_commit=%s\ncore_android_gitlink=%s\nselected_sfa_commit=%s\npairing=%s\n' \
+            '${{ inputs.source_ref }}' "$ACTUAL_CORE" "$ACTUAL_GITLINK" "$SFA_COMMIT" "$SFA_PAIRING"
 
       - name: Verify fork libbox architecture surface
         shell: bash
@@ -216,13 +230,21 @@ jobs:
     needs:
       - build_libbox
     steps:
-      - name: Checkout exact audited fork core
+      - name: Checkout exact core resolved from source_ref
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          ref: ${{ env.CORE_COMMIT }}
+          ref: ${{ needs.build_libbox.outputs.core_commit }}
           fetch-depth: 1
           persist-credentials: false
           path: sing-box
+
+      - name: Bind resolved core identity for this job
+        shell: bash
+        run: |-
+          set -euo pipefail
+          echo "CORE_COMMIT=${{ needs.build_libbox.outputs.core_commit }}" >> "$GITHUB_ENV"
+          echo "CORE_ANDROID_GITLINK=${{ needs.build_libbox.outputs.core_android_gitlink }}" >> "$GITHUB_ENV"
+          echo "SFA_PAIRING=${{ needs.build_libbox.outputs.sfa_pairing }}" >> "$GITHUB_ENV"
 
       - name: Checkout explicitly pinned SFA 1.14.0
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -274,7 +296,11 @@ jobs:
           test "$(git -C sing-box rev-parse HEAD)" = "$CORE_COMMIT"
           test "$(git -C sing-box rev-parse HEAD:clients/android)" = "$CORE_ANDROID_GITLINK"
           test "$(git -C sing-box-for-android rev-parse HEAD)" = "$SFA_COMMIT"
-          test "$CORE_ANDROID_GITLINK" != "$SFA_COMMIT"
+          if [[ "$CORE_ANDROID_GITLINK" = "$SFA_COMMIT" ]]; then
+            test "$SFA_PAIRING" = 'gitlink-equal'
+          else
+            test "$SFA_PAIRING" = 'explicit-pinned-override'
+          fi
           grep -Fx 'VERSION_CODE=730' sing-box-for-android/version.properties
           grep -Fx 'VERSION_NAME=1.14.0' sing-box-for-android/version.properties
           grep -Fx 'GO_VERSION=go1.26.7' sing-box-for-android/version.properties
@@ -283,8 +309,8 @@ jobs:
           grep -F 'minSdk = 24' sing-box-for-android/app/build.gradle.kts
           grep -F 'ndkVersion = "28.0.13004108"' sing-box-for-android/app/build.gradle.kts
           grep -F 'include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")' sing-box-for-android/app/build.gradle.kts
-          printf 'PAIRING NOTE: core gitlink=%s; selected SFA=%s; this is an explicit audited override, not gitlink equality.\n' \
-            "$CORE_ANDROID_GITLINK" "$SFA_COMMIT"
+          printf 'PAIRING NOTE: core gitlink=%s; selected SFA=%s; pairing=%s.\n' \
+            "$CORE_ANDROID_GITLINK" "$SFA_COMMIT" "$SFA_PAIRING"
 
       - name: Audit SFA to fork libbox API and lifecycle contract
         shell: bash
@@ -685,7 +711,8 @@ jobs:
             echo "core_commit=${CORE_COMMIT}"
             echo "core_android_gitlink=${CORE_ANDROID_GITLINK}"
             echo "sfa_commit=${SFA_COMMIT}"
-            echo 'sfa_selection=explicit-pinned-override;not-gitlink-equality'
+            echo "source_ref=${{ inputs.source_ref }}"
+            echo "sfa_selection=${SFA_PAIRING}"
             echo "workflow_ref=${{ github.workflow_ref }}"
             echo "workflow_sha=${{ github.workflow_sha }}"
             echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
