@@ -651,13 +651,13 @@ jobs:
           trap - EXIT
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-      - name: Actual mutation controls - 10 executable wrong variants
+      - name: Actual mutation controls - 9 executable wrong variants + 1 frozen-tree drift
         shell: bash
         run: |
           set -euo pipefail
           python3 <<'PYMUT'
           from pathlib import Path
-          import os, shutil, subprocess, sys
+          import json, os, re, shutil, subprocess
 
           root=Path(os.environ['GITHUB_WORKSPACE'])
           temp=Path(os.environ['MUTANT_ROOT'])
@@ -682,27 +682,72 @@ jobs:
 
           def run(cmd,cwd,env=None):
               return subprocess.run(cmd,cwd=cwd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+          def exact_test_name(regex):
+              match=re.fullmatch(r'\^([A-Za-z0-9_/-]+)\$',regex)
+              if not match:
+                  raise RuntimeError(f'behavior mutation requires an exact test selector: {regex}')
+              return match.group(1)
+
           for name,rel,old,new,regex,pkg in mutations:
               work=temp/name
               subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
               try:
-                  target=work/rel; data=target.read_text()
+                  target=work/rel
+                  data=target.read_text()
                   count=data.count(old)
-                  if count!=1: raise RuntimeError(f'{name}: mutation anchor count={count}')
-                  target.write_text(data.replace(old,new,1))
+                  if count!=1:
+                      raise RuntimeError(f'{name}: mutation anchor count={count}')
+                  data=data.replace(old,new,1)
+
+                  # Mutation 06 models a real unquoted implementation. Remove the import
+                  # that becomes unused only because of this intentional mutation.
+                  if name=='06-drop-instance-unquoted':
+                      import_anchor='\t"strconv"\n'
+                      import_count=data.count(import_anchor)
+                      if import_count!=1:
+                          raise RuntimeError(f'{name}: strconv import anchor count={import_count}')
+                      data=data.replace(import_anchor,'',1)
+
+                  target.write_text(data)
                   shutil.copyfile(independent/'protocol/mieru/freeze_independent_test.go',work/'protocol/mieru/zz_freeze_independent_test.go')
                   shutil.copyfile(independent/'protocol/multipath/freeze_independent_test.go',work/'protocol/multipath/zz_freeze_independent_test.go')
                   env=dict(os.environ,CGO_ENABLED='1')
-                  cmd=['go','test','-count=1','-timeout=10m','-tags',tags,'-ldflags',ldflags,'-run',regex,pkg]
-                  result=run(cmd,work,env)
-                  (evidence/f'{name}.log').write_text(result.stdout)
+
+                  compile_cmd=['go','test','-count=1','-timeout=10m','-tags',tags,'-ldflags',ldflags,'-run','^$',pkg]
+                  compile_result=run(compile_cmd,work,env)
+                  (evidence/f'{name}.compile.log').write_text(compile_result.stdout)
+                  if compile_result.returncode!=0:
+                      raise RuntimeError(f'{name}: INVALID MUTANT compile failed exit={compile_result.returncode}')
+
+                  expected_test=exact_test_name(regex)
+                  test_cmd=['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-ldflags',ldflags,'-run',regex,pkg]
+                  result=run(test_cmd,work,env)
+                  (evidence/f'{name}.test.jsonl').write_text(result.stdout)
+
+                  events=[]
+                  for line in result.stdout.splitlines():
+                      try:
+                          event=json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+                      if isinstance(event,dict):
+                          events.append(event)
+                  ran=any(event.get('Action')=='run' and event.get('Test')==expected_test for event in events)
+                  failed=any(event.get('Action')=='fail' and event.get('Test')==expected_test for event in events)
+
                   if result.returncode==0:
-                      raise RuntimeError(f'{name}: mutant SURVIVED')
-                  print(f'KILLED {name}: exit={result.returncode}')
+                      raise RuntimeError(f'{name}: mutant SURVIVED target={expected_test}')
+                  if not ran:
+                      raise RuntimeError(f'{name}: INVALID RESULT target test did not run: {expected_test}')
+                  if not failed:
+                      raise RuntimeError(f'{name}: INVALID RESULT nonzero exit without target test failure: {expected_test}')
+                  print(f'KILLED BY TARGET TEST {name}: {expected_test}')
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
-          # 10: commit an unapproved scheduler byte change and prove the full-tree audit rejects it.
+          # 10: commit an unapproved scheduler byte change and prove the already-validated
+          # full-tree audit rejects this specific frozen-tree drift.
           name='10-golden-scheduler-drift'; work=temp/name
           subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
           try:
@@ -714,12 +759,15 @@ jobs:
               result=run(['python3',str(Path(os.environ['RUNNER_TEMP'])/'freeze-audit.py')],work,env)
               (evidence/f'{name}.log').write_text(result.stdout)
               if result.returncode==0:
-                  raise RuntimeError(f'{name}: mutant SURVIVED')
-              print(f'KILLED {name}: exit={result.returncode}')
+                  raise RuntimeError(f'{name}: frozen-tree drift SURVIVED')
+              expected_rejection='unapproved Golden drift protocol/multipath/scheduler.go'
+              if expected_rejection not in result.stdout:
+                  raise RuntimeError(f'{name}: INVALID RESULT audit failed for an unexpected reason')
+              print(f'REJECTED BY FREEZE AUDIT {name}: {expected_rejection}')
           finally:
               subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
               subprocess.run(['git','worktree','prune'],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 10 EXECUTABLE WRONG VARIANTS KILLED')
+          print('ALL 9 EXECUTABLE WRONG VARIANTS KILLED BY TARGET TESTS; FROZEN-TREE DRIFT REJECTED BY FREEZE AUDIT')
           PYMUT
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
