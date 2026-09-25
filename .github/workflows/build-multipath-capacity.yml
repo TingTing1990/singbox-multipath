@@ -1,4 +1,4 @@
-name: Build Multipath Capacity Memory Repair
+name: Build Multipath Capacity
 
 on:
   workflow_dispatch:
