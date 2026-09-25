@@ -1067,7 +1067,7 @@ jobs:
             found="$(go test -tags "$BUILD_TAGS" -list "^${test_name}$" ./protocol/multipath/... | grep -Fx "$test_name" | wc -l)"
             test "$found" -ge 1
           done
-          regex='^(TestRecordStorage|TestF01PendingWrite|TestF01Cache|TestPhysicalCreditReclaimDuringGCStartsNextBatch|TestPhysicalCreditCloseWaitsOnlyCapturedCutoff|TestPhysicalCreditPageAdmissionNeverWaitsForGC|TestPhysicalCreditSenderDetachBeforeBatchCredit|TestManagedBufferDetachPrecedesReleaseCallback|TestPrepaidHeadPageReusesSameBacking)$'
+          regex='^(TestF01PendingWriteSurvivesRecordPressure|TestF01CacheDropsCheckedOutReferences|TestRecordStorageSenderAccounting|TestRecordStorageGrowthChargesBothAllocations|TestRecordStorageDeniedGrowthKeepsCallerOwnership|TestRecordStoragePathEmergencyReserve|TestRecordStoragePathReceiptLifecycle|TestRecordStorageSenderStagedACKTail|TestPhysicalCreditReclaimDuringGCStartsNextBatch|TestPhysicalCreditCloseWaitsOnlyCapturedCutoff|TestPhysicalCreditPageAdmissionNeverWaitsForGC|TestPhysicalCreditSenderDetachBeforeBatchCredit|TestManagedBufferDetachPrecedesReleaseCallback|TestPrepaidHeadPageReusesSameBacking)$'
           CGO_ENABLED=1 go test -race -count=10 -timeout=25m -tags "$BUILD_TAGS" -run "$regex" ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/memory-ab-contracts.log"
       - name: Multipath correctness regression with race detector
         shell: bash
