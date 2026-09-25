@@ -181,6 +181,7 @@ func (i *Inbound) Close() error {
 	if i.recoveryCancel != nil {
 		i.recoveryCancel()
 	}
+	i.cfg.Memory.stopLogging()
 	i.recoveryMu.Lock()
 	i.recoveryClosed = true
 	var groups []*recoveryServerGroup

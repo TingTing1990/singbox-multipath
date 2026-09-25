@@ -7,10 +7,7 @@ func (b *memoryBudget) AcquireRecords(bytes int64, primary bool) bool {
 }
 
 func (b *memoryBudget) ReleaseRecords(bytes int64) {
-	// GrowRecords/TrimRecords/CloseRecords call this only after the old backing
-	// array has been cleared and ownership has moved. Keep its physical credit
-	// charged until the reclaim batch that owns this detach completes.
-	b.retireDetached(bytes)
+	b.releaseSession(bytes)
 }
 
 func (b *memoryBudget) changeSignal() <-chan struct{} {
@@ -35,19 +32,14 @@ func (b *memoryBudget) reservePage(size int64, head bool) bool {
 	if head {
 		limit = b.limit
 	}
-	now := time.Now()
 	if b.used+size > limit && b.cached > 0 {
-		b.dropCacheLocked(now)
+		b.dropCacheLocked()
 	}
 	if b.used+size > limit {
-		b.enterPressureLocked(now)
-		// PageMemory is a data-plane admission path: start only the asynchronous
-		// worker and return immediately.
-		b.startReclaimLocked()
+		b.enterPressureLocked(time.Now())
 		return false
 	}
 	b.used += size
-	b.lastActivity = now
-	b.updatePressureLocked(now)
+	b.updatePressureLocked(time.Now())
 	return true
 }

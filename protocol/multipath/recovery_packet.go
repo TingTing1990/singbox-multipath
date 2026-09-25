@@ -178,25 +178,15 @@ func (c *recoveryPacketConn) deliver(d recoveryDatagram, now time.Time) {
 			}
 		}
 	default:
-		finish := c.memory.prepareRelease(p.data)
-		p.data = nil
-		p = nil
-		if finish != nil {
-			finish()
-		}
+		c.memory.release(p.data)
 	}
 }
 
 func (c *recoveryPacketConn) expireLocked(now time.Time) {
 	for id, p := range c.parts {
 		if now.Sub(p.at) >= 5*time.Second {
+			c.memory.release(p.data)
 			delete(c.parts, id)
-			finish := c.memory.prepareRelease(p.data)
-			p.data = nil
-			p = nil
-			if finish != nil {
-				finish()
-			}
 		}
 	}
 }
@@ -222,39 +212,20 @@ func (c *recoveryPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	n := copy(b, p.data)
-	address := p.address.UDPAddr()
-	finish := c.memory.prepareRelease(p.data)
-	p.data = nil
-	p = nil
-	if finish != nil {
-		finish()
-	}
-	return n, address, nil
+	defer c.memory.release(p.data)
+	return copy(b, p.data), p.address.UDPAddr(), nil
 }
 func (c *recoveryPacketConn) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
 	p, err := c.read()
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
-	address := p.address
+	defer c.memory.release(p.data)
 	if b.FreeLen() < len(p.data) {
-		finish := c.memory.prepareRelease(p.data)
-		p.data = nil
-		p = nil
-		if finish != nil {
-			finish()
-		}
 		return M.Socksaddr{}, io.ErrShortBuffer
 	}
 	_, err = b.Write(p.data)
-	finish := c.memory.prepareRelease(p.data)
-	p.data = nil
-	p = nil
-	if finish != nil {
-		finish()
-	}
-	return address, err
+	return p.address, err
 }
 func (c *recoveryPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if len(p) > 65507 {
@@ -293,24 +264,14 @@ func (c *recoveryPacketConn) Close() error {
 	c.once.Do(func() {
 		c.mu.Lock()
 		close(c.done)
-		for id, p := range c.parts {
-			delete(c.parts, id)
-			finish := c.memory.prepareRelease(p.data)
-			p.data = nil
-			p = nil
-			if finish != nil {
-				finish()
-			}
+		for _, p := range c.parts {
+			c.memory.release(p.data)
 		}
+		clear(c.parts)
 		for {
 			select {
 			case p := <-c.queue:
-				finish := c.memory.prepareRelease(p.data)
-				p.data = nil
-				p = nil
-				if finish != nil {
-					finish()
-				}
+				c.memory.release(p.data)
 			default:
 				c.mu.Unlock()
 				c.memory.releaseSession(4096)

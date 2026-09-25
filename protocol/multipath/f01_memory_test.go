@@ -242,12 +242,10 @@ func TestF01CacheDropsCheckedOutReferences(t *testing.T) {
 				}
 			}
 			b.access.Lock()
-			b.dropCacheLocked(time.Now())
+			b.dropCacheLocked()
 			b.access.Unlock()
-			cutoff := b.reclaimCutoff()
-			b.waitReclaim(cutoff)
 			if s := b.snapshot(); s.UsedBytes != 0 || s.CachedBytes != 0 {
-				t.Fatalf("cache drain leaked charges after physical reclaim: %+v", s)
+				t.Fatalf("cache drain leaked charges: %+v", s)
 			}
 		})
 	}

@@ -336,9 +336,7 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 	case leg.send <- frame:
 		return nil
 	default:
-		buffer := frame.buffer
-		frame.data, frame.buffer = nil, nil
-		buffer.Release()
+		segment.Buffer.Release()
 		leg.queuedBytes.Add(-int64(segment.Length))
 		leg.busy = false
 		return errors.New("multipath assignment invariant violated")

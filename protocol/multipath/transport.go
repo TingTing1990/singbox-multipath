@@ -15,9 +15,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 		select {
 		case frame := <-leg.send:
 			leg.queuedBytes.Add(-int64(len(frame.data)))
-			buffer := frame.buffer
-			frame.data, frame.buffer = nil, nil
-			buffer.Release()
+			frame.buffer.Release()
 		default:
 		}
 		leg.busy = false
@@ -97,9 +95,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 			leg.writeStarted.Store(0)
 			leg.writingBytes.Store(0)
 			c.stateMu.Lock()
-			buffer := frame.buffer
-			frame.data, frame.buffer = nil, nil
-			buffer.Release()
+			frame.buffer.Release()
 			leg.busy = false
 			c.stateMu.Unlock()
 			if err != nil {
@@ -116,13 +112,7 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 func (c *mpCore) legReadLoop(leg *mpLeg) {
 	defer close(leg.readerDone)
 	scratch := c.memory.takeReservedBuffer(c.cfg.ChunkSize)
-	defer func() {
-		finish := c.memory.prepareReservedRelease(scratch)
-		scratch = nil
-		if finish != nil {
-			finish()
-		}
-	}()
+	defer c.memory.putReservedBuffer(scratch)
 	if leg.readPreamble != nil {
 		if err := leg.readPreamble(leg.conn); err != nil {
 			if !c.isDone() {

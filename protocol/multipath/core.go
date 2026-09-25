@@ -95,18 +95,14 @@ func (c *mpCore) Acquire(head bool) bool {
 	return true
 }
 
-func (c *mpCore) Release(head bool) bool {
+func (c *mpCore) Release(head bool) {
 	if head {
 		c.headPages--
 		if c.headPages == 0 {
-			return true
+			return
 		}
 	}
-	return false
-}
-
-func (c *mpCore) Retire() {
-	c.memory.retireDetached(stream.PageCharge)
+	c.memory.releaseSession(stream.PageCharge)
 }
 
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
@@ -118,7 +114,7 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 		leg.closePreferredCapacityRanges()
 	}
 	c.tx.Close()
-	prepaidHeadBacking := c.rx.Close()
+	c.rx.Close()
 	stream.CloseRecords(&c.mappings, &c.mappingHead, &c.mappingBytes, c.mappingReserve[:], c.memory)
 	c.replayMu.Lock()
 	c.replayBytes = 0
@@ -128,23 +124,11 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	c.stateMu.Unlock()
 	select {
 	case buffer := <-c.txReserve:
-		finish := c.memory.prepareReservedRelease(buffer)
-		buffer = nil
-		if finish != nil {
-			finish()
-		}
+		c.memory.putReservedBuffer(buffer)
 	default:
 	}
-	if prepaidHeadBacking {
-		c.memory.retireReservedDetached(stream.PageCharge)
-	}
-	// Capture this close's physical-reclaim boundary only after every concrete
-	// backing owned by the core has been detached. Later sessions may continue to
-	// release memory, but they cannot extend this cutoff.
-	reclaimCutoff := c.memory.reclaimCutoff()
 	c.memory.releaseSession(c.sessionBytes)
 	c.memory.sessions.Add(-1)
-	c.memory.waitReclaim(reclaimCutoff)
 	close(c.released)
 }
 
@@ -230,7 +214,7 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		// cannot create an unbounded list of uncharged send records.
 		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
 		if buffer != nil {
-			return stream.NewManagedBuffer(buffer[:c.cfg.ChunkSize], c.memory.prepareRelease), nil
+			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
 		}
 		select {
 		case <-c.done:
@@ -288,7 +272,7 @@ func (c *mpCore) txLoop() {
 			if compact != nil {
 				copy(compact, buffer.Data[:n])
 				buffer.Release()
-				buffer = stream.NewManagedBuffer(compact[:n], c.memory.prepareRelease)
+				buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
 			}
 		}
 		c.stateMu.Lock()
