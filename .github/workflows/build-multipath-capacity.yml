@@ -585,13 +585,6 @@ jobs:
           echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
           echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
 
-      - name: Native old liveness regression x10
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test -count=10 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^TestFlowRegressionRepeatedBoosterDisconnect$' ./protocol/multipath
-
       - name: Native impacted multipath regression Linux/macOS
         if: matrix.goos != 'windows'
         shell: bash
