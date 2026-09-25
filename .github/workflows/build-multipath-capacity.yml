@@ -363,9 +363,20 @@ jobs:
                       shutil.copyfile(src,work/'protocol/multipath/zz_memory_repair_independent_test.go')
                   compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
                   if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
-                  run=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
                   print(run.stdout)
+                  expected_test=test[1:-1]
+                  ran=failed=False
+                  import json
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected_test: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
                   if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran: raise RuntimeError(f'{name}: invalid result; target test did not run {test}')
+                  if not failed: raise RuntimeError(f'{name}: invalid result; nonzero exit without target test failure {test}')
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -415,16 +426,25 @@ jobs:
           LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
           mkdir -p "$LOG_DIR"
           run_perf() {
-            local tree="$1" label="$2" run_id="$3" log="$LOG_DIR/${2}-${3}.log"
+            local tree="$1"
+            local label="$2"
+            local run_id="$3"
+            local log="$LOG_DIR/${label}-${run_id}.log"
             set +e
             (
               cd "$tree"
-              CGO_ENABLED=1 go test -race -count=1 -timeout=5m -v -tags "$BUILD_TAGS" \
-                -run '^TestPerformanceHealthyLinks$' ./protocol/multipath
+              CGO_ENABLED=1 go test \
+                -race \
+                -count=1 \
+                -timeout=5m \
+                -v \
+                -tags "$BUILD_TAGS" \
+                -run '^TestPerformanceHealthyLinks$' \
+                ./protocol/multipath
             ) 2>&1 | tee "$log"
             local rc=${PIPESTATUS[0]}
             set -e
-            test "$rc" -eq 0
+            echo "${label}_run_${run_id}_go_test_rc=${rc}"
           }
           run_perf "$PARENT_DIR" golden 1
           run_perf "$GITHUB_WORKSPACE" repaired 1
@@ -440,18 +460,28 @@ jobs:
                     '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms']
           run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
           rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
-          forbidden=('healthy reliable legs triggered replay','unused window credit caused memory pressure','memory budget exceeded','panic:','fatal error:','test timed out','DATA RACE')
+          forbidden=(
+              'healthy reliable legs triggered replay','unused window credit caused memory pressure',
+              'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
+          )
+          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
           def parse(p):
-              text=p.read_text(errors='replace')
+              text=p.read_text(encoding='utf-8',errors='replace')
               for x in forbidden:
-                  if x in text: raise SystemExit(f'FAIL {p.name}: {x}')
+                  if x in text: raise SystemExit(f'FAIL {p.name}: unsafe fixture result: {x}')
               cur=None; values={}
               for line in text.splitlines():
+                  d=diagnostic_re.search(line)
+                  if d:
+                      msg=d.group(1)
+                      if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
+                          raise SystemExit(f'FAIL {p.name}: unexpected performance diagnostic: {msg}')
                   m=run_re.search(line)
                   if m: cur=m.group(1); continue
                   m=rate_re.search(line)
                   if m and cur: values[cur]=float(m.group(1))
-              if set(values)!=set(expected): raise SystemExit(f'FAIL {p.name}: cases={sorted(values)}')
+              missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
+              if missing or extra: raise SystemExit(f'FAIL {p.name}: missing={missing} extra={extra}')
               return values
           samples={k:[parse(d/f'{k}-1.log'),parse(d/f'{k}-2.log')] for k in ('golden','repaired')}
           failed=False
