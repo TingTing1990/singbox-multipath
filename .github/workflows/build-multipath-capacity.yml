@@ -344,7 +344,7 @@ jobs:
              '^TestRuntimeMemoryGuardOwnership$','native'),
             ('03-ignore-gomemlimit','protocol/multipath/memory_runtime.go',
              '\t\tif explicit || current != math.MaxInt64 {\n',
-             '\t\tif false {\n',
+             '\t\tif (explicit && false) || current != math.MaxInt64 {\n',
              '^TestRuntimeMemoryGuardOwnership$','native'),
             ('04-break-cgroup-parent-walk','protocol/multipath/memory_available_linux.go',
              '\t\t\t\tif dir == mount {\n',
