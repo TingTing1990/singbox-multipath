@@ -1,0 +1,665 @@
+name: Build Multipath Capacity Final
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Repaired source branch/tag/commit to audit and build
+        required: true
+        default: feature/multipath-capacity-final
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multipath-capacity-memory-repair-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.5'
+  VERSION: '1.14.0-multipath-beta6'
+  FROZEN_GOLDEN_SHA: 'e4245b3e7c79b1b90f2b36ddec36e8af2e63c2a6'
+  FROZEN_GOLDEN_TREE: '9dc79da54ffa4604c4649050915c7c5edc9d04f0'
+  B9_UPSTREAM_COMMIT: '9721ae7e3dd4da02a2baf9bb4461316e0aeeaf7d'
+
+jobs:
+  audit_test:
+    name: Frozen delta + A provenance + B9 guard + impacted regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+      parent_sha: ${{ steps.resolve.outputs.parent_sha }}
+
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup exact Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Resolve exact candidate against immutable Golden
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REF"
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          grep -Fx "go ${GO_VERSION}" go.mod
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          test "$(git rev-parse "${FROZEN_GOLDEN_SHA}^{tree}")" = "$FROZEN_GOLDEN_TREE"
+          test "$(git merge-base "$CANDIDATE_SHA" "$FROZEN_GOLDEN_SHA")" = "$FROZEN_GOLDEN_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=$FROZEN_GOLDEN_SHA" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$CANDIDATE_SHA"
+          echo "golden_sha=$FROZEN_GOLDEN_SHA"
+          echo "golden_tree=$FROZEN_GOLDEN_TREE"
+          echo "b9_upstream_commit=$B9_UPSTREAM_COMMIT"
+          echo "go=$(go version)"
+
+      - name: Verify exact repaired source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import hashlib
+          expected={
+            'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
+            'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
+            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
+            'protocol/multipath/inbound.go':'1173018cd6735f7e0b6e728450108a0c8f1139e276da7404d3c9a53bf08bb5a1',
+            'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
+            'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
+            'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
+            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
+            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/transport.go':'141a760282dca81dbe516a2d8054ca0ec0bb05a00d6a6d4bed774336b2c10b57',
+            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c',
+            'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
+            'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
+            'protocol/multipath/f01_staged_ack_test.go':'775af226cdf2dd06f637504d2e846df8344e8291ee9e101a37b9ae8375038547',
+            'protocol/multipath/memory_available_linux_test.go':'6e6f444997734b18f85a4f76302b7ece7b46c983ac90b7e2e251f4230659d291',
+            'protocol/multipath/memory_runtime.go':'70a2a22f367b9f70ed22bc466aa48b8724eafd4853d62d3ecdfa8ce3693297dd',
+            'protocol/multipath/memory_runtime_test.go':'e021dc2188f9c00242091608c54392d58bc97bb5c5131a99492959b1604dfb22',
+            'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
+            'protocol/multipath/stream/records_test.go':'f66daaacfc75eb676100cd1aaa94e21208ece1301c4b6e5efe09e7d1286a5f5f',
+          }
+          for rel,want in expected.items():
+              got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
+              if got != want:
+                  raise SystemExit(f'FAIL identity {rel}: {got} != {want}')
+              print('PASS',rel,got)
+          PY
+
+      - name: Set audited build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          test -n "$BUILD_TAGS"
+          echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
+      - name: Materialize immutable Golden and evidence directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOLDEN_DIR="${RUNNER_TEMP}/frozen-golden"
+          INDEPENDENT_DIR="${RUNNER_TEMP}/independent-repair"
+          MUTANT_ROOT="${RUNNER_TEMP}/repair-mutants"
+          EVIDENCE_DIR="${RUNNER_TEMP}/memory-repair-evidence"
+          git worktree prune || true
+          rm -rf "$GOLDEN_DIR" "$INDEPENDENT_DIR" "$MUTANT_ROOT" "$EVIDENCE_DIR"
+          mkdir -p "$MUTANT_ROOT" "$EVIDENCE_DIR"
+          git worktree add --detach "$GOLDEN_DIR" "$FROZEN_GOLDEN_SHA"
+          echo "GOLDEN_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          echo "PARENT_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          echo "INDEPENDENT_DIR=$INDEPENDENT_DIR" >> "$GITHUB_ENV"
+          echo "MUTANT_ROOT=$MUTANT_ROOT" >> "$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Complete-tree and architecture boundary audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY' | tee "${EVIDENCE_DIR}/architecture-audit.log"
+          from pathlib import Path
+          import hashlib, os, re, subprocess
+          ROOT=Path(os.environ['GITHUB_WORKSPACE'])
+          GOLDEN=Path(os.environ['GOLDEN_DIR'])
+          MOD={
+            'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
+            'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
+            'protocol/multipath/outbound.go','protocol/multipath/scheduler.go','protocol/multipath/stream/path.go',
+            'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go'}
+          ADD={
+            'protocol/multipath/f01_memory_test.go','protocol/multipath/f01_retention_contract_test.go',
+            'protocol/multipath/f01_staged_ack_test.go','protocol/multipath/memory_available_linux_test.go',
+            'protocol/multipath/memory_runtime.go','protocol/multipath/memory_runtime_test.go',
+            'protocol/multipath/stream/records.go','protocol/multipath/stream/records_test.go'}
+          F01={
+            'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
+            'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
+            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
+            'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
+            'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
+            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
+            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
+            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/transport.go':'141a760282dca81dbe516a2d8054ca0ec0bb05a00d6a6d4bed774336b2c10b57',
+            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c'}
+          FORBIDDEN=('pendingReclaim','reclaimIssued','reclaimCompleted','reclaimRunning','memoryIdleReclaimDelay',
+                     'memoryScavenge','retireDetached','reclaimCutoff','waitReclaim','prepareReservedRelease',
+                     'prepareRelease','NewManagedBuffer','debug.FreeOSMemory')
+          def req(v,m):
+              if not v: raise RuntimeError(m)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def tracked(root):
+              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
+              out={}
+              for rec in raw.split(b'\0'):
+                  if not rec: continue
+                  meta,path=rec.split(b'\t',1); mode,oid,stage=meta.split()
+                  req(stage==b'0','unmerged '+os.fsdecode(path))
+                  out[os.fsdecode(path)]=(mode.decode(),oid.decode())
+              return out
+          def function(src,name):
+              m=re.search(r'(?m)^func\s+(?:\([^\n]+\)\s+)?'+re.escape(name)+r'\s*\([^\n]*',src)
+              req(m is not None,'missing function '+name)
+              start=m.start(); brace=src.find('{',start); req(brace>=0,'missing brace '+name)
+              d=0; q=None; esc=False
+              for i in range(brace,len(src)):
+                  c=src[i]
+                  if q:
+                      if esc: esc=False
+                      elif c=='\\': esc=True
+                      elif c==q: q=None
+                  else:
+                      if c in ('"','`'): q=c
+                      elif c=='{': d+=1
+                      elif c=='}':
+                          d-=1
+                          if d==0: return src[start:i+1]
+              raise RuntimeError('unclosed '+name)
+          gt,rt=tracked(GOLDEN),tracked(ROOT)
+          mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
+          req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
+          print('PASS exact Golden delta 12M/8A/0D including modes/gitlinks')
+          for rel,(mode,oid) in gt.items():
+              if rel in MOD: continue
+              req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
+          print('PASS complete-tree freeze outside authorized paths')
+          for rel,want in F01.items(): req(sha(ROOT/rel)==want,'F01 byte drift '+rel)
+          print('PASS exact work-area F01/A bytes retained')
+          for rel in ('protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/activation.go',
+                      'protocol/multipath/telemetry.go','option/multipath.go','go.mod','go.sum',
+                      'protocol/multipath/flow_fault_test.go','protocol/multipath/memory_test.go',
+                      'protocol/multipath/recovery_packet.go','protocol/multipath/stream/receive.go',
+                      'protocol/multipath/stream/stream_test.go'):
+              req((ROOT/rel).read_bytes()==(GOLDEN/rel).read_bytes(),'critical Golden drift '+rel)
+          print('PASS frozen critical files and restored B-touched files exact Golden')
+          prod='\n'.join(p.read_text(errors='replace') for p in (ROOT/'protocol/multipath').rglob('*.go') if not p.name.endswith('_test.go'))
+          for token in FORBIDDEN: req(token not in prod,'rejected B token remains '+token)
+          print('PASS rejected physical-credit B state machine absent')
+          mem=(ROOT/'protocol/multipath/memory.go').read_text(); runtime=(ROOT/'protocol/multipath/memory_runtime.go').read_text(); avail=(ROOT/'protocol/multipath/memory_available_linux.go').read_text()
+          req('processMemoryGuard.acquire()' in mem and 'func (b *memoryBudget) stopLogging()' in mem,'B9 guard lifecycle missing')
+          for token in ('debug.SetMemoryLimit','os.LookupEnv("GOMEMLIMIT")','g.users++','once.Do(g.release)'): req(token in runtime,'B9 runtime contract missing '+token)
+          for token in ('/proc/self/cgroup','/proc/self/mountinfo','memory.max','memory.current','memory.limit_in_bytes','memory.usage_in_bytes'): req(token in avail,'B9 cgroup contract missing '+token)
+          req((ROOT/'protocol/multipath/inbound.go').read_text().count('i.cfg.Memory.stopLogging()')==1,'inbound close guard release')
+          req((ROOT/'protocol/multipath/outbound.go').read_text().count('o.cfg.Memory.stopLogging()')==1,'outbound close guard release')
+          print('PASS B9 runtime/cgroup guard integration bounded to logging lifecycle')
+          for rel,line in (('protocol/multipath/inbound.go','\ti.cfg.Memory.stopLogging()\n'),('protocol/multipath/outbound.go','\to.cfg.Memory.stopLogging()\n')):
+              current=(ROOT/rel).read_text()
+              req(current.count(line)==1,'compatibility hook count '+rel)
+              req(current.replace(line,'').encode()==(GOLDEN/rel).read_bytes(),'non-hook drift '+rel)
+          print('PASS inbound/outbound compatibility delta is exactly one upstream stopLogging hook each')
+          for rel,name in (('protocol/multipath/scheduler.go','choosePathLocked'),('protocol/multipath/scheduler.go','pumpLoop'),
+                           ('protocol/multipath/memory.go','boosterAllowed'),('protocol/multipath/memory.go','updatePressureLocked')):
+              req(function((ROOT/rel).read_text(),name)==function((GOLDEN/rel).read_text(),name),'frozen function drift '+rel+':'+name)
+          print('PASS Frozen scheduler/pressure function bodies unchanged')
+          req('processMemoryGuard' not in (ROOT/'protocol/multipath/scheduler.go').read_text(),'runtime guard leaked into scheduler')
+          req('processMemoryGuard' not in (ROOT/'protocol/multipath/core.go').read_text(),'runtime guard leaked into core allocation')
+          print('PASS runtime guard does not alter MP admission/scheduler semantics')
+          req('TestFlowRegressionRepeatedBoosterDisconnect' in (ROOT/'protocol/multipath/flow_fault_test.go').read_text(),'old liveness regression missing')
+          print('PASS old repeated-booster-disconnect regression preserved')
+          print('ARCHITECTURE_AUDIT=PASS')
+          PY
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Materialize independent repair regression outside candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$INDEPENDENT_DIR" "${{ steps.resolve.outputs.candidate_sha }}"
+          cat > "$INDEPENDENT_DIR/protocol/multipath/zz_memory_repair_independent_test.go" <<'GOEOF'
+          package multipath
+
+          import "testing"
+
+          // Independent from candidate tests: this reproduces the exact accounting
+          // shape that made rejected B accumulate detached credit across rounds.
+          func TestRepairIndependentRepeatedRoundCredit(t *testing.T) {
+            b := newMemoryBudget(512<<10, false)
+            const charge = 1536
+            for round := 0; round < 6; round++ {
+              buffers := make([][]byte, 0, 64)
+              for i := 0; i < 64; i++ {
+                buffer, wait := b.tryAcquirePrimary(charge)
+                if buffer == nil || wait != nil {
+                  t.Fatalf("round=%d allocation=%d denied used=%d", round, i, b.snapshot().UsedBytes)
+                }
+                buffers = append(buffers, buffer)
+              }
+              for _, buffer := range buffers {
+                b.release(buffer)
+              }
+              snapshot := b.snapshot()
+              if !b.boosterAllowed() {
+                t.Fatalf("round=%d booster disabled after releases: used=%d high=%d", round, snapshot.UsedBytes, snapshot.BoosterLimitBytes)
+              }
+              if snapshot.UsedBytes > b.cacheLimit {
+                t.Fatalf("round=%d released credit accumulated: used=%d cache_limit=%d", round, snapshot.UsedBytes, b.cacheLimit)
+              }
+            }
+          }
+          GOEOF
+          gofmt -w "$INDEPENDENT_DIR/protocol/multipath/zz_memory_repair_independent_test.go"
+          (
+            cd "$INDEPENDENT_DIR"
+            CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+              -run '^TestRepairIndependentRepeatedRoundCredit$' ./protocol/multipath
+          ) | tee "${EVIDENCE_DIR}/independent-repeated-round-credit.log"
+
+      - name: Upstream B9 runtime guard and cgroup contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestAutomaticRuntimeMemoryLimit|TestRuntimeMemoryGuardOwnership|TestMemoryLoggingStopsWithoutParentCancellation|TestCgroupAvailableMemory)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/b9-runtime-guard.log"
+
+      - name: F01 A accounting and staged-ACK contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestF01PendingWriteSurvivesRecordPressure|TestF01CacheDropsCheckedOutReferences|TestRecordStorageSenderAccounting|TestRecordStorageGrowthChargesBothAllocations|TestRecordStorageDeniedGrowthKeepsCallerOwnership|TestRecordStoragePathEmergencyReserve|TestRecordStoragePathReceiptLifecycle|TestRecordStorageSenderStagedACKTail)$' \
+            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/f01-focused.log"
+          CGO_ENABLED=1 go test -race -count=1 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestF01RetainedCapacityAcrossIdleSessions|TestIndependentRetentionContract|TestIndependentRetentionContractStagedACK)$' \
+            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/f01-broad-once.log"
+
+      - name: Capacity V2 impacted architecture regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^TestPreferredCapacity' ./protocol/multipath \
+            2>&1 | tee "${EVIDENCE_DIR}/capacity-v2-impacted.log"
+
+      - name: Existing repeated-booster-disconnect regression x20
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+            -run '^TestFlowRegressionRepeatedBoosterDisconnect$' ./protocol/multipath \
+            2>&1 | tee "${EVIDENCE_DIR}/repeated-booster-disconnect-x20.log"
+
+      - name: Mutation controls for rejected B and upstream guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os, shutil, subprocess
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          temp=Path(os.environ['MUTANT_ROOT'])
+          tags=os.environ['BUILD_TAGS']
+          mutations=[
+            ('01-accumulate-released-credit','protocol/multipath/memory.go',
+             '\t\tb.used -= int64(size)\n\t\tif b.used < 0 {',
+             '\t\t// MUTANT: released backing remains charged.\n\t\tif b.used < 0 {',
+             '^TestRepairIndependentRepeatedRoundCredit$','independent'),
+            ('02-runtime-guard-no-restore','protocol/multipath/memory_runtime.go',
+             '\t\tdebug.SetMemoryLimit(g.previous)\n',
+             '\t\t// MUTANT: leak process runtime memory limit.\n',
+             '^TestRuntimeMemoryGuardOwnership$','native'),
+            ('03-ignore-gomemlimit','protocol/multipath/memory_runtime.go',
+             '\t\tif explicit || current != math.MaxInt64 {\n',
+             '\t\tif (explicit && false) || current != math.MaxInt64 {\n',
+             '^TestRuntimeMemoryGuardOwnership$','native'),
+            ('04-break-cgroup-parent-walk','protocol/multipath/memory_available_linux.go',
+             '\t\t\t\tif dir == mount {\n',
+             '\t\t\t\tif true {\n',
+             '^TestCgroupAvailableMemory$','native'),
+          ]
+          for name,rel,old,new,test,kind in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+              try:
+                  p=work/rel; s=p.read_text()
+                  if s.count(old)!=1: raise RuntimeError(f'{name} anchor count={s.count(old)}')
+                  p.write_text(s.replace(old,new,1))
+                  if kind=='independent':
+                      src=Path(os.environ['INDEPENDENT_DIR'])/'protocol/multipath/zz_memory_repair_independent_test.go'
+                      shutil.copyfile(src,work/'protocol/multipath/zz_memory_repair_independent_test.go')
+                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  print(run.stdout)
+                  expected_test=test[1:-1]
+                  ran=failed=False
+                  import json
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected_test: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
+                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran: raise RuntimeError(f'{name}: invalid result; target test did not run {test}')
+                  if not failed: raise RuntimeError(f'{name}: invalid result; nonzero exit without target test failure {test}')
+                  print('KILLED',name,'BY',test)
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 4 REPAIR MUTANTS KILLED')
+          PY
+
+      - name: Check formatting of exact repair write-set
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            protocol/multipath/budget_stream.go protocol/multipath/capacity.go protocol/multipath/core.go
+            protocol/multipath/inbound.go protocol/multipath/memory.go protocol/multipath/memory_available_linux.go
+            protocol/multipath/outbound.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go
+            protocol/multipath/stream/send.go protocol/multipath/transport.go protocol/multipath/types.go
+            protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go
+            protocol/multipath/f01_staged_ack_test.go protocol/multipath/memory_available_linux_test.go
+            protocol/multipath/memory_runtime.go protocol/multipath/memory_runtime_test.go
+            protocol/multipath/stream/records.go protocol/multipath/stream/records_test.go
+          )
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
+
+      - name: Go vet impacted packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet -tags "$BUILD_TAGS" ./protocol/multipath/...
+
+      - name: Compile all repository packages without running tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -count=1 -timeout=20m -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
+
+      - name: Full impacted multipath regression with race detector once
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=1 -timeout=20m -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/multipath-full-race.log"
+
+      - name: Golden vs repaired zero-field performance differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
+          mkdir -p "$LOG_DIR"
+          run_perf() {
+            local tree="$1"
+            local label="$2"
+            local run_id="$3"
+            local log="$LOG_DIR/${label}-${run_id}.log"
+            set +e
+            (
+              cd "$tree"
+              CGO_ENABLED=1 go test \
+                -race \
+                -count=1 \
+                -timeout=5m \
+                -v \
+                -tags "$BUILD_TAGS" \
+                -run '^TestPerformanceHealthyLinks$' \
+                ./protocol/multipath
+            ) 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            echo "${label}_run_${run_id}_go_test_rc=${rc}"
+          }
+          run_perf "$PARENT_DIR" golden 1
+          run_perf "$GITHUB_WORKSPACE" repaired 1
+          run_perf "$PARENT_DIR" golden 2
+          run_perf "$GITHUB_WORKSPACE" repaired 2
+          python3 - "$LOG_DIR" <<'PY'
+          from pathlib import Path
+          import re, statistics, sys
+          d=Path(sys.argv[1])
+          expected=['1_160+600Mbps_65+110ms','8_160+600Mbps_65+110ms','32_160+600Mbps_65+110ms',
+                    '1_40+50Mbps_65+110ms','8_40+50Mbps_65+110ms','1_160+600Mbps_65+400ms',
+                    '8_160+600Mbps_65+400ms','1_160+600Mbps_110+65ms','1_160+600Mbps_5+10ms',
+                    '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms']
+          run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
+          rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
+          forbidden=(
+              'healthy reliable legs triggered replay','unused window credit caused memory pressure',
+              'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
+          )
+          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
+          def parse(p):
+              text=p.read_text(encoding='utf-8',errors='replace')
+              for x in forbidden:
+                  if x in text: raise SystemExit(f'FAIL {p.name}: unsafe fixture result: {x}')
+              cur=None; values={}
+              for line in text.splitlines():
+                  d=diagnostic_re.search(line)
+                  if d:
+                      msg=d.group(1)
+                      if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
+                          raise SystemExit(f'FAIL {p.name}: unexpected performance diagnostic: {msg}')
+                  m=run_re.search(line)
+                  if m: cur=m.group(1); continue
+                  m=rate_re.search(line)
+                  if m and cur: values[cur]=float(m.group(1))
+              missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
+              if missing or extra: raise SystemExit(f'FAIL {p.name}: missing={missing} extra={extra}')
+              return values
+          samples={k:[parse(d/f'{k}-1.log'),parse(d/f'{k}-2.log')] for k in ('golden','repaired')}
+          failed=False
+          for case in expected:
+              gv=[x[case] for x in samples['golden']]; rv=[x[case] for x in samples['repaired']]
+              ratio=statistics.median(rv)/statistics.median(gv)
+              print(f'{case}: golden={gv} repaired={rv} ratio={ratio:.4f}')
+              failed |= ratio < 0.98
+          if failed: raise SystemExit('FAIL repaired zero-field performance below 98% Golden')
+          print('PASS repaired retains >=98% Golden performance for all fixtures')
+          PY
+
+      - name: Verify workspace remained pristine
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: memory-repair-audit-evidence
+          path: ${{ runner.temp }}/memory-repair-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup audit worktrees
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git worktree remove --force "${GOLDEN_DIR:-}" >/dev/null 2>&1 || true
+          git worktree remove --force "${INDEPENDENT_DIR:-}" >/dev/null 2>&1 || true
+          git worktree prune || true
+
+  build_targets:
+    name: Build ${{ matrix.label }}
+    needs: audit_test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Intel amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
+          - label: Windows amd64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
+          - label: Linux amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-linux-amd64
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout exact audited commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.audit_test.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup exact Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify exact audited source and native runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.audit_test.outputs.candidate_sha }}"
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          test "$(go env GOHOSTARCH)" = "amd64"
+          test "$(go env GOHOSTOS)" = "${{ matrix.goos }}"
+          echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+          echo "go=$(go version)"
+          echo "audited_commit=$(git rev-parse HEAD)"
+
+      - name: Set build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          test -n "$BUILD_TAGS"
+          echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
+      - name: Native impacted multipath regression Linux/macOS
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=20m -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" ./protocol/multipath/...
+
+      - name: Native impacted multipath regression Windows
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=20m -skip '^(TestPerformanceHealthyLinks|TestCoreSenderStatusAndRTTProbe)$' \
+            -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./protocol/multipath/...
+
+      - name: Build standalone core
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -v -trimpath -tags "$BUILD_TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o "dist/${{ matrix.binary }}" ./cmd/sing-box
+
+      - name: Smoke-test built binary and embedded version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="dist/${{ matrix.binary }}"
+          if [[ "${{ matrix.goos }}" != "windows" ]]; then chmod +x "$BIN"; fi
+          test -s "$BIN"
+          ACTUAL_VERSION="$("./$BIN" version -n | tr -d '\r\n')"
+          test "$ACTUAL_VERSION" = "$VERSION"
+          VERSION_OUTPUT="$("./$BIN" version)"
+          printf '%s\n' "$VERSION_OUTPUT"
+          grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$VERSION_OUTPUT"
+          grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
+
+      - name: Produce checksum and build provenance
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          BIN="dist/${{ matrix.binary }}"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then shasum -a 256 "$BIN" > "${BIN}.sha256"; else sha256sum "$BIN" > "${BIN}.sha256"; fi
+          {
+            echo "version=${VERSION}"
+            echo "source_ref=${SOURCE_REF}"
+            echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
+            echo "golden_commit=${{ needs.audit_test.outputs.parent_sha }}"
+            echo "golden_tree=${FROZEN_GOLDEN_TREE}"
+            echo "b9_upstream_commit=${B9_UPSTREAM_COMMIT}"
+            echo "go_version=$(go env GOVERSION)"
+            echo "target=${{ matrix.goos }}/${{ matrix.goarch }}"
+            echo "cgo=0"
+            echo "build_tags=${BUILD_TAGS}"
+            echo "binary=${{ matrix.binary }}"
+          } > "${BIN}.buildinfo.txt"
+          cat "${BIN}.sha256"
+          cat "${BIN}.buildinfo.txt"
+
+      - name: Upload verified binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/${{ matrix.binary }}.sha256
+            dist/${{ matrix.binary }}.buildinfo.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
