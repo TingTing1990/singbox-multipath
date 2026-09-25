@@ -36,8 +36,12 @@ type Path struct {
 	LastProgress  time.Time
 	Stale         bool
 	ReleaseFlight func(prepaid bool)
+	RecordMemory  RecordAllocator
+	RecordPrimary bool
 	flights       []Flight
 	head          int
+	recordBytes   int64
+	recordReserve [PathRecordReserve]Flight
 	sampleBytes   uint64
 	sampleTime    uint64
 }
@@ -49,9 +53,17 @@ func (p *Path) Submitted(length int, now time.Time, prepaid ...bool) (uint64, er
 	if length <= 0 || uint64(length) > math.MaxUint64-p.Sent {
 		return 0, ErrSequence
 	}
+	isPrepaid := len(prepaid) > 0 && prepaid[0]
+	additional := 1
+	if p.RecordMemory != nil && !isPrepaid {
+		additional += RecordReserve
+	}
+	if !GrowRecords(&p.flights, &p.head, &p.recordBytes, p.recordReserve[:], p.RecordMemory, additional, p.RecordPrimary) {
+		return 0, ErrRecordMemory
+	}
 	seq := p.Sent
 	p.Sent += uint64(length)
-	p.flights = append(p.flights, Flight{End: p.Sent, SentAt: now, Prepaid: len(prepaid) > 0 && prepaid[0]})
+	p.flights = append(p.flights, Flight{End: p.Sent, SentAt: now, Prepaid: isPrepaid})
 	return seq, nil
 }
 
@@ -119,15 +131,7 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 			p.MinimumRTT = min(p.MinimumRTT, rtt)
 		}
 	}
-	if p.head == len(p.flights) {
-		p.flights = p.flights[:0]
-		p.head = 0
-	} else if p.head >= 256 && p.head*2 >= len(p.flights) {
-		n := copy(p.flights, p.flights[p.head:])
-		clear(p.flights[n:])
-		p.flights = p.flights[:n]
-		p.head = 0
-	}
+	TrimRecords(&p.flights, &p.head, &p.recordBytes, p.recordReserve[:], p.RecordMemory, 256, RecordReserve)
 	return nil
 }
 
@@ -137,8 +141,7 @@ func (p *Path) Close() {
 			p.ReleaseFlight(p.flights[i].Prepaid)
 		}
 	}
-	p.flights = nil
-	p.head = 0
+	CloseRecords(&p.flights, &p.head, &p.recordBytes, p.recordReserve[:], p.RecordMemory)
 }
 
 func (p *Path) RTO(floor time.Duration) time.Duration {

@@ -5,13 +5,22 @@ import "math"
 // Buffer ownership is shared only by the connection send queue and active
 // writers. ACK processing must not recycle bytes referenced by a blocked Write.
 type Buffer struct {
-	Data    []byte
-	refs    int
-	release func()
+	Data        []byte
+	refs        int
+	release     func()
+	releaseData func([]byte) func()
 }
 
 func NewBuffer(data []byte, release func()) *Buffer {
 	return &Buffer{Data: data, refs: 1, release: release}
+}
+
+// NewManagedBuffer is for memoryBudget-owned payloads. On the last reference,
+// Buffer first removes its own backing reference, then hands the detached slice
+// to the memory owner. Legacy NewBuffer callbacks remain unchanged for reserved
+// buffers whose callback intentionally transfers ownership elsewhere.
+func NewManagedBuffer(data []byte, release func([]byte) func()) *Buffer {
+	return &Buffer{Data: data, refs: 1, releaseData: release}
 }
 
 func (b *Buffer) Retain() {
@@ -25,8 +34,21 @@ func (b *Buffer) Release() {
 		panic("multipath: releasing unowned buffer")
 	}
 	b.refs--
-	if b.refs == 0 && b.release != nil {
-		b.release()
+	if b.refs != 0 {
+		return
+	}
+	data, releaseData, release := b.Data, b.releaseData, b.release
+	b.Data, b.releaseData, b.release = nil, nil, nil
+	if releaseData != nil {
+		finish := releaseData(data)
+		data = nil
+		if finish != nil {
+			finish()
+		}
+		return
+	}
+	if release != nil {
+		release()
 	}
 }
 
@@ -43,25 +65,37 @@ func (s Segment) Data() []byte { return s.Buffer.Data[s.Offset : s.Offset+s.Leng
 // Sender is the single connection-level retransmission queue. Path receipts
 // deliberately have no API which removes its data.
 type Sender struct {
-	Una       uint64
-	Next      uint64
-	WriteNext uint64
-	WindowEnd uint64
-	FIN       uint64
-	HasFIN    bool
-	FINSent   bool
-	FINAcked  bool
-	segments  []Segment
-	head      int
+	Una           uint64
+	Next          uint64
+	WriteNext     uint64
+	WindowEnd     uint64
+	FIN           uint64
+	HasFIN        bool
+	FINSent       bool
+	FINAcked      bool
+	segments      []Segment
+	head          int
+	recordMemory  RecordAllocator
+	recordBytes   int64
+	recordReserve [RecordReserve]Segment
 }
 
-func NewSender(initialWindow uint64) *Sender { return &Sender{WindowEnd: initialWindow} }
+func NewSender(initialWindow uint64, memory ...RecordAllocator) *Sender {
+	s := &Sender{WindowEnd: initialWindow}
+	if len(memory) > 0 {
+		s.recordMemory = memory[0]
+	}
+	return s
+}
 
 // Append transfers the caller's one buffer reference on success only.
 func (s *Sender) Append(buffer *Buffer) error {
 	length := len(buffer.Data)
 	if s.HasFIN || length == 0 || uint64(length) >= math.MaxUint64-s.WriteNext {
 		return ErrSequence
+	}
+	if !GrowRecords(&s.segments, &s.head, &s.recordBytes, s.recordReserve[:], s.recordMemory, 1, true) {
+		return ErrRecordMemory
 	}
 	s.segments = append(s.segments, Segment{Seq: s.WriteNext, Buffer: buffer, Length: length})
 	s.WriteNext += uint64(length)
@@ -150,19 +184,12 @@ func (s *Sender) Acknowledge(next, windowEnd uint64) error {
 			segment.Length -= consumed
 			break
 		}
-		segment.Buffer.Release()
+		buffer := segment.Buffer
 		*segment = Segment{}
 		s.head++
+		buffer.Release()
 	}
-	if s.head == len(s.segments) {
-		s.segments = s.segments[:0]
-		s.head = 0
-	} else if s.head >= 1024 && s.head*2 >= len(s.segments) {
-		n := copy(s.segments, s.segments[s.head:])
-		clear(s.segments[n:])
-		s.segments = s.segments[:n]
-		s.head = 0
-	}
+	TrimRecords(&s.segments, &s.head, &s.recordBytes, s.recordReserve[:], s.recordMemory, 1024, 0)
 	s.FINAcked = s.FINSent && next == s.FIN+1
 	return nil
 }
@@ -173,8 +200,11 @@ func (s *Sender) Buffered() uint64 {
 
 func (s *Sender) Close() {
 	for i := s.head; i < len(s.segments); i++ {
-		s.segments[i].Buffer.Release()
+		buffer := s.segments[i].Buffer
+		s.segments[i] = Segment{}
+		if buffer != nil {
+			buffer.Release()
+		}
 	}
-	s.segments = nil
-	s.head = 0
+	CloseRecords(&s.segments, &s.head, &s.recordBytes, s.recordReserve[:], s.recordMemory)
 }
