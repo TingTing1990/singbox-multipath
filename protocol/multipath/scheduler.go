@@ -165,15 +165,7 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	if c.mappingHead < len(c.mappings) {
 		c.mappings[c.mappingHead].seq = max(c.mappings[c.mappingHead].seq, c.tx.Una)
 	}
-	if c.mappingHead == len(c.mappings) {
-		c.mappings = c.mappings[:0]
-		c.mappingHead = 0
-	} else if c.mappingHead >= 1024 && c.mappingHead*2 >= len(c.mappings) {
-		n := copy(c.mappings, c.mappings[c.mappingHead:])
-		clear(c.mappings[n:])
-		c.mappings = c.mappings[:n]
-		c.mappingHead = 0
-	}
+	stream.TrimRecords(&c.mappings, &c.mappingHead, &c.mappingBytes, c.mappingReserve[:], c.memory, 1024, 0)
 	c.updateStateCountersLocked()
 	wakeFlow(c.txWake)
 	wakeFlow(c.pumpWake)
@@ -293,9 +285,29 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 		leg.prepaidFlights++
 		prepaid = true
 	}
+	// Reserve every first-transmission record before advancing either sequence.
+	// Reinjection only needs path storage and can use the prepaid flight slots.
+	if !repair {
+		if !stream.GrowRecords(&c.mappings, &c.mappingHead, &c.mappingBytes, c.mappingReserve[:], c.memory, 1, essential) ||
+			(leg.id == 0 && c.cfg.PreferredCapacity != nil && !leg.reservePreferredCapacityRange(essential)) {
+			leg.path.ReleaseFlight(prepaid)
+			return errMemoryLimit
+		}
+	}
+	leg.path.RecordPrimary = essential
 	pathSeq, err := leg.path.Submitted(segment.Length, now, prepaid)
+	if errors.Is(err, stream.ErrRecordMemory) && essential && !prepaid && leg.prepaidFlights < stream.RecordReserve {
+		// Ordinary growth can fail while the reserved flight slots remain free.
+		leg.path.ReleaseFlight(false)
+		leg.prepaidFlights++
+		prepaid = true
+		pathSeq, err = leg.path.Submitted(segment.Length, now, true)
+	}
 	if err != nil {
 		leg.path.ReleaseFlight(prepaid)
+		if errors.Is(err, stream.ErrRecordMemory) {
+			return errMemoryLimit
+		}
 		return err
 	}
 	if !repair {
@@ -308,7 +320,10 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 			pathEnd: pathSeq + uint64(segment.Length), sentAt: now,
 		})
 		if leg.id == 0 && c.cfg.PreferredCapacity != nil {
-			leg.recordPreferredCapacityRange(pathSeq, segment.Length)
+			// Capacity was reserved above under the same stateMu lock.
+			if !leg.recordPreferredCapacityRange(pathSeq, segment.Length) {
+				return errors.New("multipath capacity record reservation invariant violated")
+			}
 		}
 	}
 	segment.Buffer.Retain()
@@ -321,7 +336,9 @@ func (c *mpCore) submitLocked(leg *mpLeg, segment stream.Segment, repair bool, n
 	case leg.send <- frame:
 		return nil
 	default:
-		segment.Buffer.Release()
+		buffer := frame.buffer
+		frame.data, frame.buffer = nil, nil
+		buffer.Release()
 		leg.queuedBytes.Add(-int64(segment.Length))
 		leg.busy = false
 		return errors.New("multipath assignment invariant violated")

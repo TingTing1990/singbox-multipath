@@ -61,7 +61,7 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	}
 	// The first chunk is usable before feedback, preserving the early-write
 	// fast path. Advertised byte capacity is separate from allocated storage.
-	c.tx = stream.NewSender(uint64(cfg.ChunkSize))
+	c.tx = stream.NewSender(uint64(cfg.ChunkSize), budget)
 	capacity := uint64(cfg.MaxReorderBytes)
 	if cfg.MaxReorderFrames > 0 {
 		capacity = min(capacity, uint64(cfg.MaxReorderFrames)*uint64(cfg.ChunkSize))
@@ -95,14 +95,18 @@ func (c *mpCore) Acquire(head bool) bool {
 	return true
 }
 
-func (c *mpCore) Release(head bool) {
+func (c *mpCore) Release(head bool) bool {
 	if head {
 		c.headPages--
 		if c.headPages == 0 {
-			return
+			return true
 		}
 	}
-	c.memory.releaseSession(stream.PageCharge)
+	return false
+}
+
+func (c *mpCore) Retire() {
+	c.memory.retireDetached(stream.PageCharge)
 }
 
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
@@ -111,10 +115,11 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	c.stateMu.Lock()
 	for _, leg := range legs {
 		leg.path.Close()
+		leg.closePreferredCapacityRanges()
 	}
 	c.tx.Close()
-	c.rx.Close()
-	c.mappings = nil
+	prepaidHeadBacking := c.rx.Close()
+	stream.CloseRecords(&c.mappings, &c.mappingHead, &c.mappingBytes, c.mappingReserve[:], c.memory)
 	c.replayMu.Lock()
 	c.replayBytes = 0
 	c.replayMu.Unlock()
@@ -123,11 +128,23 @@ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	c.stateMu.Unlock()
 	select {
 	case buffer := <-c.txReserve:
-		c.memory.putReservedBuffer(buffer)
+		finish := c.memory.prepareReservedRelease(buffer)
+		buffer = nil
+		if finish != nil {
+			finish()
+		}
 	default:
 	}
+	if prepaidHeadBacking {
+		c.memory.retireReservedDetached(stream.PageCharge)
+	}
+	// Capture this close's physical-reclaim boundary only after every concrete
+	// backing owned by the core has been detached. Later sessions may continue to
+	// release memory, but they cannot extend this cutoff.
+	reclaimCutoff := c.memory.reclaimCutoff()
 	c.memory.releaseSession(c.sessionBytes)
 	c.memory.sessions.Add(-1)
+	c.memory.waitReclaim(reclaimCutoff)
 	close(c.released)
 }
 
@@ -151,7 +168,8 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		send: make(chan wireFrame, 1), control: make(chan wireFrame, 32), feedback: make(chan wireFrame, 1),
 		telemetry: make(chan struct{}, 1), shutdown: make(chan legShutdownRequest, 1),
 		onClose: onClose, done: make(chan struct{}), writerDone: make(chan struct{}), readerDone: make(chan struct{}),
-		path: stream.Path{Generation: c.nextGeneration},
+		path:         stream.Path{Generation: c.nextGeneration, RecordMemory: c.memory},
+		recordMemory: c.memory,
 	}
 	leg.ready.Store(preamble == nil)
 	leg.path.ReleaseFlight = func(prepaid bool) {
@@ -212,7 +230,7 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		// cannot create an unbounded list of uncharged send records.
 		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
 		if buffer != nil {
-			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
+			return stream.NewManagedBuffer(buffer[:c.cfg.ChunkSize], c.memory.prepareRelease), nil
 		}
 		select {
 		case <-c.done:
@@ -270,18 +288,39 @@ func (c *mpCore) txLoop() {
 			if compact != nil {
 				copy(compact, buffer.Data[:n])
 				buffer.Release()
-				buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
+				buffer = stream.NewManagedBuffer(compact[:n], c.memory.prepareRelease)
 			}
 		}
 		c.stateMu.Lock()
-		if n > 0 && !c.isDone() {
+		// A read already accepted these bytes. Metadata exhaustion must apply
+		// backpressure, not discard that accepted prefix or fail the session.
+		var recordWait time.Time
+		appended := false
+		for n > 0 && !c.isDone() {
+			changed := c.memory.changeSignal()
 			buffer.Data = buffer.Data[:n]
 			err = c.tx.Append(buffer)
-			if err == nil {
-				c.ingressBytes.Add(uint64(n))
-			} else {
-				buffer.Release()
+			if !errors.Is(err, stream.ErrRecordMemory) {
+				appended = err == nil
+				break
 			}
+			if recordWait.IsZero() {
+				recordWait = time.Now()
+				c.backpressE.Add(1)
+			}
+			c.stateMu.Unlock()
+			select {
+			case <-c.done:
+			case <-changed:
+			case <-c.txWake:
+			}
+			c.stateMu.Lock()
+		}
+		if !recordWait.IsZero() {
+			c.backpressNS.Add(uint64(time.Since(recordWait)))
+		}
+		if appended {
+			c.ingressBytes.Add(uint64(n))
 		} else {
 			buffer.Release()
 		}

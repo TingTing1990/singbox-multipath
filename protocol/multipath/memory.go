@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 	"github.com/sagernet/sing/common/byteformats"
 )
 
@@ -17,11 +19,20 @@ const (
 	automaticMemoryLimitCap      = 512 << 20
 	automaticMemoryLimitFallback = 256 << 20
 	memoryCacheLimitCap          = 16 << 20
+	memoryIdleReclaimDelay       = 2 * time.Second
 	sessionMemoryBase            = 128 << 10
 	wireFrameMemoryEstimate      = int64(unsafe.Sizeof(wireFrame{}))
 )
 
-var errMemoryLimit = errors.New("multipath memory limit reached")
+var (
+	errMemoryLimit = errors.New("multipath memory limit reached")
+	// Production uses runtime/debug.FreeOSMemory. Tests replace this function
+	// only to hold a batch at the GC boundary and verify ordering.
+	memoryScavenge = debug.FreeOSMemory
+	// The runtime operation is process-wide. Never hold memoryBudget.access while
+	// waiting here, and never run more than one process-wide scavenge at once.
+	memoryScavengeAccess sync.Mutex
+)
 
 type memorySnapshot struct {
 	LimitBytes         int64
@@ -62,9 +73,23 @@ type memoryBudget struct {
 	waitCount     uint64
 	peakUsed      int64
 	peakCached    int64
-	changed       chan struct{}
-	events        chan memoryPressureEvent
-	logOnce       sync.Once
+
+	// Physical-credit reclaim is batch/epoch based. pendingReclaim contains only
+	// allocations detached after the current GC batch began. reclaimIssued is a
+	// monotonic handoff epoch; reclaimCompleted advances only after the GC that
+	// owns that batch returns. New releases during GC therefore cannot be credited
+	// by the older batch and cannot lose a wakeup.
+	pendingReclaim   int64
+	reclaimIssued    uint64
+	reclaimCompleted uint64
+	reclaimRunning   bool
+
+	lastActivity         time.Time
+	maintenanceScheduled bool
+
+	changed chan struct{}
+	events  chan memoryPressureEvent
+	logOnce sync.Once
 }
 
 func resolveMemoryLimit(configured uint64) (int64, bool, error) {
@@ -113,66 +138,109 @@ func sessionMemoryReservation(cfg coreConfig) int64 {
 	// frame per path. The base also covers worker stacks and 16 prepaid primary
 	// flight records. Two reader scratch buffers and one primary TX reserve
 	// keep head recovery independent of speculative allocations.
-	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3
+	// Inline record arrays are always live, even while a larger array is in use.
+	// Charge them at admission so head progress does not depend on new storage.
+	records := stream.SenderRecordBytes + 2*stream.PathRecordBytes +
+		int64(stream.RecordReserve)*(int64(unsafe.Sizeof(dataMapping{}))+2*int64(unsafe.Sizeof(preferredCapacityPathRange{})))
+	return sessionMemoryBase + 2*34*wireFrameMemoryEstimate + int64(cfg.ChunkSize)*3 + records
 }
 
 func (b *memoryBudget) tryAcquirePrimary(size int) ([]byte, <-chan struct{}) {
 	b.access.Lock()
 	defer b.access.Unlock()
-	if buffers := b.cache[size]; len(buffers) > 0 {
-		buffer := buffers[len(buffers)-1]
-		if len(buffers) == 1 {
-			delete(b.cache, size)
-		} else {
-			b.cache[size] = buffers[:len(buffers)-1]
-		}
-		b.cached -= int64(size)
+	if buffer := b.popCacheLocked(size); buffer != nil {
 		return buffer[:size], nil
 	}
+	now := time.Now()
 	if b.used+int64(size) > b.limit && b.cached > 0 {
-		b.dropCacheLocked()
+		b.dropCacheLocked(now)
 	}
 	if b.used+int64(size) <= b.limit {
 		b.used += int64(size)
-		b.updatePressureLocked(time.Now())
+		b.lastActivity = now
+		b.updatePressureLocked(now)
 		return make([]byte, size), nil
 	}
+	// Allocation remains non-blocking. If detached physical credit exists, start
+	// its asynchronous batch and let the existing changed signal wake the caller.
+	b.startReclaimLocked()
 	return nil, b.changed
 }
 
 // The caller has already charged a reusable session scratch/TX reservation.
 func (b *memoryBudget) takeReservedBuffer(size int) []byte {
 	b.access.Lock()
-	if buffers := b.cache[size]; len(buffers) > 0 {
-		buffer := buffers[len(buffers)-1]
-		if len(buffers) == 1 {
-			delete(b.cache, size)
-		} else {
-			b.cache[size] = buffers[:len(buffers)-1]
-		}
-		b.cached -= int64(size)
+	if buffer := b.popCacheLocked(size); buffer != nil {
 		b.used -= int64(size)
-		b.updatePressureLocked(time.Now())
+		b.lastActivity = time.Now()
+		b.updatePressureLocked(b.lastActivity)
 		b.access.Unlock()
 		return buffer[:size]
 	}
+	b.lastActivity = time.Now()
 	b.access.Unlock()
 	return make([]byte, size)
 }
 
+// A slice's unused capacity is still scanned by GC. Clear checked-out entries
+// and shrink sparse indexes so neither payloads nor historical size-class peaks
+// can remain reachable outside the cache's byte accounting.
+func (b *memoryBudget) popCacheLocked(size int) []byte {
+	buffers := b.cache[size]
+	if len(buffers) == 0 {
+		return nil
+	}
+	last := len(buffers) - 1
+	buffer := buffers[last]
+	buffers[last] = nil
+	if last == 0 {
+		delete(b.cache, size)
+	} else if cap(buffers) > 16 && last <= cap(buffers)/4 {
+		b.cache[size] = append([][]byte(nil), buffers[:last]...)
+	} else {
+		b.cache[size] = buffers[:last]
+	}
+	b.cached -= int64(size)
+	return buffer
+}
+
 // Returning a reserved buffer does not release its session reservation. Cache
 // storage is charged separately until reused or dropped.
-func (b *memoryBudget) putReservedBuffer(buffer []byte) {
+func (b *memoryBudget) prepareReservedRelease(buffer []byte) func() {
 	size := cap(buffer)
+	if size == 0 {
+		return nil
+	}
+	now := time.Now()
 	b.access.Lock()
 	if !b.pressure && b.cached+int64(size) <= b.cacheLimit && b.used+int64(size) <= b.limit {
 		b.cache[size] = append(b.cache[size], buffer[:size])
 		b.cached += int64(size)
 		b.used += int64(size)
+		b.lastActivity = now
+		b.updatePressureLocked(now)
+		b.signalLocked()
+		b.access.Unlock()
+		return nil
 	}
-	b.updatePressureLocked(time.Now())
-	b.signalLocked()
+	// This allocation was physically covered by the session reservation. Move an
+	// equal charge out of that reservation now, but do not hand it to GC until the
+	// caller has cleared its final slice reference.
+	b.used += int64(size)
+	b.lastActivity = now
+	b.updatePressureLocked(now)
 	b.access.Unlock()
+	return func() { b.retireDetached(int64(size)) }
+}
+
+// putReservedBuffer is kept for focused accounting tests. Production owners use
+// prepareReservedRelease so they can clear their own slice before finalizing.
+func (b *memoryBudget) putReservedBuffer(buffer []byte) {
+	finish := b.prepareReservedRelease(buffer)
+	buffer = nil
+	if finish != nil {
+		finish()
+	}
 }
 
 func (b *memoryBudget) reserveSession(bytes int64) bool {
@@ -181,14 +249,19 @@ func (b *memoryBudget) reserveSession(bytes int64) bool {
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
-	if b.used+bytes > b.limit {
-		b.dropCacheLocked()
+	now := time.Now()
+	if b.used+bytes > b.limit && b.cached > 0 {
+		b.dropCacheLocked(now)
 	}
 	if b.used+bytes > b.limit {
+		// Preserve setup admission as an immediate success/failure decision. A
+		// pending physical batch is kicked asynchronously but never waited here.
+		b.startReclaimLocked()
 		return false
 	}
 	b.used += bytes
-	b.updatePressureLocked(time.Now())
+	b.lastActivity = now
+	b.updatePressureLocked(now)
 	return true
 }
 
@@ -206,25 +279,105 @@ func (b *memoryBudget) releaseSession(bytes int64) {
 	b.access.Unlock()
 }
 
-func (b *memoryBudget) release(buffer []byte) {
+func (b *memoryBudget) prepareRelease(buffer []byte) func() {
 	if b == nil || cap(buffer) == 0 {
-		return
+		return nil
 	}
 	size := cap(buffer)
+	now := time.Now()
 	b.access.Lock()
-	b.updatePressureLocked(time.Now())
+	b.updatePressureLocked(now)
 	if !b.pressure && b.cached+int64(size) <= b.cacheLimit {
 		b.cache[size] = append(b.cache[size], buffer[:size])
 		b.cached += int64(size)
-	} else {
-		b.used -= int64(size)
-		if b.used < 0 {
-			b.used = 0
-		}
+		b.lastActivity = now
+		b.updatePressureLocked(now)
+		b.signalLocked()
+		b.access.Unlock()
+		return nil
 	}
-	b.updatePressureLocked(time.Now())
-	b.signalLocked()
 	b.access.Unlock()
+	// The returned closure captures only budget+size, never the backing slice.
+	// Its caller clears the final protocol reference before invoking it.
+	return func() { b.retireDetached(int64(size)) }
+}
+
+// release is retained for focused budget tests. Protocol owners must use the
+// two-phase prepareRelease path so GC cannot race their last backing reference.
+func (b *memoryBudget) release(buffer []byte) {
+	finish := b.prepareRelease(buffer)
+	buffer = nil
+	if finish != nil {
+		finish()
+	}
+}
+
+// retireDetached is used only after the last protocol reference to an actual
+// backing allocation has been cleared. used is intentionally unchanged here.
+func (b *memoryBudget) retireDetached(bytes int64) uint64 {
+	if b == nil || bytes <= 0 {
+		return 0
+	}
+	b.access.Lock()
+	epoch := b.retireDetachedLocked(bytes, time.Now())
+	b.access.Unlock()
+	return epoch
+}
+
+func (b *memoryBudget) retireDetachedLocked(bytes int64, now time.Time) uint64 {
+	if bytes <= 0 {
+		return b.reclaimIssued
+	}
+	b.pendingReclaim += bytes
+	b.reclaimIssued++
+	b.lastActivity = now
+	b.scheduleMaintenanceLocked(now)
+	return b.reclaimIssued
+}
+
+// retireReservedDetached transfers a concrete backing allocation out of a
+// fixed session reservation before that reservation is released.
+func (b *memoryBudget) retireReservedDetached(bytes int64) uint64 {
+	if b == nil || bytes <= 0 {
+		return 0
+	}
+	b.access.Lock()
+	b.used += bytes
+	epoch := b.retireDetachedLocked(bytes, time.Now())
+	b.updatePressureLocked(time.Now())
+	b.access.Unlock()
+	return epoch
+}
+
+// reclaimCutoff starts pending work and returns the latest detach epoch visible
+// at this point. A close waits only for this cutoff; later traffic cannot extend
+// its boundary.
+func (b *memoryBudget) reclaimCutoff() uint64 {
+	if b == nil {
+		return 0
+	}
+	b.access.Lock()
+	cutoff := b.reclaimIssued
+	b.startReclaimLocked()
+	b.access.Unlock()
+	return cutoff
+}
+
+func (b *memoryBudget) waitReclaim(cutoff uint64) {
+	if b == nil || cutoff == 0 {
+		return
+	}
+	for {
+		b.access.Lock()
+		if b.reclaimCompleted >= cutoff {
+			b.access.Unlock()
+			return
+		}
+		b.startReclaimLocked()
+		changed := b.changed
+		b.access.Unlock()
+		<-changed
+	}
 }
 
 func (b *memoryBudget) boosterAllowed() bool {
@@ -372,13 +525,95 @@ func (b *memoryBudget) startLogging(ctx context.Context, logger log.ContextLogge
 	})
 }
 
-func (b *memoryBudget) dropCacheLocked() {
+func (b *memoryBudget) dropCacheLocked(now time.Time) {
 	if b.cached == 0 {
 		return
 	}
-	b.used -= b.cached
+	bytes := b.cached
+	// Clear every stored slice pointer before the byte charge is handed to the
+	// reclaim worker. The cache map itself may survive until GC; payload owners do
+	// not.
+	for key, buffers := range b.cache {
+		clear(buffers)
+		delete(b.cache, key)
+	}
 	b.cached = 0
-	b.cache = make(map[int][][]byte)
+	b.retireDetachedLocked(bytes, now)
+}
+
+func (b *memoryBudget) scheduleMaintenanceLocked(now time.Time) {
+	if b.pendingReclaim == 0 && b.cached == 0 {
+		return
+	}
+	b.lastActivity = now
+	if b.maintenanceScheduled {
+		return
+	}
+	b.maintenanceScheduled = true
+	time.AfterFunc(memoryIdleReclaimDelay, b.runIdleMaintenance)
+}
+
+func (b *memoryBudget) runIdleMaintenance() {
+	b.access.Lock()
+	idleFor := time.Since(b.lastActivity)
+	if idleFor < memoryIdleReclaimDelay {
+		delay := memoryIdleReclaimDelay - idleFor
+		b.access.Unlock()
+		time.AfterFunc(delay, b.runIdleMaintenance)
+		return
+	}
+	b.maintenanceScheduled = false
+	now := time.Now()
+	if b.sessions.Load() == 0 && b.cached > 0 {
+		b.dropCacheLocked(now)
+	}
+	b.startReclaimLocked()
+	b.access.Unlock()
+}
+
+// startReclaimLocked moves the current pending set into one immutable GC batch.
+// Releases that arrive after this point accumulate in pendingReclaim for the
+// next batch. There is deliberately no queued boolean: the running flag and the
+// pending byte count are sufficient to avoid the confirmed stale-queue state.
+func (b *memoryBudget) startReclaimLocked() {
+	if b.reclaimRunning || b.pendingReclaim <= 0 {
+		return
+	}
+	bytes := b.pendingReclaim
+	cutoff := b.reclaimIssued
+	b.pendingReclaim = 0
+	b.reclaimRunning = true
+	go b.runReclaimBatch(bytes, cutoff)
+}
+
+func (b *memoryBudget) runReclaimBatch(bytes int64, cutoff uint64) {
+	if bytes <= 0 {
+		b.access.Lock()
+		b.reclaimRunning = false
+		b.signalLocked()
+		b.startReclaimLocked()
+		b.access.Unlock()
+		return
+	}
+	memoryScavengeAccess.Lock()
+	memoryScavenge()
+	memoryScavengeAccess.Unlock()
+
+	b.access.Lock()
+	b.used -= bytes
+	if b.used < 0 {
+		b.used = 0
+	}
+	if cutoff > b.reclaimCompleted {
+		b.reclaimCompleted = cutoff
+	}
+	b.reclaimRunning = false
+	b.updatePressureLocked(time.Now())
+	b.signalLocked()
+	// A GC can retire only the batch captured before it started. Any release that
+	// arrived while it ran remains pending and is immediately assigned a new batch.
+	b.startReclaimLocked()
+	b.access.Unlock()
 }
 
 func (b *memoryBudget) signalLocked() {

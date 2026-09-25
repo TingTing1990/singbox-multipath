@@ -78,8 +78,13 @@ func TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve(t *testing.T) {
 		t.Fatal("booster resumed above low watermark")
 	}
 	budget.release(first)
+	if budget.boosterAllowed() {
+		t.Fatal("booster resumed before detached physical credit completed reclaim")
+	}
+	cutoff := budget.reclaimCutoff()
+	budget.waitReclaim(cutoff)
 	if !budget.boosterAllowed() || !budget.reservePage(64, false) {
-		t.Fatal("booster did not resume")
+		t.Fatal("booster did not resume after physical reclaim")
 	}
 	budget.releaseSession(64)
 	cached := acquireTestMemory(t, budget, 64)

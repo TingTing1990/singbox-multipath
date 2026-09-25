@@ -143,39 +143,42 @@ type legShutdownRequest struct {
 }
 
 type mpLeg struct {
-	id                         uint8
-	ctx                        context.Context
-	cancel                     context.CancelFunc
-	conn                       net.Conn
-	readPreamble               func(net.Conn) error
-	send                       chan wireFrame
-	queueMu                    sync.Mutex
-	ready                      atomic.Bool
-	control                    chan wireFrame
-	telemetry                  chan struct{}
-	telemetryMu                sync.Mutex
-	telemetryFrame             wireFrame
-	telemetryPending           bool
-	shutdown                   chan legShutdownRequest
-	onClose                    func(error)
-	done                       chan struct{}
-	writerDone                 chan struct{}
-	readerDone                 chan struct{}
-	closeOne                   sync.Once
-	queuedBytes                atomic.Int64
-	writingBytes               atomic.Int64
-	writeStarted               atomic.Int64
-	transportWriteStarted      atomic.Int64
-	feedback                   chan wireFrame
-	startupFeedback            *wireFrame
-	path                       stream.Path
-	busy                       bool
-	received                   stream.Receipt
-	inflight                   atomic.Int64
-	prepaidFlights             int
-	peerTerminal               atomic.Bool
-	preferredCapacityRanges    []preferredCapacityPathRange
-	preferredCapacityRangeHead int
+	id                            uint8
+	ctx                           context.Context
+	cancel                        context.CancelFunc
+	conn                          net.Conn
+	readPreamble                  func(net.Conn) error
+	send                          chan wireFrame
+	queueMu                       sync.Mutex
+	ready                         atomic.Bool
+	control                       chan wireFrame
+	telemetry                     chan struct{}
+	telemetryMu                   sync.Mutex
+	telemetryFrame                wireFrame
+	telemetryPending              bool
+	shutdown                      chan legShutdownRequest
+	onClose                       func(error)
+	done                          chan struct{}
+	writerDone                    chan struct{}
+	readerDone                    chan struct{}
+	closeOne                      sync.Once
+	queuedBytes                   atomic.Int64
+	writingBytes                  atomic.Int64
+	writeStarted                  atomic.Int64
+	transportWriteStarted         atomic.Int64
+	feedback                      chan wireFrame
+	startupFeedback               *wireFrame
+	path                          stream.Path
+	busy                          bool
+	received                      stream.Receipt
+	inflight                      atomic.Int64
+	prepaidFlights                int
+	peerTerminal                  atomic.Bool
+	preferredCapacityRanges       []preferredCapacityPathRange
+	preferredCapacityRangeHead    int
+	recordMemory                  stream.RecordAllocator
+	preferredCapacityRangeBytes   int64
+	preferredCapacityRangeReserve [stream.RecordReserve]preferredCapacityPathRange
 }
 
 type mpCore struct {
@@ -268,6 +271,8 @@ type mpCore struct {
 	startedAt                  time.Time
 	mappings                   []dataMapping
 	mappingHead                int
+	mappingBytes               int64
+	mappingReserve             [stream.RecordReserve]dataMapping
 	feedbackDirty              bool
 }
 

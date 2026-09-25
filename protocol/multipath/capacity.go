@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
 const (
@@ -715,12 +717,26 @@ func (c *preferredCapacityController) snapshot() preferredCapacitySnapshot {
 // recordPreferredCapacityRange is called under core.stateMu after a successful
 // logical first-transmission mapping is created for leg0. Repair path sequence
 // ranges are intentionally absent.
-func (l *mpLeg) recordPreferredCapacityRange(start uint64, length int) {
+func (l *mpLeg) reservePreferredCapacityRange(primary bool) bool {
+	return stream.GrowRecords(&l.preferredCapacityRanges, &l.preferredCapacityRangeHead,
+		&l.preferredCapacityRangeBytes, l.preferredCapacityRangeReserve[:], l.recordMemory, 1, primary)
+}
+
+func (l *mpLeg) closePreferredCapacityRanges() {
+	stream.CloseRecords(&l.preferredCapacityRanges, &l.preferredCapacityRangeHead,
+		&l.preferredCapacityRangeBytes, l.preferredCapacityRangeReserve[:], l.recordMemory)
+}
+
+func (l *mpLeg) recordPreferredCapacityRange(start uint64, length int) bool {
 	if l == nil || length <= 0 {
-		return
+		return true
+	}
+	if !l.reservePreferredCapacityRange(true) {
+		return false
 	}
 	end := start + uint64(length)
 	l.preferredCapacityRanges = append(l.preferredCapacityRanges, preferredCapacityPathRange{next: start, end: end})
+	return true
 }
 
 // confirmPreferredCapacityDelivery consumes peer receipt progress through the
@@ -748,14 +764,7 @@ func (l *mpLeg) confirmPreferredCapacityDelivery(received uint64) uint64 {
 		l.preferredCapacityRanges[l.preferredCapacityRangeHead] = preferredCapacityPathRange{}
 		l.preferredCapacityRangeHead++
 	}
-	if l.preferredCapacityRangeHead == len(l.preferredCapacityRanges) {
-		l.preferredCapacityRanges = l.preferredCapacityRanges[:0]
-		l.preferredCapacityRangeHead = 0
-	} else if l.preferredCapacityRangeHead >= 256 && l.preferredCapacityRangeHead*2 >= len(l.preferredCapacityRanges) {
-		n := copy(l.preferredCapacityRanges, l.preferredCapacityRanges[l.preferredCapacityRangeHead:])
-		clear(l.preferredCapacityRanges[n:])
-		l.preferredCapacityRanges = l.preferredCapacityRanges[:n]
-		l.preferredCapacityRangeHead = 0
-	}
+	stream.TrimRecords(&l.preferredCapacityRanges, &l.preferredCapacityRangeHead,
+		&l.preferredCapacityRangeBytes, l.preferredCapacityRangeReserve[:], l.recordMemory, 256, 0)
 	return confirmed
 }
