@@ -100,8 +100,7 @@ func (m *testMemory) Acquire(bool) bool {
 	m.used++
 	return true
 }
-func (m *testMemory) Release(bool) bool { return false }
-func (m *testMemory) Retire()           { m.used-- }
+func (m *testMemory) Release(bool) { m.used-- }
 
 func TestPressureKeepsAcknowledgedBytesAndAdmitsHead(t *testing.T) {
 	memory := &testMemory{limit: 2}

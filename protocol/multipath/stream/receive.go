@@ -27,13 +27,7 @@ var (
 // The caller reserves at least one head page independently of speculative data.
 type PageMemory interface {
 	Acquire(head bool) bool
-	// Release updates prepaid-head ownership only. It returns true when this
-	// concrete page backing becomes the reusable prepaid head allocation. It does
-	// not return physical credit for non-prepaid pages.
-	Release(head bool) bool
-	// Retire is called only after Receiver has removed and nilled its last page
-	// pointer. The implementation may then hand PageCharge to asynchronous GC.
-	Retire()
+	Release(head bool)
 }
 
 type receivePage struct {
@@ -47,18 +41,17 @@ type receivePage struct {
 // Its sparse, byte-addressed pages bound metadata even for one-byte frames.
 // Individual path receipts do not belong to this state machine.
 type Receiver struct {
-	Next        uint64
-	ReadNext    uint64
-	WindowEnd   uint64
-	Capacity    uint64
-	FIN         uint64
-	HasFIN      bool
-	Pruned      uint64
-	Dropped     uint64
-	buffered    uint64
-	pages       map[uint64]*receivePage
-	prepaidHead *receivePage
-	memory      PageMemory
+	Next      uint64
+	ReadNext  uint64
+	WindowEnd uint64
+	Capacity  uint64
+	FIN       uint64
+	HasFIN    bool
+	Pruned    uint64
+	Dropped   uint64
+	buffered  uint64
+	pages     map[uint64]*receivePage
+	memory    PageMemory
 }
 
 func NewReceiver(capacity uint64, memory PageMemory) *Receiver {
@@ -141,13 +134,7 @@ func (r *Receiver) Insert(seq uint64, data []byte) (int, error) {
 				}
 			}
 			if admitted {
-				if head && r.prepaidHead != nil {
-					page = r.prepaidHead
-					r.prepaidHead = nil
-					page.head = true
-				} else {
-					page = &receivePage{head: head}
-				}
+				page = &receivePage{head: head}
 				r.pages[id] = page
 			}
 		}
@@ -238,8 +225,11 @@ func (r *Receiver) Consume(length int) {
 	r.ReadNext += uint64(length)
 	r.buffered -= uint64(length)
 	for id := old / PageSize; id < r.ReadNext/PageSize; id++ {
-		if r.pages[id] != nil {
-			r.removePage(id)
+		if page := r.pages[id]; page != nil {
+			delete(r.pages, id)
+			if r.memory != nil {
+				r.memory.Release(page.head)
+			}
 		}
 	}
 }
@@ -273,7 +263,10 @@ func (r *Receiver) pruneTail(keep uint64) bool {
 	page := r.pages[last]
 	r.Pruned += uint64(page.count)
 	r.buffered -= uint64(page.count)
-	r.removePage(last)
+	delete(r.pages, last)
+	if r.memory != nil {
+		r.memory.Release(page.head)
+	}
 	return true
 }
 
@@ -290,37 +283,12 @@ func (r *Receiver) Buffered() (bytes, outOfOrder uint64, pages int) {
 	return bytes, outOfOrder, pages
 }
 
-// Close removes every page owner and reports whether the prepaid head backing
-// itself existed. The caller transfers that reserved physical allocation into a
-// reclaim batch before releasing the session reservation.
-func (r *Receiver) Close() bool {
-	for id := range r.pages {
-		r.removePage(id)
+func (r *Receiver) Close() {
+	for id, page := range r.pages {
+		delete(r.pages, id)
+		if r.memory != nil {
+			r.memory.Release(page.head)
+		}
 	}
 	r.buffered = 0
-	hadPrepaid := r.prepaidHead != nil
-	r.prepaidHead = nil
-	return hadPrepaid
-}
-
-func (r *Receiver) removePage(id uint64) {
-	page := r.pages[id]
-	if page == nil {
-		return
-	}
-	delete(r.pages, id)
-	if r.memory == nil {
-		return
-	}
-	reuse := r.memory.Release(page.head)
-	if reuse {
-		clear(page.present[:])
-		page.count = 0
-		page.head = false
-		r.prepaidHead = page
-		return
-	}
-	// Do not call Retire while this stack still owns the page allocation.
-	page = nil
-	r.memory.Retire()
 }

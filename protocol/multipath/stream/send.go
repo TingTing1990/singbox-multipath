@@ -5,22 +5,13 @@ import "math"
 // Buffer ownership is shared only by the connection send queue and active
 // writers. ACK processing must not recycle bytes referenced by a blocked Write.
 type Buffer struct {
-	Data        []byte
-	refs        int
-	release     func()
-	releaseData func([]byte) func()
+	Data    []byte
+	refs    int
+	release func()
 }
 
 func NewBuffer(data []byte, release func()) *Buffer {
 	return &Buffer{Data: data, refs: 1, release: release}
-}
-
-// NewManagedBuffer is for memoryBudget-owned payloads. On the last reference,
-// Buffer first removes its own backing reference, then hands the detached slice
-// to the memory owner. Legacy NewBuffer callbacks remain unchanged for reserved
-// buffers whose callback intentionally transfers ownership elsewhere.
-func NewManagedBuffer(data []byte, release func([]byte) func()) *Buffer {
-	return &Buffer{Data: data, refs: 1, releaseData: release}
 }
 
 func (b *Buffer) Retain() {
@@ -34,21 +25,8 @@ func (b *Buffer) Release() {
 		panic("multipath: releasing unowned buffer")
 	}
 	b.refs--
-	if b.refs != 0 {
-		return
-	}
-	data, releaseData, release := b.Data, b.releaseData, b.release
-	b.Data, b.releaseData, b.release = nil, nil, nil
-	if releaseData != nil {
-		finish := releaseData(data)
-		data = nil
-		if finish != nil {
-			finish()
-		}
-		return
-	}
-	if release != nil {
-		release()
+	if b.refs == 0 && b.release != nil {
+		b.release()
 	}
 }
 
@@ -184,10 +162,9 @@ func (s *Sender) Acknowledge(next, windowEnd uint64) error {
 			segment.Length -= consumed
 			break
 		}
-		buffer := segment.Buffer
+		segment.Buffer.Release()
 		*segment = Segment{}
 		s.head++
-		buffer.Release()
 	}
 	TrimRecords(&s.segments, &s.head, &s.recordBytes, s.recordReserve[:], s.recordMemory, 1024, 0)
 	s.FINAcked = s.FINSent && next == s.FIN+1
@@ -200,11 +177,7 @@ func (s *Sender) Buffered() uint64 {
 
 func (s *Sender) Close() {
 	for i := s.head; i < len(s.segments); i++ {
-		buffer := s.segments[i].Buffer
-		s.segments[i] = Segment{}
-		if buffer != nil {
-			buffer.Release()
-		}
+		s.segments[i].Buffer.Release()
 	}
 	CloseRecords(&s.segments, &s.head, &s.recordBytes, s.recordReserve[:], s.recordMemory)
 }
