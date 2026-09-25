@@ -1,4 +1,4 @@
-name: Build Multipath Capacity
+name: Build Multipath Capacity A+B Memory Fix
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: multipath-mieru-inbound-v1-${{ inputs.source_ref }}
+  group: multipath-capacity-ab-memory-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
@@ -23,10 +23,12 @@ env:
   FROZEN_GOLDEN_TREE: '2b3c62cc0ee25af52d55411db918884208c42b6e'
   REPAIR_BASE_SHA: '7c3473ab86f7dd8cb7995b93574ad17001ed87c2'
   REPAIR_BASE_TREE: 'e343df90e9576b47364c4a910e62a0ec8db7424a'
+  F01_BASE_SHA: 'e4245b3e7c79b1b90f2b36ddec36e8af2e63c2a6'
+  F01_BASE_TREE: '9dc79da54ffa4604c4649050915c7c5edc9d04f0'
 
 jobs:
   audit_test:
-    name: Full-source Mieru inbound audit + independent simulation + regressions
+    name: Frozen-tree and A+B memory contract audit + simulation + regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
@@ -65,6 +67,8 @@ jobs:
           test "$(git rev-parse "${REPAIR_BASE_SHA}^{tree}")" = "$REPAIR_BASE_TREE"
           test "$(git merge-base "$REPAIR_BASE_SHA" "$FROZEN_GOLDEN_SHA")" = "$FROZEN_GOLDEN_SHA"
           test "$(git merge-base "$CANDIDATE_SHA" "$REPAIR_BASE_SHA")" = "$REPAIR_BASE_SHA"
+          test "$(git rev-parse "${F01_BASE_SHA}^{tree}")" = "$F01_BASE_TREE"
+          test "$(git merge-base "$CANDIDATE_SHA" "$F01_BASE_SHA")" = "$F01_BASE_SHA"
 
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
           echo "parent_sha=$FROZEN_GOLDEN_SHA" >> "$GITHUB_OUTPUT"
@@ -85,6 +89,19 @@ jobs:
           from pathlib import Path
           import hashlib
           expected={
+            'protocol/multipath/budget_stream.go':'175ac2591d7f3371343ba03ee09e16c4d78393eff495a0be78e2efdd2e7b0dd8',
+            'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
+            'protocol/multipath/core.go':'64e869f09e38d500a8d9f6907e4937833c7bd92bf759bf56ea8a7f553da1e7eb',
+            'protocol/multipath/f01_memory_test.go':'09166fb209556f2de4eaf7105f9df6bf830e73f80c1a90db73dbcc49ff75677f',
+            'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
+            'protocol/multipath/memory.go':'bbb2a042a0ba2a793cb5926f81467f0856ea2ac2023c454461c321308d87e22a',
+            'protocol/multipath/scheduler.go':'39c71e37e38a47dd9393e74767a30eb43cb7577f024329cf13c4bf82273053c4',
+            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
+            'protocol/multipath/stream/records_test.go':'f66daaacfc75eb676100cd1aaa94e21208ece1301c4b6e5efe09e7d1286a5f5f',
+            'protocol/multipath/stream/send.go':'34322b3677f5633e5d2ea0324c3d450a1d05788b6e64a39ca7de446124b630df',
+            'protocol/multipath/transport.go':'3be5769ee756fe69a154ebcd6f0cda1bbe190858796bbdf9396610a323ed96df',
+            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c',
             'include/registry.go':'7f37d2d09fb592953d077d664feb1c1c42ea2306a55f51355309c5eaaddf04be',
             'option/mieru.go':'37c7343f6e753ec5f1b9ec7d03cb8f7b73d1ec5260bad6e73aa2fdd560e1ce1d',
             'include/mieru_registry_test.go':'b63d99542a88451cc2cbc3ab406c43df1e407c647c886914f9e7d0986af5ad6f',
@@ -95,6 +112,13 @@ jobs:
             'protocol/mieru/outbound.go':'b6c38262650f65379bcf2b04e15e7d803f997e6987e0d2528c54cd64d39c2e76',
             'go.mod':'15549baff00a3988ea31d709a7ea3e77e30ce9e0618c48e4a2fc2bcb801e9b8d',
             'go.sum':'8b32b50751e8839951ae5082bc082cc20ab1e860b10a5068bb8695c2fca2e41e',
+            'protocol/multipath/memory_test.go':'ea2d06019d4b4f60d0bcc93ad8aabab1160f88c4f3ce8999d9e7933b09c13b90',
+            'protocol/multipath/recovery_packet.go':'16ccd1fdaaf7b2c5fd0ff88e7423a3aa4df1e99eff8e4f056afa3b5dcbd2f1d5',
+            'protocol/multipath/stream/receive.go':'2027ef764f08297b3cce8700cd8f031783983a33e24377781ccadf35c9e73f05',
+            'protocol/multipath/stream/stream_test.go':'1b32c83b8185c353d0e9ee6ba5f3df9e04500123f8f418dab8fcc930fce0e079',
+            'protocol/multipath/f01_staged_ack_test.go':'775af226cdf2dd06f637504d2e846df8344e8291ee9e101a37b9ae8375038547',
+            'protocol/multipath/physical_credit_test.go':'b2af4f756d3e0f21c9ddfe18f723ba31270839ae0922ea7e9bb1b2387f9246dd',
+            'protocol/multipath/stream/physical_credit_test.go':'a8020790d26415e32390602a6754b7b63605f6d5c868eb582231c072b9848f44',
           }
           for path,want in expected.items():
               got=hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -139,7 +163,7 @@ jobs:
 
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-      - name: Full-source architecture audit - 10 independent domains
+      - name: Complete-tree identity and 10 architecture contract checks
         shell: bash
         run: |
           set -euo pipefail
@@ -154,11 +178,19 @@ jobs:
           FROZEN_TREE=os.environ['FROZEN_GOLDEN_TREE']
           REPAIR_SHA=os.environ['REPAIR_BASE_SHA']
           REPAIR_TREE=os.environ['REPAIR_BASE_TREE']
+          F01_SHA=os.environ['F01_BASE_SHA']
+          F01_TREE=os.environ['F01_BASE_TREE']
+          F01_M={'protocol/multipath/stream/stream_test.go', 'protocol/multipath/stream/send.go', 'protocol/multipath/stream/path.go', 'protocol/multipath/capacity.go', 'protocol/multipath/core.go', 'protocol/multipath/budget_stream.go', 'protocol/multipath/stream/receive.go', 'protocol/multipath/types.go', 'protocol/multipath/memory_test.go', 'protocol/multipath/memory.go', 'protocol/multipath/scheduler.go', 'protocol/multipath/recovery_packet.go', 'protocol/multipath/transport.go'}
+          F01_A={'protocol/multipath/stream/records_test.go', 'protocol/multipath/stream/records.go', 'protocol/multipath/f01_retention_contract_test.go', 'protocol/multipath/stream/physical_credit_test.go', 'protocol/multipath/physical_credit_test.go', 'protocol/multipath/f01_staged_ack_test.go', 'protocol/multipath/f01_memory_test.go'}
+          F01_HASH={'protocol/multipath/budget_stream.go': '175ac2591d7f3371343ba03ee09e16c4d78393eff495a0be78e2efdd2e7b0dd8', 'protocol/multipath/capacity.go': 'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd', 'protocol/multipath/core.go': '64e869f09e38d500a8d9f6907e4937833c7bd92bf759bf56ea8a7f553da1e7eb', 'protocol/multipath/memory.go': 'bbb2a042a0ba2a793cb5926f81467f0856ea2ac2023c454461c321308d87e22a', 'protocol/multipath/memory_test.go': 'ea2d06019d4b4f60d0bcc93ad8aabab1160f88c4f3ce8999d9e7933b09c13b90', 'protocol/multipath/recovery_packet.go': '16ccd1fdaaf7b2c5fd0ff88e7423a3aa4df1e99eff8e4f056afa3b5dcbd2f1d5', 'protocol/multipath/scheduler.go': '39c71e37e38a47dd9393e74767a30eb43cb7577f024329cf13c4bf82273053c4', 'protocol/multipath/stream/path.go': '940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f', 'protocol/multipath/stream/receive.go': '2027ef764f08297b3cce8700cd8f031783983a33e24377781ccadf35c9e73f05', 'protocol/multipath/stream/send.go': '34322b3677f5633e5d2ea0324c3d450a1d05788b6e64a39ca7de446124b630df', 'protocol/multipath/stream/stream_test.go': '1b32c83b8185c353d0e9ee6ba5f3df9e04500123f8f418dab8fcc930fce0e079', 'protocol/multipath/transport.go': '3be5769ee756fe69a154ebcd6f0cda1bbe190858796bbdf9396610a323ed96df', 'protocol/multipath/types.go': '36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c', 'protocol/multipath/f01_memory_test.go': '09166fb209556f2de4eaf7105f9df6bf830e73f80c1a90db73dbcc49ff75677f', 'protocol/multipath/f01_retention_contract_test.go': '331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed', 'protocol/multipath/f01_staged_ack_test.go': '775af226cdf2dd06f637504d2e846df8344e8291ee9e101a37b9ae8375038547', 'protocol/multipath/physical_credit_test.go': 'b2af4f756d3e0f21c9ddfe18f723ba31270839ae0922ea7e9bb1b2387f9246dd', 'protocol/multipath/stream/physical_credit_test.go': 'a8020790d26415e32390602a6754b7b63605f6d5c868eb582231c072b9848f44', 'protocol/multipath/stream/records.go': 'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903', 'protocol/multipath/stream/records_test.go': 'f66daaacfc75eb676100cd1aaa94e21208ece1301c4b6e5efe09e7d1286a5f5f'}
           REPAIR_M={'include/registry.go','option/mieru.go'}
           REPAIR_A={'include/mieru_registry_test.go','protocol/mieru/inbound.go','protocol/mieru/inbound_test.go'}
           FIX_M={'protocol/mieru/inbound.go','protocol/mieru/inbound_test.go','protocol/multipath/inbound.go','protocol/multipath/server_audit_test.go'}
           TOTAL_M=REPAIR_M|{'protocol/multipath/inbound.go','protocol/multipath/server_audit_test.go'}
-          TOTAL_A=REPAIR_A
+          FIX_M=FIX_M|F01_M
+          FIX_A=F01_A
+          TOTAL_M=TOTAL_M|F01_M
+          TOTAL_A=REPAIR_A|F01_A
 
           def req(value,message):
               if not value: raise RuntimeError(message)
@@ -191,6 +223,8 @@ jobs:
           req(git(REPAIR,'rev-parse','HEAD^{tree}')==REPAIR_TREE,'repair-base tree mismatch')
           req(git(ROOT,'merge-base',head,REPAIR_SHA)==REPAIR_SHA,'candidate is not descendant of fixed repair base')
           req(git(ROOT,'merge-base',REPAIR_SHA,FROZEN)==FROZEN,'repair base is not descendant of fixed Golden')
+          req(git(ROOT,'rev-parse',F01_SHA+'^{tree}')==F01_TREE,'F01 base tree mismatch')
+          req(git(ROOT,'merge-base',head,F01_SHA)==F01_SHA,'candidate not descendant of frozen F01 base')
           req(not git(ROOT,'status','--porcelain'),'candidate checkout is dirty before audit')
           passline(1,'provenance',f'golden={FROZEN[:12]} repair={REPAIR_SHA[:12]} candidate={head[:12]}')
 
@@ -198,10 +232,17 @@ jobs:
           _,_,rm,ra,rd=delta(GOLDEN,REPAIR)
           req(rm==REPAIR_M and ra==REPAIR_A and not rd,f'Golden->repair delta M={sorted(rm)} A={sorted(ra)} D={sorted(rd)}')
           _,_,fm,fa,fd=delta(REPAIR,ROOT)
-          req(fm==FIX_M and not fa and not fd,f'repair->candidate delta M={sorted(fm)} A={sorted(fa)} D={sorted(fd)}')
+          req(fm==FIX_M and fa==FIX_A and not fd,f'repair->candidate delta M={sorted(fm)} A={sorted(fa)} D={sorted(fd)}')
           _,_,tm,ta,td=delta(GOLDEN,ROOT)
           req(tm==TOTAL_M and ta==TOTAL_A and not td,f'Golden->candidate delta M={sorted(tm)} A={sorted(ta)} D={sorted(td)}')
-          passline(2,'write-set','Golden 4M/3A overall; repair delta exactly 4M/0A/0D')
+          raw=git(ROOT,'diff','--name-status','--no-renames',F01_SHA,head)
+          delta_f01={'M':set(),'A':set(),'D':set()}
+          for line in raw.splitlines():
+              status,path=line.split('\t',1)
+              req(status in delta_f01,'unapproved F01 status '+status)
+              delta_f01[status].add(path)
+          req(delta_f01=={'M':F01_M,'A':F01_A,'D':set()},'F01 exact delta mismatch')
+          passline(2,'write-set','Golden/repair contracts preserved; A+B memory delta 13M/7A/0D from e4245')
 
           # 03 complete-tree freeze: mode/blob identity outside the approved sets, including gitlinks.
           gm,cm,_,_,_=delta(GOLDEN,ROOT)
@@ -245,12 +286,15 @@ jobs:
               req(needle in src,'UDP invariant missing: '+needle)
           passline(7,'udp-contract','RSV/FRAG validation + buffer ownership + TCP-over-stream packet routing')
 
-          # 08 Multipath data plane remains frozen; only approved audit logging/test files may differ.
-          for rel in ('protocol/multipath/scheduler.go','protocol/multipath/capacity.go','protocol/multipath/wire.go','protocol/multipath/memory.go','option/multipath.go'):
-              req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'Multipath data-plane drift '+rel)
+          # 08 A+B memory changes only these exact reviewed bytes. Other protocol/config bytes stay frozen.
+          for rel,want in F01_HASH.items():
+              req(hash_file(ROOT,rel)==want,'unapproved F01 identity '+rel)
+              req(tracked(ROOT)[rel][0]=='100644','unapproved F01 mode '+rel)
+          for rel in ('protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/activation.go','option/multipath.go'):
+              req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'Multipath protocol/control drift '+rel)
           mp=text(ROOT,'protocol/multipath/inbound.go')
           req('instance=", strconv.Quote(i.Tag())' in mp,'CAP_AUDIT_DROPPED instance quoting fix missing')
-          passline(8,'multipath-isolation','scheduler/capacity/wire/memory frozen; only audit log schema repair allowed')
+          passline(8,'multipath-isolation','A+B exact 20 file hashes; wire/config/activation frozen; CAP_AUDIT repair preserved')
 
           # 09 regression coverage must exist for every repaired contract.
           mt=text(ROOT,'protocol/mieru/inbound_test.go'); at=text(ROOT,'protocol/multipath/server_audit_test.go')
@@ -270,7 +314,7 @@ jobs:
           for rel in ('release/DEFAULT_BUILD_TAGS_OTHERS','release/LDFLAGS'):
               req(tracked(ROOT)[rel]==tracked(GOLDEN)[rel],'build input drift '+rel)
           passline(10,'build-registry','registry/options/build tags/ldflags bounded and frozen')
-          print('ALL 10 DISTINCT FULL-SOURCE ARCHITECTURE AUDIT DOMAINS PASS')
+          print('ALL 10 AUTOMATED ARCHITECTURE CONTRACT CHECKS PASS; NOT TEN INDEPENDENT FULL-SOURCE REVIEWS')
           PYAUDIT
           python3 "${RUNNER_TEMP}/freeze-audit.py" | tee "${EVIDENCE_DIR}/full-source-audit.log"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -678,6 +722,22 @@ jobs:
             ('07-invalid-transport-accepted','protocol/mieru/inbound.go','\tif options.Transport != "TCP" && options.Transport != "UDP" {','\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
             ('08-empty-users-accepted','protocol/mieru/inbound.go','\tif len(options.Users) == 0 {','\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
             ('09-empty-password-accepted','protocol/mieru/inbound.go','\t\tif user.Password == "" {','\t\tif false {',r'^TestFreezeIndependentValidationBoundaries$','./protocol/mieru'),
+            ('10-memory-no-next-batch','protocol/multipath/memory.go',
+             '\t// A GC can retire only the batch captured before it started. Any release that\n\t// arrived while it ran remains pending and is immediately assigned a new batch.\n\tb.startReclaimLocked()\n',
+             '\t// mutant: next pending batch is never restarted\n',
+             r'^TestPhysicalCreditReclaimDuringGCStartsNextBatch$','./protocol/multipath'),
+            ('11-memory-early-credit','protocol/multipath/memory.go',
+             '\tb.pendingReclaim += bytes\n\tb.reclaimIssued++\n',
+             '\tb.pendingReclaim += bytes\n\tb.used -= bytes\n\tb.reclaimIssued++\n',
+             r'^TestPhysicalCreditSenderDetachBeforeBatchCredit$','./protocol/multipath'),
+            ('12-sender-release-before-detach','protocol/multipath/stream/send.go',
+             '\t\tbuffer := segment.Buffer\n\t\t*segment = Segment{}\n\t\ts.head++\n\t\tbuffer.Release()\n',
+             '\t\tbuffer := segment.Buffer\n\t\tbuffer.Release()\n\t\t*segment = Segment{}\n\t\ts.head++\n',
+             r'^TestManagedBufferDetachPrecedesReleaseCallback$','./protocol/multipath/stream'),
+            ('13-staged-ack-retains-dynamic','protocol/multipath/stream/records.go',
+             '\tif *charged > 0 && live+spare <= len(fixed) {\n',
+             '\tif *charged > 0 && live+spare <= len(fixed) && *head >= compactAt {\n',
+             r'^TestRecordStorageSenderStagedACKTail$','./protocol/multipath/stream'),
           ]
 
           def run(cmd,cwd,env=None):
@@ -749,8 +809,8 @@ jobs:
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
-          # 10: commit an unapproved scheduler byte change and prove the full-tree audit rejects it.
-          name='10-golden-scheduler-drift'; work=temp/name
+          # 14: commit an unapproved scheduler byte change and prove the full-tree audit rejects it.
+          name='14-golden-scheduler-drift'; work=temp/name
           subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
           try:
               scheduler=work/'protocol/multipath/scheduler.go'
@@ -766,15 +826,15 @@ jobs:
           finally:
               subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
               subprocess.run(['git','worktree','prune'],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 10 EXECUTABLE WRONG VARIANTS KILLED')
+          print('ALL 14 EXECUTABLE WRONG VARIANTS KILLED')
           PYMUT
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-      - name: Check formatting of exact Mieru inbound write-set
+      - name: Check formatting of exact Mieru and A+B memory write-set
         shell: bash
         run: |
           set -euo pipefail
-          files=(option/mieru.go include/registry.go include/mieru_registry_test.go protocol/mieru/inbound.go protocol/mieru/inbound_test.go protocol/multipath/inbound.go protocol/multipath/server_audit_test.go)
+          files=(option/mieru.go include/registry.go include/mieru_registry_test.go protocol/mieru/inbound.go protocol/mieru/inbound_test.go protocol/multipath/inbound.go protocol/multipath/server_audit_test.go protocol/multipath/budget_stream.go protocol/multipath/capacity.go protocol/multipath/core.go protocol/multipath/memory.go protocol/multipath/memory_test.go protocol/multipath/recovery_packet.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go protocol/multipath/stream/receive.go protocol/multipath/stream/send.go protocol/multipath/stream/stream_test.go protocol/multipath/transport.go protocol/multipath/types.go protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go protocol/multipath/f01_staged_ack_test.go protocol/multipath/physical_credit_test.go protocol/multipath/stream/physical_credit_test.go protocol/multipath/stream/records.go protocol/multipath/stream/records_test.go)
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
 
@@ -782,7 +842,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go vet -tags "$BUILD_TAGS" ./option ./include ./protocol/mieru ./protocol/multipath
+          go vet -tags "$BUILD_TAGS" ./option ./include ./protocol/mieru ./protocol/multipath/...
 
       - name: Compile all repository packages without running tests
         shell: bash
@@ -821,11 +881,43 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=1 go test -race -count=100 -timeout=15m -tags "$BUILD_TAGS" -run '^TestPreferredCapacity' ./protocol/multipath
 
+      - name: A+B memory contracts and reproduced blind spots with race detector
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_name in TestF01PendingWriteSurvivesRecordPressure TestF01CacheDropsCheckedOutReferences TestF01RetainedCapacityAcrossIdleSessions TestIndependentRetentionContract TestIndependentRetentionContractStagedACK TestPhysicalCreditReclaimDuringGCStartsNextBatch TestPhysicalCreditCloseWaitsOnlyCapturedCutoff TestPhysicalCreditPageAdmissionNeverWaitsForGC TestPhysicalCreditSenderDetachBeforeBatchCredit TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve; do
+            go test -tags "$BUILD_TAGS" -list "^${test_name}$" ./protocol/multipath | grep -Fx "$test_name"
+          done
+          for test_name in TestRecordStorageSenderAccounting TestRecordStorageGrowthChargesBothAllocations TestRecordStorageDeniedGrowthKeepsCallerOwnership TestRecordStoragePathEmergencyReserve TestRecordStoragePathReceiptLifecycle TestRecordStorageSenderStagedACKTail TestManagedBufferDetachPrecedesReleaseCallback TestPrepaidHeadPageReusesSameBacking; do
+            go test -tags "$BUILD_TAGS" -list "^${test_name}$" ./protocol/multipath/stream | grep -Fx "$test_name"
+          done
+
+          # Exact reproduced A capacity paths, including the staged-ACK blind spot.
+          CGO_ENABLED=1 go test -race -count=10 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestIndependentRetentionContract|TestIndependentRetentionContractStagedACK|TestF01PendingWriteSurvivesRecordPressure|TestF01CacheDropsCheckedOutReferences|TestF01RetainedCapacityAcrossIdleSessions|TestMemoryBudgetBoosterBackpressurePreservesPrimaryReserve)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/ab-capacity-contracts.log"
+
+          # B state-machine/credit/ownership paths. These are cheap and deterministic, so x100.
+          CGO_ENABLED=1 go test -race -count=100 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestPhysicalCreditReclaimDuringGCStartsNextBatch|TestPhysicalCreditCloseWaitsOnlyCapturedCutoff|TestPhysicalCreditPageAdmissionNeverWaitsForGC|TestPhysicalCreditSenderDetachBeforeBatchCredit)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/ab-physical-credit.log"
+          CGO_ENABLED=1 go test -race -count=100 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestRecordStorageSenderStagedACKTail|TestManagedBufferDetachPrecedesReleaseCallback|TestPrepaidHeadPageReusesSameBacking)$' \
+            ./protocol/multipath/stream 2>&1 | tee "${EVIDENCE_DIR}/ab-stream-ownership.log"
+
+      - name: A+B admission, pressure and close regressions with race detector x10
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestMemoryBudgetSessionAdmissionIsReleased|TestCoreMemoryPressureKeepsLeg0Available|TestFlowBidirectionalStallAndMemoryPressure|TestBeta5BidirectionalByteStream|TestBeta5SecondaryFailureDoesNotCloseSession|TestApplicationCloseDrainsAcrossTransientLegs)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/ab-admission-close-regression.log"
+
       - name: Multipath correctness regression with race detector
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=1 -timeout=15m -skip '^TestPerformanceHealthyLinks$' -tags "$BUILD_TAGS" ./protocol/multipath
+          CGO_ENABLED=1 go test -race -count=1 -timeout=15m -skip '^TestPerformanceHealthyLinks$' -tags "$BUILD_TAGS" ./protocol/multipath/...
 
       - name: Parent vs candidate zero-field performance differential
         shell: bash
@@ -1026,7 +1118,7 @@ jobs:
             -skip '^TestPerformanceHealthyLinks$' \
             -tags "$BUILD_TAGS" \
             ./option \
-            ./protocol/multipath \
+            ./protocol/multipath/... \
             ./protocol/mieru \
             ./include
 
@@ -1042,7 +1134,7 @@ jobs:
             -tags "$BUILD_TAGS" \
             -ldflags "$LDFLAGS_SHARED" \
             ./option \
-            ./protocol/multipath \
+            ./protocol/multipath/... \
             ./protocol/mieru \
             ./include
 
