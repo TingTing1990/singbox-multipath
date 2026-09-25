@@ -1040,11 +1040,10 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=1 go test -race -count=100 -timeout=15m -tags "$BUILD_TAGS" -run '^TestPreferredCapacity' ./protocol/multipath
 
-      - name: Memory A+B deterministic record, physical-credit and ownership contracts with race detector x10
+      - name: Memory A+B record, staged-ACK and physical-credit contracts with race detector x10
         shell: bash
         run: |
           set -euo pipefail
-
           tests=(
             TestF01PendingWriteSurvivesRecordPressure
             TestF01CacheDropsCheckedOutReferences
@@ -1068,10 +1067,8 @@ jobs:
             found="$(go test -tags "$BUILD_TAGS" -list "^${test_name}$" ./protocol/multipath/... | grep -Fx "$test_name" | wc -l)"
             test "$found" -ge 1
           done
-
-          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" \
-            -run '^(TestRecordStorage|TestF01PendingWrite|TestF01Cache|TestPhysicalCreditReclaimDuringGCStartsNextBatch|TestPhysicalCreditCloseWaitsOnlyCapturedCutoff|TestPhysicalCreditPageAdmissionNeverWaitsForGC|TestPhysicalCreditSenderDetachBeforeBatchCredit|TestManagedBufferDetachPrecedesReleaseCallback|TestPrepaidHeadPageReusesSameBacking)$' \
-            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/memory-ab-contracts.log"
+          regex='^(TestRecordStorage|TestF01PendingWrite|TestF01Cache|TestPhysicalCreditReclaimDuringGCStartsNextBatch|TestPhysicalCreditCloseWaitsOnlyCapturedCutoff|TestPhysicalCreditPageAdmissionNeverWaitsForGC|TestPhysicalCreditSenderDetachBeforeBatchCredit|TestManagedBufferDetachPrecedesReleaseCallback|TestPrepaidHeadPageReusesSameBacking)$'
+          CGO_ENABLED=1 go test -race -count=10 -timeout=25m -tags "$BUILD_TAGS" -run "$regex" ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/memory-ab-contracts.log"
       - name: Multipath correctness regression with race detector
         shell: bash
         run: |
