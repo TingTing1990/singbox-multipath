@@ -115,10 +115,6 @@ jobs:
             'protocol/multipath/audit/timeline.go':'5a6ed05bb13db5ef3c7da99bb2aaa31c8dd2a7f3bb931be58fafa1b1c4084316',
             'protocol/multipath/audit/timeline_v3_test.go':'0c7727a465aadd1c22f72dad962b6de92577dfcc080471b42d6aebdafc40e783',
             'protocol/multipath/audit/v3_test_helpers_test.go':'2b9766a8c5b9624ac4358db602b2162425fbb3d87b36c29bee8c7135c10b58e4',
-            'protocol/multipath/audit/testdata/field/field-01-mp-in-39002.log':'dbe979a1f2603b6fa4cfcc3ffe24805de5dcf57d4d24f4c21733f91f21be8de8',
-            'protocol/multipath/audit/testdata/field/field-02-mp-in-39002.log':'97c843c71742ea3f8cb898335d8956bdea387bde0593818ed1dc0841d78d31dd',
-            'protocol/multipath/audit/testdata/field/field-03-speedtest-mp-in-39001.log':'ba29a7eea755d5992d1525ed5a1786ee6a790976729b05dae3e37ad8b6370b52',
-            'protocol/multipath/audit/testdata/field/field-04-video-mp-in-39001.log':'9dcab9f93f6ba3b091461264dd4ad664756714acd4b16f625f64453dc569c3bf',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -182,11 +178,7 @@ jobs:
             'protocol/multipath/audit/field_replay.go','protocol/multipath/audit/field_replay_test.go',
             'protocol/multipath/audit/status.go','protocol/multipath/audit/status_v3_test.go',
             'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
-            'protocol/multipath/audit/v3_test_helpers_test.go',
-            'protocol/multipath/audit/testdata/field/field-01-mp-in-39002.log',
-            'protocol/multipath/audit/testdata/field/field-02-mp-in-39002.log',
-            'protocol/multipath/audit/testdata/field/field-03-speedtest-mp-in-39001.log',
-            'protocol/multipath/audit/testdata/field/field-04-video-mp-in-39001.log'}
+            'protocol/multipath/audit/v3_test_helpers_test.go'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
@@ -235,7 +227,7 @@ jobs:
           gt,rt=tracked(GOLDEN),tracked(ROOT)
           mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
           req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
-          print('PASS exact Golden delta 12M/29A/0D including modes/gitlinks')
+          print('PASS exact Golden delta 12M/25A/0D including modes/gitlinks')
           for rel,(mode,oid) in gt.items():
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
@@ -372,6 +364,45 @@ jobs:
             -run '^TestPreferredCapacity' ./protocol/multipath \
             2>&1 | tee "${EVIDENCE_DIR}/capacity-v2-impacted.log"
 
+      - name: Materialize privacy-safe V3 FIELD replay fixtures in runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIXTURE_DIR="protocol/multipath/audit/testdata/field"
+          test ! -e "protocol/multipath/audit/testdata"
+          mkdir -p "$FIXTURE_DIR"
+
+          cat > "$FIXTURE_DIR/field-01-mp-in-39002.log" <<'EOF'
+          multipath session established to fixture.invalid:443 on leg 0
+          multipath leg 1 joined session for fixture.invalid:443
+          multipath leg1 joined data path: side=server destination=fixture.invalid:443 reconnect=false reason=bytes current_bytes=3145728 threshold_bytes=2097152
+          EOF
+
+          cat > "$FIXTURE_DIR/field-02-mp-in-39002.log" <<'EOF'
+          multipath session established to example.invalid:443 on leg 0
+          multipath leg 1 joined session for example.invalid:443
+          multipath leg1 joined data path: side=server destination=example.invalid:443 reconnect=false reason=bytes current_bytes=4194304 threshold_bytes=2097152
+          EOF
+
+          cat > "$FIXTURE_DIR/field-03-speedtest-mp-in-39001.log" <<'EOF'
+          CAP_AUDIT schema_version=1 event_seq=1 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:00:01Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=962.20 delivery_ready=true protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=689.26 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=2 event=CAP_GATE_OPENED side=server instance="mp-in-fixture" session_id="fixture-session" destination="fixture.invalid:443" at=2026-01-01T00:00:02Z original_trigger=bytes original_trigger_satisfied=true recovery_bypass=false target_mbps=640.00 delivery_mbps=962.20 delivery_ready=true protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=689.26 degrade_windows=0 normal_booster_admitted=true current_bytes=4194304 threshold_bytes=2097152 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=3 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:00:03Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=29.65 delivery_ready=false protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=21.35 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=2
+          EOF
+
+          cat > "$FIXTURE_DIR/field-04-video-mp-in-39001.log" <<'EOF'
+          CAP_AUDIT schema_version=1 event_seq=1 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:01:01Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=244.17 delivery_ready=false protected_mbps=0.00 protection_valid=false protection_active=false preferred_assignment_mbps=207.36 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=2 event=CAP_GATE_BLOCKED side=server instance="mp-in-fixture" session_id="fixture-session" destination="fixture.invalid:443" at=2026-01-01T00:01:02Z original_trigger=bytes original_trigger_satisfied=true recovery_bypass=false target_mbps=640.00 delivery_mbps=244.17 delivery_ready=false protected_mbps=0.00 protection_valid=false protection_active=false preferred_assignment_mbps=207.36 degrade_windows=0 normal_booster_admitted=false current_bytes=3145728 threshold_bytes=2097152 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          EOF
+
+          test "$(find "$FIXTURE_DIR" -maxdepth 1 -type f -name 'field-*.log' | wc -l)" -eq 4
+          if grep -RInE '([0-9]{1,3}\.){3}[0-9]{1,3}|@[A-Za-z0-9._-]+|session_id="[0-9a-fA-F]{6,}"' "$FIXTURE_DIR"; then
+            echo 'ERROR: privacy-safe replay fixture contains forbidden raw FIELD identifier pattern' >&2
+            exit 71
+          fi
+          sha256sum "$FIXTURE_DIR"/*.log | tee "${EVIDENCE_DIR}/server-audit-v3-ci-fixture-sha256.txt"
+          echo 'PASS privacy-safe V3 FIELD-derived fixtures materialized only in runner workspace'
+
       - name: Server Audit V2 plus V3 audit package contracts x20
         shell: bash
         run: |
@@ -431,13 +462,25 @@ jobs:
           print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
           PY
 
-      - name: Server Audit V3 real FIELD replay diagnostic closure gate
+      - name: Server Audit V3 journal-only FIELD closure negative control
         shell: bash
         run: |
           set -euo pipefail
+          LOG="${EVIDENCE_DIR}/server-audit-v3-field-replay-negative-control.log"
+          set +e
           AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -count=1 -timeout=10m -tags "$BUILD_TAGS" \
             -run '^TestFieldReplayDiagnosticClosureGate$' ./protocol/multipath/audit \
-            2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-field-replay.log"
+            2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$rc" -eq 0 ]]; then
+            echo 'ERROR: journal-only FIELD evidence was falsely accepted as diagnostically closed' >&2
+            exit 72
+          fi
+          grep -F 'diagnostic closure failed:' "$LOG"
+          grep -F 'missing status traces: historical journal alone cannot provide useful aggregate or both-leg delivery' "$LOG"
+          grep -F 'missing single-path status baselines' "$LOG"
+          echo 'PASS journal-only FIELD evidence fails closed exactly as V3 requires'
 
       - name: Existing repeated-booster-disconnect regression x20
         shell: bash
@@ -625,6 +668,13 @@ jobs:
           if failed: raise SystemExit('FAIL repaired zero-field performance below 98% Golden')
           print('PASS repaired retains >=98% Golden performance for all fixtures')
           PY
+
+      - name: Remove runner-only V3 FIELD replay fixtures
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf protocol/multipath/audit/testdata
 
       - name: Verify workspace remained pristine
         shell: bash
