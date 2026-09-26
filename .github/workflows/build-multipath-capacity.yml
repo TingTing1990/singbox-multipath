@@ -1,4 +1,4 @@
-name: Build Multipath Capacity Server Audit V2
+name: Build Multipath Capacity Server Audit V3
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: multipath-server-audit-v2-${{ inputs.source_ref }}
+  group: multipath-server-audit-v3-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
@@ -105,6 +105,20 @@ jobs:
             'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
             'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
             'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
+            'protocol/multipath/audit/aggregation.go':'219c7fbb971300c3de4012f35636be4cfd4ddce3647c2102dcd112e3e4186cbd',
+            'protocol/multipath/audit/aggregation_v3_test.go':'95f9ade90a6818a81259f7033deeee8683886615c065d64bb2f71c9fa6c8131c',
+            'protocol/multipath/audit/diagnosis.go':'43303a5830becd85c518561b0db4a180fe3e38df324f681baba0d997e347ea86',
+            'protocol/multipath/audit/field_replay.go':'11d9a27b42d374d76b707653606a5de9611c1cc1958f6b1c737617022422806c',
+            'protocol/multipath/audit/field_replay_test.go':'feaa9cf5398fac02e15adb6dfb0eb3fef8634199a1e318f6011d97a53d7ec743',
+            'protocol/multipath/audit/status.go':'c19e6843219a1c1272fa500dde3f53589929450642ca669af64dfa77faa79c47',
+            'protocol/multipath/audit/status_v3_test.go':'51324992963a058f86a1874c7ebd2aa843cab36c07a8adf632aa28bde27a415f',
+            'protocol/multipath/audit/timeline.go':'5a6ed05bb13db5ef3c7da99bb2aaa31c8dd2a7f3bb931be58fafa1b1c4084316',
+            'protocol/multipath/audit/timeline_v3_test.go':'0c7727a465aadd1c22f72dad962b6de92577dfcc080471b42d6aebdafc40e783',
+            'protocol/multipath/audit/v3_test_helpers_test.go':'2b9766a8c5b9624ac4358db602b2162425fbb3d87b36c29bee8c7135c10b58e4',
+            'protocol/multipath/audit/testdata/field/field-01-mp-in-39002.log':'dbe979a1f2603b6fa4cfcc3ffe24805de5dcf57d4d24f4c21733f91f21be8de8',
+            'protocol/multipath/audit/testdata/field/field-02-mp-in-39002.log':'97c843c71742ea3f8cb898335d8956bdea387bde0593818ed1dc0841d78d31dd',
+            'protocol/multipath/audit/testdata/field/field-03-speedtest-mp-in-39001.log':'ba29a7eea755d5992d1525ed5a1786ee6a790976729b05dae3e37ad8b6370b52',
+            'protocol/multipath/audit/testdata/field/field-04-video-mp-in-39001.log':'9dcab9f93f6ba3b091461264dd4ad664756714acd4b16f625f64453dc569c3bf',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -163,7 +177,16 @@ jobs:
             'protocol/multipath/audit/analyzer.go','protocol/multipath/audit/audit_test.go',
             'protocol/multipath/audit/coverage.go','protocol/multipath/audit/event.go',
             'protocol/multipath/audit/event_type.go','protocol/multipath/audit/parser.go',
-            'protocol/multipath/audit/schema.go'}
+            'protocol/multipath/audit/schema.go','protocol/multipath/audit/aggregation.go',
+            'protocol/multipath/audit/aggregation_v3_test.go','protocol/multipath/audit/diagnosis.go',
+            'protocol/multipath/audit/field_replay.go','protocol/multipath/audit/field_replay_test.go',
+            'protocol/multipath/audit/status.go','protocol/multipath/audit/status_v3_test.go',
+            'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
+            'protocol/multipath/audit/v3_test_helpers_test.go',
+            'protocol/multipath/audit/testdata/field/field-01-mp-in-39002.log',
+            'protocol/multipath/audit/testdata/field/field-02-mp-in-39002.log',
+            'protocol/multipath/audit/testdata/field/field-03-speedtest-mp-in-39001.log',
+            'protocol/multipath/audit/testdata/field/field-04-video-mp-in-39001.log'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
@@ -212,7 +235,7 @@ jobs:
           gt,rt=tracked(GOLDEN),tracked(ROOT)
           mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
           req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
-          print('PASS exact Golden delta 12M/15A/0D including modes/gitlinks')
+          print('PASS exact Golden delta 12M/29A/0D including modes/gitlinks')
           for rel,(mode,oid) in gt.items():
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
@@ -257,6 +280,23 @@ jobs:
           req('github.com/sagernet/sing-box/protocol/multipath/audit' not in prod,'Server Audit V2 leaked into frozen multipath runtime')
           req('SupportOpen' in (audit_dir/'coverage.go').read_text() and 'RequiresFrozenHook: true' in (audit_dir/'coverage.go').read_text(),'OPEN frozen-hook coverage contract missing')
           print('PASS Server Audit V2 is read-only/offline and does not enter frozen runtime control/data paths')
+          v2_expected={
+            'analyzer.go':'dcda89bfc030f9c135e1851b24e54853b8aa88006b57e1ec56712f6d9e86e4c4',
+            'audit_test.go':'64cfd5d182028abef1669221906486ac1c0607d32c01cacc25cf1eb95628906b',
+            'coverage.go':'d3385555fc774701cd0adecca0b8a5738a0d3487c172dc187053adf97ef2d1bf',
+            'event.go':'7953044aa94246846fce722e8a3b03e97897fbdc1e106d1b46dfeae4f21be4d5',
+            'event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
+            'parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
+            'schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff'}
+          for name,want in v2_expected.items(): req(sha(audit_dir/name)==want,'Server Audit V2 byte drift '+name)
+          req(not (ROOT/'cmd/multipath-audit-v3').exists(),'forbidden V3 cmd boundary exists')
+          req(not (ROOT/'protocol/multipath/auditv3').exists(),'forbidden split auditv3 package exists')
+          v3_prod='\n'.join((audit_dir/name).read_text(errors='replace') for name in ('status.go','timeline.go','aggregation.go','diagnosis.go','field_replay.go'))
+          req('package audit' in v3_prod,'V3 did not extend existing audit package')
+          req('unsafe' not in v3_prod and 'go:linkname' not in v3_prod,'V3 bypasses frozen boundary')
+          req('LEG1_EXACT_ASSIGNMENT' in (audit_dir/'diagnosis.go').read_text(),'scheduler uncertainty guard missing')
+          req('diagnostic closure failed' in (audit_dir/'field_replay.go').read_text(),'FIELD diagnostic closure gate missing')
+          print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
           print('ARCHITECTURE_AUDIT=PASS')
           PY
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -332,12 +372,12 @@ jobs:
             -run '^TestPreferredCapacity' ./protocol/multipath \
             2>&1 | tee "${EVIDENCE_DIR}/capacity-v2-impacted.log"
 
-      - name: Server Audit V2 parser analyzer contracts x20
+      - name: Server Audit V2 plus V3 audit package contracts x20
         shell: bash
         run: |
           set -euo pipefail
           CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
-            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v2.log"
+            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-package.log"
 
       - name: Server Audit V2 mutation controls
         shell: bash
@@ -390,6 +430,14 @@ jobs:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
           print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
           PY
+
+      - name: Server Audit V3 real FIELD replay diagnostic closure gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -count=1 -timeout=10m -tags "$BUILD_TAGS" \
+            -run '^TestFieldReplayDiagnosticClosureGate$' ./protocol/multipath/audit \
+            2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-field-replay.log"
 
       - name: Existing repeated-booster-disconnect regression x20
         shell: bash
@@ -476,6 +524,10 @@ jobs:
             protocol/multipath/audit/analyzer.go protocol/multipath/audit/audit_test.go
             protocol/multipath/audit/coverage.go protocol/multipath/audit/event.go
             protocol/multipath/audit/event_type.go protocol/multipath/audit/parser.go protocol/multipath/audit/schema.go
+            protocol/multipath/audit/aggregation.go protocol/multipath/audit/aggregation_v3_test.go
+            protocol/multipath/audit/diagnosis.go protocol/multipath/audit/field_replay.go protocol/multipath/audit/field_replay_test.go
+            protocol/multipath/audit/status.go protocol/multipath/audit/status_v3_test.go
+            protocol/multipath/audit/timeline.go protocol/multipath/audit/timeline_v3_test.go protocol/multipath/audit/v3_test_helpers_test.go
           )
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
