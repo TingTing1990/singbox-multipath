@@ -105,15 +105,15 @@ jobs:
             'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
             'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
             'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
-            'protocol/multipath/audit/aggregation.go':'219c7fbb971300c3de4012f35636be4cfd4ddce3647c2102dcd112e3e4186cbd',
-            'protocol/multipath/audit/aggregation_v3_test.go':'95f9ade90a6818a81259f7033deeee8683886615c065d64bb2f71c9fa6c8131c',
-            'protocol/multipath/audit/diagnosis.go':'43303a5830becd85c518561b0db4a180fe3e38df324f681baba0d997e347ea86',
-            'protocol/multipath/audit/field_replay.go':'11d9a27b42d374d76b707653606a5de9611c1cc1958f6b1c737617022422806c',
-            'protocol/multipath/audit/field_replay_test.go':'feaa9cf5398fac02e15adb6dfb0eb3fef8634199a1e318f6011d97a53d7ec743',
-            'protocol/multipath/audit/status.go':'c19e6843219a1c1272fa500dde3f53589929450642ca669af64dfa77faa79c47',
-            'protocol/multipath/audit/status_v3_test.go':'51324992963a058f86a1874c7ebd2aa843cab36c07a8adf632aa28bde27a415f',
-            'protocol/multipath/audit/timeline.go':'5a6ed05bb13db5ef3c7da99bb2aaa31c8dd2a7f3bb931be58fafa1b1c4084316',
-            'protocol/multipath/audit/timeline_v3_test.go':'0c7727a465aadd1c22f72dad962b6de92577dfcc080471b42d6aebdafc40e783',
+            'protocol/multipath/audit/aggregation.go':'9b2df829f6beb2c80c884415bac698bb0f39299d9bcfeb0ea3b0900cd6a23332',
+            'protocol/multipath/audit/aggregation_v3_test.go':'ed5d87256d423a98eca4ae4df9525b187a5e633f055b1a0a78e8b88f682edef3',
+            'protocol/multipath/audit/diagnosis.go':'55d697fd311dacd4340f304e6756d9748fe429ceaacc06902bd1e4e0c31c40e3',
+            'protocol/multipath/audit/field_replay.go':'0678d03d87d156899c67a7057e247165009eacdc87fcf5394c601736c1124b49',
+            'protocol/multipath/audit/field_replay_test.go':'dd6cdcae9f4737bc160e84f0e0e1354792745e36d0b82b7a43db81a9babd4a5b',
+            'protocol/multipath/audit/status.go':'380bb52b7453ff13cf821816a771b71baecbcede1bf456cac86399fb9b30e5eb',
+            'protocol/multipath/audit/status_v3_test.go':'7f2c76821e645e44dab7d606fd3cc5013dc3f1879c2df49ff139a6871b55d57d',
+            'protocol/multipath/audit/timeline.go':'af6dae0edc29584627db0dafcb5b103001c157f8d173f52c00e5dcb42bc3dfe4',
+            'protocol/multipath/audit/timeline_v3_test.go':'7663d6855d4164c104e419b4ce3e4e5c39e82f36582963840bf3ae5dbfebd3d4',
             'protocol/multipath/audit/v3_test_helpers_test.go':'2b9766a8c5b9624ac4358db602b2162425fbb3d87b36c29bee8c7135c10b58e4',
           }
           for rel,want in expected.items():
@@ -287,6 +287,10 @@ jobs:
           req('package audit' in v3_prod,'V3 did not extend existing audit package')
           req('unsafe' not in v3_prod and 'go:linkname' not in v3_prod,'V3 bypasses frozen boundary')
           req('LEG1_EXACT_ASSIGNMENT' in (audit_dir/'diagnosis.go').read_text(),'scheduler uncertainty guard missing')
+          req('preferred_assigned_bytes' in (audit_dir/'status.go').read_text(),'frozen preferred-assignment status evidence parser missing')
+          req('PreferredAssignmentEvidence' in (audit_dir/'timeline.go').read_text(),'preferred-assignment timeline evidence missing')
+          req('ErrUnverifiedDemand' in (audit_dir/'aggregation.go').read_text() and 'CompareAlgorithms' in (audit_dir/'aggregation.go').read_text(),'verified-demand or A/B comparison contract missing')
+          req('journal evidence must be complete with zero dropped events and zero sequence gaps' in (audit_dir/'field_replay.go').read_text(),'FIELD evidence-completeness gate missing')
           req('diagnostic closure failed' in (audit_dir/'field_replay.go').read_text(),'FIELD diagnostic closure gate missing')
           print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
           print('ARCHITECTURE_AUDIT=PASS')
@@ -407,7 +411,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+          AUDIT_V3_FIELD_FIXTURES=1 CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
             ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-package.log"
 
       - name: Server Audit V2 mutation controls
@@ -462,25 +466,14 @@ jobs:
           print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
           PY
 
-      - name: Server Audit V3 journal-only FIELD closure negative control
+      - name: Server Audit V3 FIELD replay closure acceptance
         shell: bash
         run: |
           set -euo pipefail
-          LOG="${EVIDENCE_DIR}/server-audit-v3-field-replay-negative-control.log"
-          set +e
-          AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -count=1 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^TestFieldReplayDiagnosticClosureGate$' ./protocol/multipath/audit \
-            2>&1 | tee "$LOG"
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [[ "$rc" -eq 0 ]]; then
-            echo 'ERROR: journal-only FIELD evidence was falsely accepted as diagnostically closed' >&2
-            exit 72
-          fi
-          grep -F 'diagnostic closure failed:' "$LOG"
-          grep -F 'missing status traces: historical journal alone cannot provide useful aggregate or both-leg delivery' "$LOG"
-          grep -F 'missing single-path status baselines' "$LOG"
-          echo 'PASS journal-only FIELD evidence fails closed exactly as V3 requires'
+          AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -count=1 -timeout=10m -tags "$BUILD_TAGS" \
+            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureCanPassWithOperationalSchedulerEvidenceAndAB|TestActiveEnvelopePreservesTrailingActiveStall|TestBuildTimelineCapturesPreferredAssignmentFromFrozenStatus)$' \
+            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-field-closure.log"
+          echo 'PASS V3 fails closed on incomplete evidence and closes only with complete verified status/CAP/A-B evidence'
 
       - name: Existing repeated-booster-disconnect regression x20
         shell: bash
