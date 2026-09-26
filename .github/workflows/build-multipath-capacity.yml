@@ -1,4 +1,4 @@
-name: Build Multipath Capacity Server Audit V3
+name: Build Multipath Capacity Server Audit V2
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: multipath-server-audit-v3-${{ inputs.source_ref }}
+  group: multipath-server-audit-v2-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 env:
@@ -31,7 +31,6 @@ jobs:
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       parent_sha: ${{ steps.resolve.outputs.parent_sha }}
-      v2_baseline_sha: ${{ steps.resolve.outputs.v2_baseline_sha }}
 
     steps:
       - name: Checkout requested source
@@ -63,54 +62,9 @@ jobs:
           test "$(git rev-parse "${FROZEN_GOLDEN_SHA}^{tree}")" = "$FROZEN_GOLDEN_TREE"
           test "$(git merge-base "$CANDIDATE_SHA" "$FROZEN_GOLDEN_SHA")" = "$FROZEN_GOLDEN_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          V2_BASELINE_SHA="$(python3 - "$CANDIDATE_SHA" "$FROZEN_GOLDEN_SHA" <<'PY'
-          import hashlib, subprocess, sys
-          candidate,golden=sys.argv[1:]
-          modified={
-            'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
-            'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
-            'protocol/multipath/outbound.go','protocol/multipath/scheduler.go','protocol/multipath/stream/path.go',
-            'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go'}
-          added={
-            'protocol/multipath/f01_memory_test.go','protocol/multipath/f01_retention_contract_test.go',
-            'protocol/multipath/f01_staged_ack_test.go','protocol/multipath/memory_available_linux_test.go',
-            'protocol/multipath/memory_runtime.go','protocol/multipath/memory_runtime_test.go',
-            'protocol/multipath/stream/records.go','protocol/multipath/stream/records_test.go',
-            'protocol/multipath/audit/analyzer.go','protocol/multipath/audit/audit_test.go',
-            'protocol/multipath/audit/coverage.go','protocol/multipath/audit/event.go',
-            'protocol/multipath/audit/event_type.go','protocol/multipath/audit/parser.go','protocol/multipath/audit/schema.go'}
-          expected={*(f'M\t{x}' for x in modified),*(f'A\t{x}' for x in added)}
-          identities={
-            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
-            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
-            'protocol/multipath/audit/analyzer.go':'dcda89bfc030f9c135e1851b24e54853b8aa88006b57e1ec56712f6d9e86e4c4',
-            'protocol/multipath/audit/audit_test.go':'64cfd5d182028abef1669221906486ac1c0607d32c01cacc25cf1eb95628906b',
-            'protocol/multipath/audit/coverage.go':'d3385555fc774701cd0adecca0b8a5738a0d3487c172dc187053adf97ef2d1bf',
-            'protocol/multipath/audit/event.go':'7953044aa94246846fce722e8a3b03e97897fbdc1e106d1b46dfeae4f21be4d5',
-            'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
-            'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
-            'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff'}
-          for rev in subprocess.check_output(['git','rev-list',candidate],text=True).splitlines():
-              lines=set(x for x in subprocess.check_output(['git','diff','--name-status',golden,rev],text=True).splitlines() if x)
-              if lines != expected: continue
-              ok=True
-              for rel,want in identities.items():
-                  try: payload=subprocess.check_output(['git','show',f'{rev}:{rel}'])
-                  except subprocess.CalledProcessError: ok=False; break
-                  if hashlib.sha256(payload).hexdigest()!=want: ok=False; break
-              if ok:
-                  print(rev)
-                  sys.exit(0)
-          raise SystemExit('FAIL: no exact Server Audit V2 ancestor matches frozen Golden delta and identities')
-          PY
-          )"
-          test -n "$V2_BASELINE_SHA"
-          test "$(git merge-base "$CANDIDATE_SHA" "$V2_BASELINE_SHA")" = "$V2_BASELINE_SHA"
           echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-          echo "v2_baseline_sha=$V2_BASELINE_SHA" >> "$GITHUB_OUTPUT"
           echo "parent_sha=$FROZEN_GOLDEN_SHA" >> "$GITHUB_OUTPUT"
           echo "candidate_sha=$CANDIDATE_SHA"
-          echo "v2_baseline_sha=$V2_BASELINE_SHA"
           echo "golden_sha=$FROZEN_GOLDEN_SHA"
           echo "golden_tree=$FROZEN_GOLDEN_TREE"
           echo "b9_upstream_commit=$B9_UPSTREAM_COMMIT"
@@ -151,22 +105,6 @@ jobs:
             'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
             'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
             'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
-            'cmd/multipath-audit-v3/main.go':'bae1f5b5015d2465f41fa37a566534b9480420e712f0fcd3efdac09b6ea7c1e4',
-            'protocol/multipath/auditv3/capture.go':'22f33b1f777a848a79da52d7c98034b39707719da89e128d53938cb05f81d21a',
-            'protocol/multipath/auditv3/compare.go':'f097519d4294ea2e5d8f511a5d51db153bb85c4565d593af33ccde9a429e1aad',
-            'protocol/multipath/auditv3/diagnosis.go':'e94e017e9e88b31733a145dcd5dfc921b43cdc0bfffe50df883fb4c90861d811',
-            'protocol/multipath/auditv3/doc.go':'4b3e132a06407312bdb9bbd30ae3ae1e9f45567e9e38fd58fc8578ef35715725',
-            'protocol/multipath/auditv3/journal.go':'f7a3a0abbed1aa85e1ac3a60644a340391d965fb1a5236bd4ad2875c79de2ce4',
-            'protocol/multipath/auditv3/journal_test.go':'c3bd2eb7f38698b3877b10e771dc3a3f6ad02e43e194c8153abfd256d9d23225',
-            'protocol/multipath/auditv3/metrics.go':'63e695ad1c94a8a5bdab955e5fadea8b89d388139185accf07c8487808e0ddea',
-            'protocol/multipath/auditv3/report.go':'645674490bca673df200fa314ba1239ade6b27f03111d4b84eea0c679d63b5c6',
-            'protocol/multipath/auditv3/schema.go':'6b4e8f267490ac02f02793fe2af18ae59fc314d7e3032c0c713fa96f0edf8554',
-            'protocol/multipath/auditv3/simulation_test.go':'0c7807b0978ac0daacd4a6eb7d98af6327a0b2475b791882ab6acdfc0d42019d',
-            'protocol/multipath/auditv3/status_parser.go':'fbb10846686dd86af7638c36590e67d51835d122ba3634b2c4ab093b51909d18',
-            'protocol/multipath/auditv3/status_parser_test.go':'92ad0f285ea40a1e6863483d8583ec22f3a810a83ff03eded1fd59704a434f81',
-            'protocol/multipath/auditv3/test_helpers_test.go':'49b106d6a8c18f22f7771bce5ce55fb55d796996656b2b8d39adb1c9ab25dd7e',
-            'protocol/multipath/auditv3/timeline.go':'79b3326901b96eeb00660fa167c6cbc7b9e2d2b57b82dcd993b59a60b1318f7f',
-            'protocol/multipath/auditv3/timeline_test.go':'eb014053189b282e1fd3c4c4b17e70fae8c279832786822264d0cae9bcee3e32',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -190,17 +128,14 @@ jobs:
         run: |
           set -euo pipefail
           GOLDEN_DIR="${RUNNER_TEMP}/frozen-golden"
-          V2_DIR="${RUNNER_TEMP}/server-audit-v2-baseline"
           INDEPENDENT_DIR="${RUNNER_TEMP}/independent-repair"
           MUTANT_ROOT="${RUNNER_TEMP}/repair-mutants"
-          EVIDENCE_DIR="${RUNNER_TEMP}/server-audit-v3-evidence"
+          EVIDENCE_DIR="${RUNNER_TEMP}/memory-repair-evidence"
           git worktree prune || true
-          rm -rf "$GOLDEN_DIR" "$V2_DIR" "$INDEPENDENT_DIR" "$MUTANT_ROOT" "$EVIDENCE_DIR"
+          rm -rf "$GOLDEN_DIR" "$INDEPENDENT_DIR" "$MUTANT_ROOT" "$EVIDENCE_DIR"
           mkdir -p "$MUTANT_ROOT" "$EVIDENCE_DIR"
           git worktree add --detach "$GOLDEN_DIR" "$FROZEN_GOLDEN_SHA"
-          git worktree add --detach "$V2_DIR" "${{ steps.resolve.outputs.v2_baseline_sha }}"
           echo "GOLDEN_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
-          echo "V2_DIR=$V2_DIR" >> "$GITHUB_ENV"
           echo "PARENT_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
           echo "INDEPENDENT_DIR=$INDEPENDENT_DIR" >> "$GITHUB_ENV"
           echo "MUTANT_ROOT=$MUTANT_ROOT" >> "$GITHUB_ENV"
@@ -215,7 +150,6 @@ jobs:
           import hashlib, os, re, subprocess
           ROOT=Path(os.environ['GITHUB_WORKSPACE'])
           GOLDEN=Path(os.environ['GOLDEN_DIR'])
-          V2=Path(os.environ['V2_DIR'])
           MOD={
             'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
             'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
@@ -229,33 +163,7 @@ jobs:
             'protocol/multipath/audit/analyzer.go','protocol/multipath/audit/audit_test.go',
             'protocol/multipath/audit/coverage.go','protocol/multipath/audit/event.go',
             'protocol/multipath/audit/event_type.go','protocol/multipath/audit/parser.go',
-            'protocol/multipath/audit/schema.go',
-            'cmd/multipath-audit-v3/main.go',
-            'protocol/multipath/auditv3/capture.go',
-            'protocol/multipath/auditv3/compare.go',
-            'protocol/multipath/auditv3/diagnosis.go',
-            'protocol/multipath/auditv3/doc.go',
-            'protocol/multipath/auditv3/journal.go',
-            'protocol/multipath/auditv3/journal_test.go',
-            'protocol/multipath/auditv3/metrics.go',
-            'protocol/multipath/auditv3/report.go',
-            'protocol/multipath/auditv3/schema.go',
-            'protocol/multipath/auditv3/simulation_test.go',
-            'protocol/multipath/auditv3/status_parser.go',
-            'protocol/multipath/auditv3/status_parser_test.go',
-            'protocol/multipath/auditv3/test_helpers_test.go',
-            'protocol/multipath/auditv3/timeline.go',
-            'protocol/multipath/auditv3/timeline_test.go'}
-          V3_ADD={
-            'cmd/multipath-audit-v3/main.go',
-            'protocol/multipath/auditv3/capture.go','protocol/multipath/auditv3/compare.go',
-            'protocol/multipath/auditv3/diagnosis.go','protocol/multipath/auditv3/doc.go',
-            'protocol/multipath/auditv3/journal.go','protocol/multipath/auditv3/journal_test.go',
-            'protocol/multipath/auditv3/metrics.go','protocol/multipath/auditv3/report.go',
-            'protocol/multipath/auditv3/schema.go','protocol/multipath/auditv3/simulation_test.go',
-            'protocol/multipath/auditv3/status_parser.go','protocol/multipath/auditv3/status_parser_test.go',
-            'protocol/multipath/auditv3/test_helpers_test.go','protocol/multipath/auditv3/timeline.go',
-            'protocol/multipath/auditv3/timeline_test.go'}
+            'protocol/multipath/audit/schema.go'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
@@ -304,12 +212,7 @@ jobs:
           gt,rt=tracked(GOLDEN),tracked(ROOT)
           mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
           req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
-          print('PASS exact Golden delta 12M/31A/0D including modes/gitlinks')
-          v2t=tracked(V2)
-          mod_v3={p for p in v2t.keys()&rt.keys() if v2t[p]!=rt[p]}; add_v3=set(rt)-set(v2t); del_v3=set(v2t)-set(rt)
-          req(not mod_v3 and add_v3==V3_ADD and not del_v3,f'V2->V3 write-set M={sorted(mod_v3)} A={sorted(add_v3)} D={sorted(del_v3)}')
-          for rel,(mode,oid) in v2t.items(): req(rel in rt and rt[rel]==(mode,oid),'V2 baseline drift '+rel)
-          print('PASS exact Server Audit V2 -> V3 delta 0M/16A/0D; every V2 file byte/mode identity retained')
+          print('PASS exact Golden delta 12M/15A/0D including modes/gitlinks')
           for rel,(mode,oid) in gt.items():
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
@@ -323,8 +226,7 @@ jobs:
                       'protocol/multipath/stream/stream_test.go'):
               req((ROOT/rel).read_bytes()==(GOLDEN/rel).read_bytes(),'critical Golden drift '+rel)
           print('PASS frozen critical files and restored B-touched files exact Golden')
-          mp_root=ROOT/'protocol/multipath'
-          prod='\n'.join(p.read_text(errors='replace') for p in mp_root.rglob('*.go') if not p.name.endswith('_test.go') and p.relative_to(mp_root).parts[0] not in ('audit','auditv3'))
+          prod='\n'.join(p.read_text(errors='replace') for p in (ROOT/'protocol/multipath').rglob('*.go') if not p.name.endswith('_test.go'))
           for token in FORBIDDEN: req(token not in prod,'rejected B token remains '+token)
           print('PASS rejected physical-credit B state machine absent')
           mem=(ROOT/'protocol/multipath/memory.go').read_text(); runtime=(ROOT/'protocol/multipath/memory_runtime.go').read_text(); avail=(ROOT/'protocol/multipath/memory_available_linux.go').read_text()
@@ -355,17 +257,6 @@ jobs:
           req('github.com/sagernet/sing-box/protocol/multipath/audit' not in prod,'Server Audit V2 leaked into frozen multipath runtime')
           req('SupportOpen' in (audit_dir/'coverage.go').read_text() and 'RequiresFrozenHook: true' in (audit_dir/'coverage.go').read_text(),'OPEN frozen-hook coverage contract missing')
           print('PASS Server Audit V2 is read-only/offline and does not enter frozen runtime control/data paths')
-          auditv3_dir=ROOT/'protocol/multipath/auditv3'
-          auditv3_prod='\n'.join(p.read_text(errors='replace') for p in auditv3_dir.glob('*.go') if not p.name.endswith('_test.go'))
-          req('package auditv3' in auditv3_prod,'Server Audit V3 package identity missing')
-          req('unsafe' not in auditv3_prod and 'go:linkname' not in auditv3_prod,'Server Audit V3 bypasses frozen boundary')
-          req('github.com/sagernet/sing-box/protocol/multipath/auditv3' not in prod,'Server Audit V3 leaked into frozen multipath runtime')
-          req('github.com/sagernet/sing-box/protocol/multipath/auditv3' not in audit_prod,'Server Audit V3 leaked into frozen V2 package')
-          req('LEG1_EXACT_ASSIGNMENT' in (auditv3_dir/'diagnosis.go').read_text(),'V3 exact-assignment OPEN contract missing')
-          req('SCHEDULER_DECISION_REASON' in (auditv3_dir/'diagnosis.go').read_text(),'V3 scheduler-reason OPEN contract missing')
-          req('remote_delivery_bytes_per_second' in (auditv3_dir/'schema.go').read_text(),'V3 frozen status schema mapping missing')
-          req('SchedulerRateEstimateBytesPS' in auditv3_prod,'V3 scheduler estimate semantic rename missing')
-          print('PASS Server Audit V3 is add-only/offline, consumes frozen status/V2 evidence, and cannot enter runtime')
           print('ARCHITECTURE_AUDIT=PASS')
           PY
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -500,87 +391,6 @@ jobs:
           print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
           PY
 
-      - name: Server Audit V3 aggregation contracts and deterministic simulation x20
-        shell: bash
-        run: |
-          set -euo pipefail
-          CGO_ENABLED=1 go test -race -count=20 -timeout=15m -tags "$BUILD_TAGS" \
-            ./protocol/multipath/auditv3 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3.log"
-          go test -count=1 -timeout=10m -tags "$BUILD_TAGS" ./cmd/multipath-audit-v3
-
-      - name: Server Audit V3 mutation controls
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          from pathlib import Path
-          import json, os, subprocess
-          root=Path(os.environ['GITHUB_WORKSPACE'])
-          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
-          temp=Path(os.environ['MUTANT_ROOT'])
-          tags=os.environ['BUILD_TAGS']
-          mutations=[
-            ('v3-01-physical-as-useful','protocol/multipath/auditv3/metrics.go',
-             'result.Useful.MeanMbps = float64(result.UsefulBytes) * 8 / seconds / 1_000_000',
-             'result.Useful.MeanMbps = result.PhysicalMeanMbps',
-             '^TestS05PhysicalIsNotUsefulAggregate$'),
-            ('v3-02-udp-not-subtracted','protocol/multipath/auditv3/schema.go',
-             'view.LogicalRX = s.Node.Logical.Cumulative.RXBytes - udpLogical',
-             'view.LogicalRX = s.Node.Logical.Cumulative.RXBytes',
-             '^TestS06UDPTrafficIsExcludedFromTCPAggregation$'),
-            ('v3-03-cross-restart-delta','protocol/multipath/auditv3/timeline.go',
-             'if previous == nil || !current.ProcessStartedAt.Equal(previous.ProcessStartedAt) {',
-             'if previous == nil {',
-             '^TestS08ProcessRestartNeverCrossSubtracts$'),
-            ('v3-04-stale-remote-used','protocol/multipath/auditv3/diagnosis.go',
-             'if d.RemoteSenderAvailable && !d.RemoteSenderStale {',
-             'if d.RemoteSenderAvailable {',
-             '^TestS09StaleRemoteTelemetryCannotCreateWriteStallFinding$'),
-            ('v3-05-scheduler-rate-as-throughput','protocol/multipath/auditv3/metrics.go',
-             'path.MeanMbps = float64(result.LegBytes[leg]) * 8 / seconds / 1_000_000',
-             'path.MeanMbps = float64(active[len(active)-1].Diagnostics.Leg[leg].SchedulerRateEstimateBytesPS) * 8 / 1_000_000',
-             '^TestSchedulerRateEstimateIsNotPathThroughput$'),
-            ('v3-06-leg1-assignment-closed','protocol/multipath/auditv3/diagnosis.go',
-             '{Code: "LEG1_EXACT_ASSIGNMENT", Reason: "frozen evidence exposes no exact per-window normal scheduler assignment for leg1"}',
-             '{Code: "LEG1_ASSIGNMENT_INFERRED", Reason: "MUTANT"}',
-             '^TestS10ExactSchedulerAssignmentRemainsOpen$'),
-            ('v3-07-peak-as-gain','protocol/multipath/auditv3/metrics.go',
-             'result.GainVsBestSingle = aggregate.Useful.MeanMbps/result.BestSingleMbps - 1',
-             'result.GainVsBestSingle = aggregate.Useful.PeakMbps/result.BestSingleMbps - 1',
-             '^TestPeakCannotOverrideNegativeSustainedGain$'),
-            ('v3-08-counter-regression-ignored','protocol/multipath/auditv3/timeline.go',
-             'return 0, fmt.Errorf("%w: %s previous=%d current=%d", ErrCounterRegression, name, previous, current)',
-             'return 0, nil',
-             '^TestBuildTimelineRejectsCounterRegression$'),
-          ]
-          for name,rel,old,new,test in mutations:
-              work=temp/name
-              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
-              try:
-                  p=work/rel; text=p.read_text()
-                  count=text.count(old)
-                  if count!=1: raise RuntimeError(f'{name} anchor count={count}')
-                  p.write_text(text.replace(old,new,1))
-                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath/auditv3'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
-                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath/auditv3'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-                  print(run.stdout)
-                  expected=test[1:-1]
-                  ran=failed=False
-                  for line in run.stdout.splitlines():
-                      try: event=json.loads(line)
-                      except json.JSONDecodeError: continue
-                      if event.get('Test') != expected: continue
-                      if event.get('Action') == 'run': ran=True
-                      elif event.get('Action') == 'fail': failed=True
-                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
-                  if not ran or not failed: raise RuntimeError(f'{name}: target test did not fail correctly {test}')
-                  print('KILLED',name,'BY',test)
-              finally:
-                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 8 SERVER AUDIT V3 MUTANTS KILLED')
-          PY
-
       - name: Existing repeated-booster-disconnect regression x20
         shell: bash
         run: |
@@ -666,22 +476,6 @@ jobs:
             protocol/multipath/audit/analyzer.go protocol/multipath/audit/audit_test.go
             protocol/multipath/audit/coverage.go protocol/multipath/audit/event.go
             protocol/multipath/audit/event_type.go protocol/multipath/audit/parser.go protocol/multipath/audit/schema.go
-            cmd/multipath-audit-v3/main.go
-            protocol/multipath/auditv3/capture.go
-            protocol/multipath/auditv3/compare.go
-            protocol/multipath/auditv3/diagnosis.go
-            protocol/multipath/auditv3/doc.go
-            protocol/multipath/auditv3/journal.go
-            protocol/multipath/auditv3/journal_test.go
-            protocol/multipath/auditv3/metrics.go
-            protocol/multipath/auditv3/report.go
-            protocol/multipath/auditv3/schema.go
-            protocol/multipath/auditv3/simulation_test.go
-            protocol/multipath/auditv3/status_parser.go
-            protocol/multipath/auditv3/status_parser_test.go
-            protocol/multipath/auditv3/test_helpers_test.go
-            protocol/multipath/auditv3/timeline.go
-            protocol/multipath/auditv3/timeline_test.go
           )
           unformatted="$(gofmt -l "${files[@]}")"
           if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
@@ -790,8 +584,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: server-audit-v3-evidence
-          path: ${{ runner.temp }}/server-audit-v3-evidence
+          name: memory-repair-audit-evidence
+          path: ${{ runner.temp }}/memory-repair-evidence
           if-no-files-found: warn
           retention-days: 14
 
@@ -801,7 +595,6 @@ jobs:
         run: |
           set +e
           git worktree remove --force "${GOLDEN_DIR:-}" >/dev/null 2>&1 || true
-          git worktree remove --force "${V2_DIR:-}" >/dev/null 2>&1 || true
           git worktree remove --force "${INDEPENDENT_DIR:-}" >/dev/null 2>&1 || true
           git worktree prune || true
 
@@ -817,19 +610,16 @@ jobs:
             goos: darwin
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
-            audit_binary: multipath-audit-v3-darwin-amd64
           - label: Windows amd64
             runner: windows-2025
             goos: windows
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
-            audit_binary: multipath-audit-v3-windows-amd64.exe
           - label: Linux amd64
             runner: ubuntu-24.04
             goos: linux
             goarch: amd64
             binary: sing-box-1.14.0-multipath-beta6-linux-amd64
-            audit_binary: multipath-audit-v3-linux-amd64
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -904,18 +694,6 @@ jobs:
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
             -o "dist/${{ matrix.binary }}" ./cmd/sing-box
 
-      - name: Build standalone Server Audit V3 tool
-        shell: bash
-        env:
-          CGO_ENABLED: '0'
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          set -euo pipefail
-          go build -v -trimpath \
-            -ldflags "-s -w -buildid=" \
-            -o "dist/${{ matrix.audit_binary }}" ./cmd/multipath-audit-v3
-
       - name: Smoke-test built binary and embedded version
         shell: bash
         run: |
@@ -929,10 +707,6 @@ jobs:
           printf '%s\n' "$VERSION_OUTPUT"
           grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$VERSION_OUTPUT"
           grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
-          AUDIT_BIN="dist/${{ matrix.audit_binary }}"
-          if [[ "${{ matrix.goos }}" != "windows" ]]; then chmod +x "$AUDIT_BIN"; fi
-          test -s "$AUDIT_BIN"
-          "./$AUDIT_BIN" help >/dev/null
 
       - name: Produce checksum and build provenance
         shell: bash
@@ -947,7 +721,6 @@ jobs:
             echo "source_ref=${SOURCE_REF}"
             echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
             echo "golden_commit=${{ needs.audit_test.outputs.parent_sha }}"
-            echo "v2_baseline_commit=${{ needs.audit_test.outputs.v2_baseline_sha }}"
             echo "golden_tree=${FROZEN_GOLDEN_TREE}"
             echo "b9_upstream_commit=${B9_UPSTREAM_COMMIT}"
             echo "go_version=$(go env GOVERSION)"
@@ -958,20 +731,6 @@ jobs:
           } > "${BIN}.buildinfo.txt"
           cat "${BIN}.sha256"
           cat "${BIN}.buildinfo.txt"
-          AUDIT_BIN="dist/${{ matrix.audit_binary }}"
-          if [[ "$RUNNER_OS" == "macOS" ]]; then shasum -a 256 "$AUDIT_BIN" > "${AUDIT_BIN}.sha256"; else sha256sum "$AUDIT_BIN" > "${AUDIT_BIN}.sha256"; fi
-          {
-            echo "tool=multipath-audit-v3"
-            echo "source_ref=${SOURCE_REF}"
-            echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
-            echo "v2_baseline_commit=${{ needs.audit_test.outputs.v2_baseline_sha }}"
-            echo "go_version=$(go env GOVERSION)"
-            echo "target=${{ matrix.goos }}/${{ matrix.goarch }}"
-            echo "cgo=0"
-            echo "binary=${{ matrix.audit_binary }}"
-          } > "${AUDIT_BIN}.buildinfo.txt"
-          cat "${AUDIT_BIN}.sha256"
-          cat "${AUDIT_BIN}.buildinfo.txt"
 
       - name: Upload verified binary
         uses: actions/upload-artifact@v7
@@ -981,9 +740,6 @@ jobs:
             dist/${{ matrix.binary }}
             dist/${{ matrix.binary }}.sha256
             dist/${{ matrix.binary }}.buildinfo.txt
-            dist/${{ matrix.audit_binary }}
-            dist/${{ matrix.audit_binary }}.sha256
-            dist/${{ matrix.audit_binary }}.buildinfo.txt
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
