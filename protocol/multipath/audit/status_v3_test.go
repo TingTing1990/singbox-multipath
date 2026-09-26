@@ -95,3 +95,28 @@ func TestParseStatusFailsClosedOnMissingNestedRXCounter(t *testing.T) {
 		t.Fatalf("missing nested rx counter accepted: %v", err)
 	}
 }
+
+func TestParseStatusPreferredCapacityEvidence(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	snapshot := syntheticSnapshot(start, start.Add(time.Second), 100, [2]uint64{60, 50}, [2]uint64{})
+	snapshot.Node.Logical.PreferredCapacity = &PreferredCapacityStatus{
+		TargetMbps:              640,
+		PreferredDeliveredBytes: 1234,
+		PreferredAssignedBytes:  5678,
+		DeliveryBytesPS:         100,
+		AssignmentBytesPS:       200,
+		ProtectedMbps:           700,
+		ProtectionValid:         true,
+		ProtectionActive:        true,
+		DegradeWindows:          1,
+		Ready:                   true,
+		AssignmentCreditBytes:   10,
+	}
+	parsed, err := ParseStatus(marshalSnapshot(t, snapshot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Node.Logical.PreferredCapacity == nil || parsed.Node.Logical.PreferredCapacity.PreferredAssignedBytes != 5678 {
+		t.Fatalf("preferred capacity evidence not parsed: %+v", parsed.Node.Logical.PreferredCapacity)
+	}
+}

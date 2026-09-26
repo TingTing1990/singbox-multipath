@@ -36,9 +36,12 @@ type OpenQuestion struct {
 	Reason string
 }
 
-func Diagnose(aggregate RunMetrics, comparison AggregateMetrics, load LoadClass) ([]Finding, []OpenQuestion, error) {
+func Diagnose(aggregate RunMetrics, comparison AggregateMetrics, load LoadClass, demand DemandEvidence) ([]Finding, []OpenQuestion, error) {
 	if load != LoadSaturating && load != LoadUnverified {
 		return nil, nil, ErrUnsupportedLoad
+	}
+	if load == LoadSaturating && (!demand.Verified || !demand.Saturated || demand.Method == "") {
+		return nil, nil, ErrUnverifiedDemand
 	}
 	var findings []Finding
 	if aggregate.LegBytes[0] > 0 && aggregate.LegBytes[1] > 0 {

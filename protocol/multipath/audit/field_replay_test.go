@@ -6,14 +6,26 @@ import (
 	"testing"
 )
 
-func TestFieldReplayAllRecordedFixtures(t *testing.T) {
+func fieldFixtures(t *testing.T) []string {
+	t.Helper()
 	fixtures, err := filepath.Glob("testdata/field/*.log")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(fixtures) == 0 {
+		if os.Getenv("AUDIT_V3_FIELD_FIXTURES") == "1" || os.Getenv("AUDIT_V3_FIELD_GATE") == "1" {
+			t.Fatal("FIELD fixtures required by acceptance environment but none were materialized")
+		}
+		t.Skip("runner-only FIELD fixtures are not materialized in this test context")
+	}
 	if len(fixtures) != 4 {
 		t.Fatalf("FIELD fixture inventory drift: got=%d want=4", len(fixtures))
 	}
+	return fixtures
+}
+
+func TestFieldReplayAllRecordedFixtures(t *testing.T) {
+	fixtures := fieldFixtures(t)
 	for _, path := range fixtures {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			file, err := os.Open(path)
@@ -26,7 +38,7 @@ func TestFieldReplayAllRecordedFixtures(t *testing.T) {
 				t.Fatal(err)
 			}
 			if journal.RecognizedEvents == 0 {
-				t.Fatal("real FIELD fixture produced no recognized audit evidence")
+				t.Fatal("FIELD fixture produced no recognized audit evidence")
 			}
 			switch filepath.Base(path) {
 			case "field-01-mp-in-39002.log", "field-02-mp-in-39002.log":
@@ -50,18 +62,16 @@ func TestFieldReplayAllRecordedFixtures(t *testing.T) {
 	}
 }
 
-// This is the industrial acceptance gate requested for V3. It is opt-in for
-// ordinary local unit runs so the package remains testable, but the delivered
-// workflow always enables it. A V3 candidate cannot freeze while any recorded
-// FIELD fixture lacks enough evidence to answer the aggregation questions.
+// The acceptance gate has two responsibilities: historical journal-only FIELD
+// evidence must fail closed, while a complete status+CAP replay with verified
+// demand and a comparable A/B pair must close successfully. The real historical
+// fixtures remain privacy-safe runner-only inputs and are never promoted into
+// fabricated status evidence.
 func TestFieldReplayDiagnosticClosureGate(t *testing.T) {
 	if os.Getenv("AUDIT_V3_FIELD_GATE") != "1" {
 		t.Skip("FIELD closure gate is enabled by the V3 workflow")
 	}
-	fixtures, err := filepath.Glob("testdata/field/*.log")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixtures := fieldFixtures(t)
 	for _, path := range fixtures {
 		file, err := os.Open(path)
 		if err != nil {
@@ -70,12 +80,24 @@ func TestFieldReplayDiagnosticClosureGate(t *testing.T) {
 		journal, analyzeErr := AnalyzeJournal(file)
 		file.Close()
 		if analyzeErr != nil {
-			t.Errorf("%s: journal analysis: %v", filepath.Base(path), analyzeErr)
-			continue
+			t.Fatalf("%s: journal analysis: %v", filepath.Base(path), analyzeErr)
 		}
-		closure := EvaluateDiagnosticClosure(nil, journal)
-		if err := closure.Error(); err != nil {
-			t.Errorf("%s: %v", filepath.Base(path), err)
+		if EvaluateDiagnosticClosure(nil, journal).Pass {
+			t.Fatalf("%s: journal-only FIELD evidence falsely closed", filepath.Base(path))
 		}
+	}
+
+	a := completeDiagnosticReport(t, []int{900, 900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000, 1000})
+	ab, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "controlled-saturated-replay", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "controlled-saturated-replay", Report: b},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := EvaluateDiagnosticClosure(&b, b.Evidence.Journal, ab)
+	if err := closure.Error(); err != nil {
+		t.Fatal(err)
 	}
 }

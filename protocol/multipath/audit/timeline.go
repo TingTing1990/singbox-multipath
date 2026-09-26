@@ -46,20 +46,25 @@ type WindowDiagnostics struct {
 }
 
 type Window struct {
-	Epoch                int
-	Start                time.Time
-	End                  time.Time
-	Duration             time.Duration
-	UsefulRXBytes        uint64
-	LegRXBytes           [2]uint64
-	UsefulMbps           float64
-	LegMbps              [2]float64
-	PhysicalMbps         float64
-	PathLogicalGapMbps   float64
-	BoosterSenderTXMbps  float64
-	RemoteSenderEvidence bool
-	Diagnostics          WindowDiagnostics
-	ResolutionDegraded   bool
+	Epoch                       int
+	Start                       time.Time
+	End                         time.Time
+	Duration                    time.Duration
+	UsefulRXBytes               uint64
+	LegRXBytes                  [2]uint64
+	UsefulMbps                  float64
+	LegMbps                     [2]float64
+	PhysicalMbps                float64
+	PathLogicalGapMbps          float64
+	BoosterSenderTXMbps         float64
+	RemoteSenderEvidence        bool
+	PreferredAssignedMbps       float64
+	PreferredAssignmentEvidence bool
+	LogicalState                string
+	LogicalConnections          int
+	Active                      bool
+	Diagnostics                 WindowDiagnostics
+	ResolutionDegraded          bool
 }
 
 type Timeline struct {
@@ -159,13 +164,16 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 		}
 		seconds := duration.Seconds()
 		window := Window{
-			Epoch:         epoch,
-			Start:         previous.GeneratedAt,
-			End:           current.GeneratedAt,
-			Duration:      duration,
-			UsefulRXBytes: useful,
-			LegRXBytes:    legBytes,
-			Diagnostics:   diagnosticsFromSnapshot(current),
+			Epoch:              epoch,
+			Start:              previous.GeneratedAt,
+			End:                current.GeneratedAt,
+			Duration:           duration,
+			UsefulRXBytes:      useful,
+			LegRXBytes:         legBytes,
+			LogicalState:       current.Node.Logical.State,
+			LogicalConnections: current.Node.Logical.Connections,
+			Active:             previous.Node.Logical.Connections > 0 || current.Node.Logical.Connections > 0,
+			Diagnostics:        diagnosticsFromSnapshot(current),
 		}
 		window.UsefulMbps = float64(useful) * 8 / seconds / 1_000_000
 		for leg := range window.LegMbps {
@@ -173,6 +181,17 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 		}
 		window.PhysicalMbps = window.LegMbps[0] + window.LegMbps[1]
 		window.PathLogicalGapMbps = window.PhysicalMbps - window.UsefulMbps
+
+		if previous.Node.Logical.PreferredCapacity != nil && current.Node.Logical.PreferredCapacity != nil {
+			assigned, assignmentErr := counterDelta("preferred assigned bytes",
+				previous.Node.Logical.PreferredCapacity.PreferredAssignedBytes,
+				current.Node.Logical.PreferredCapacity.PreferredAssignedBytes)
+			if assignmentErr != nil {
+				return result, assignmentErr
+			}
+			window.PreferredAssignedMbps = float64(assigned) * 8 / seconds / 1_000_000
+			window.PreferredAssignmentEvidence = true
+		}
 
 		// For a client-side download trace, frozen remote-sender telemetry exposes
 		// cumulative peer leg1 DATA actually transmitted. Require two consecutive
@@ -205,15 +224,19 @@ func ActiveEnvelope(windows []Window) ([]Window, error) {
 	first := -1
 	last := -1
 	for index, window := range windows {
-		if window.UsefulRXBytes > 0 || window.LegRXBytes[0] > 0 || window.LegRXBytes[1] > 0 {
-			if first < 0 {
-				first = index
-			}
+		hasTraffic := window.UsefulRXBytes > 0 || window.LegRXBytes[0] > 0 || window.LegRXBytes[1] > 0
+		if hasTraffic && first < 0 {
+			first = index
+		}
+		if first >= 0 && (hasTraffic || window.Active) {
 			last = index
 		}
 	}
 	if first < 0 {
 		return nil, ErrNoActivity
+	}
+	if last < first {
+		last = first
 	}
 	return append([]Window(nil), windows[first:last+1]...), nil
 }

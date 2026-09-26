@@ -64,3 +64,34 @@ func TestBuildTimelineRejectsCounterRegression(t *testing.T) {
 		t.Fatalf("counter regression accepted: %v", err)
 	}
 }
+
+func TestActiveEnvelopePreservesTrailingActiveStall(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{500, 0, 0}, []int{300, 0, 0}, []int{220, 0, 0}, time.Second)
+	for i := range trace {
+		trace[i].Node.Logical.State = "aggregating"
+		trace[i].Node.Logical.Connections = 1
+	}
+	run := mustRun(t, trace)
+	if len(run.Windows) != 3 {
+		t.Fatalf("active zero-throughput tail was trimmed: windows=%d", len(run.Windows))
+	}
+	if run.Useful.MinimumMbps != 0 || run.Useful.MeanMbps >= 200 {
+		t.Fatalf("active stall was hidden from stability metrics: %+v", run.Useful)
+	}
+}
+
+func TestBuildTimelineCapturesPreferredAssignmentFromFrozenStatus(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{500}, []int{300}, []int{220}, time.Second)
+	trace[0].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{PreferredAssignedBytes: 1000}
+	trace[1].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{PreferredAssignedBytes: 1000 + bytesForMbps(310, time.Second)}
+	timeline, err := BuildTimeline(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := timeline.Windows[0]
+	if !window.PreferredAssignmentEvidence || window.PreferredAssignedMbps != 310 {
+		t.Fatalf("preferred assignment evidence not recovered: %+v", window)
+	}
+}

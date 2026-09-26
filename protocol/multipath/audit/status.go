@@ -44,16 +44,31 @@ type SenderDiagnostics struct {
 	MemoryBackpressureEvents uint64 `json:"memory_backpressure_events"`
 }
 
+type PreferredCapacityStatus struct {
+	TargetMbps              uint64 `json:"target_mbps"`
+	PreferredDeliveredBytes uint64 `json:"preferred_delivered_bytes"`
+	PreferredAssignedBytes  uint64 `json:"preferred_assigned_bytes"`
+	DeliveryBytesPS         uint64 `json:"delivery_bytes_per_second"`
+	AssignmentBytesPS       uint64 `json:"assignment_bytes_per_second"`
+	ProtectedMbps           uint64 `json:"protected_mbps"`
+	ProtectionValid         bool   `json:"protection_valid"`
+	ProtectionActive        bool   `json:"protection_active"`
+	DegradeWindows          int    `json:"degrade_windows"`
+	Ready                   bool   `json:"ready"`
+	AssignmentCreditBytes   int64  `json:"assignment_credit_bytes"`
+}
+
 type LogicalStatus struct {
-	State        string            `json:"state"`
-	Connections  int               `json:"connections"`
-	Current      Rate              `json:"current"`
-	Cumulative   Traffic           `json:"cumulative"`
-	ReplayBytes  int64             `json:"replay_bytes"`
-	ReorderBytes int64             `json:"reorder_bytes"`
-	ReorderPages int64             `json:"reorder_pages"`
-	LocalSender  SenderDiagnostics `json:"local_sender"`
-	RemoteSender SenderDiagnostics `json:"remote_sender"`
+	State             string                   `json:"state"`
+	Connections       int                      `json:"connections"`
+	Current           Rate                     `json:"current"`
+	Cumulative        Traffic                  `json:"cumulative"`
+	ReplayBytes       int64                    `json:"replay_bytes"`
+	ReorderBytes      int64                    `json:"reorder_bytes"`
+	ReorderPages      int64                    `json:"reorder_pages"`
+	LocalSender       SenderDiagnostics        `json:"local_sender"`
+	RemoteSender      SenderDiagnostics        `json:"remote_sender"`
+	PreferredCapacity *PreferredCapacityStatus `json:"preferred_capacity,omitempty"`
 }
 
 type MemoryStatus struct {
@@ -139,13 +154,15 @@ func (s StatusSnapshot) TCPView() (TCPView, error) {
 }
 
 var (
-	ErrInvalidStatus     = errors.New("invalid multipath status evidence")
-	ErrCounterRegression = errors.New("cumulative counter regression")
-	ErrCounterUnderflow  = errors.New("derived TCP counter underflow")
-	ErrNoActivity        = errors.New("no TCP activity observed")
-	ErrInvalidBaseline   = errors.New("baseline is not single-path")
-	ErrInvalidTopology   = errors.New("invalid topology")
-	ErrUnsupportedLoad   = errors.New("unsupported load class")
+	ErrInvalidStatus          = errors.New("invalid multipath status evidence")
+	ErrCounterRegression      = errors.New("cumulative counter regression")
+	ErrCounterUnderflow       = errors.New("derived TCP counter underflow")
+	ErrNoActivity             = errors.New("no TCP activity observed")
+	ErrInvalidBaseline        = errors.New("baseline is not single-path")
+	ErrInvalidTopology        = errors.New("invalid topology")
+	ErrUnsupportedLoad        = errors.New("unsupported load class")
+	ErrUnverifiedDemand       = errors.New("saturating load is not backed by verified demand evidence")
+	ErrAlgorithmNotComparable = errors.New("algorithm runs are not comparable")
 )
 
 func errCounterUnderflow(name string, total, subtract uint64) error {
@@ -190,7 +207,7 @@ func ParseStatus(data []byte) (StatusSnapshot, error) {
 	if err := json.Unmarshal(root["node"], &nodeRaw); err != nil {
 		return StatusSnapshot{}, fmt.Errorf("%w: node: %v", ErrInvalidStatus, err)
 	}
-	if err := requireFields(nodeRaw["logical"], "node.logical", "cumulative", "replay_bytes", "reorder_bytes", "reorder_pages", "local_sender", "remote_sender"); err != nil {
+	if err := requireFields(nodeRaw["logical"], "node.logical", "state", "connections", "cumulative", "replay_bytes", "reorder_bytes", "reorder_pages", "local_sender", "remote_sender"); err != nil {
 		return StatusSnapshot{}, err
 	}
 	var logicalRaw map[string]json.RawMessage
@@ -204,6 +221,15 @@ func ParseStatus(data []byte) (StatusSnapshot, error) {
 		if err := requireFields(logicalRaw[senderName], "node.logical."+senderName,
 			"available", "stale", "leg1_tx_bytes", "replay_bytes", "replay_timeouts",
 			"memory_pressure", "memory_used_bytes"); err != nil {
+			return StatusSnapshot{}, err
+		}
+	}
+	if raw, ok := logicalRaw["preferred_capacity"]; ok && len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if err := requireFields(raw, "node.logical.preferred_capacity",
+			"target_mbps", "preferred_delivered_bytes", "preferred_assigned_bytes",
+			"delivery_bytes_per_second", "assignment_bytes_per_second",
+			"protected_mbps", "protection_valid", "protection_active", "degrade_windows",
+			"ready", "assignment_credit_bytes"); err != nil {
 			return StatusSnapshot{}, err
 		}
 	}

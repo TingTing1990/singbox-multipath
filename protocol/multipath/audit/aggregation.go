@@ -30,17 +30,19 @@ type StabilityMetrics struct {
 }
 
 type RunMetrics struct {
-	Windows                         []Window
-	Duration                        time.Duration
-	UsefulBytes                     uint64
-	LegBytes                        [2]uint64
-	Useful                          StabilityMetrics
-	Paths                           [2]PathMetrics
-	PhysicalMeanMbps                float64
-	PathLogicalGapMeanMbps          float64
-	BoosterSenderTXMeanMbps         float64
-	RemoteSenderEvidenceWindowRatio float64
-	SinglePathVerified              bool
+	Windows                                []Window
+	Duration                               time.Duration
+	UsefulBytes                            uint64
+	LegBytes                               [2]uint64
+	Useful                                 StabilityMetrics
+	Paths                                  [2]PathMetrics
+	PhysicalMeanMbps                       float64
+	PathLogicalGapMeanMbps                 float64
+	BoosterSenderTXMeanMbps                float64
+	RemoteSenderEvidenceWindowRatio        float64
+	PreferredAssignmentMeanMbps            float64
+	PreferredAssignmentEvidenceWindowRatio float64
+	SinglePathVerified                     bool
 }
 
 type weightedValue struct {
@@ -87,6 +89,8 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 	var gapNumerator float64
 	var boosterSenderNumerator float64
 	var remoteSenderDuration time.Duration
+	var preferredAssignmentNumerator float64
+	var preferredAssignmentDuration time.Duration
 	for _, window := range active {
 		seconds := window.Duration.Seconds()
 		if seconds <= 0 {
@@ -105,6 +109,10 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 		if window.RemoteSenderEvidence {
 			boosterSenderNumerator += window.BoosterSenderTXMbps * seconds
 			remoteSenderDuration += window.Duration
+		}
+		if window.PreferredAssignmentEvidence {
+			preferredAssignmentNumerator += window.PreferredAssignedMbps * seconds
+			preferredAssignmentDuration += window.Duration
 		}
 		for leg := range result.Paths {
 			result.LegBytes[leg] += window.LegRXBytes[leg]
@@ -138,6 +146,11 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 		result.BoosterSenderTXMeanMbps = boosterSenderNumerator / remoteSeconds
 		result.RemoteSenderEvidenceWindowRatio = remoteSeconds / seconds
 	}
+	if preferredAssignmentDuration > 0 {
+		assignmentSeconds := preferredAssignmentDuration.Seconds()
+		result.PreferredAssignmentMeanMbps = preferredAssignmentNumerator / assignmentSeconds
+		result.PreferredAssignmentEvidenceWindowRatio = assignmentSeconds / seconds
+	}
 	var totalLegBytes uint64
 	for leg := range result.Paths {
 		path := &result.Paths[leg]
@@ -167,6 +180,29 @@ const (
 	LoadSaturating LoadClass = "SATURATING"
 	LoadUnverified LoadClass = "UNVERIFIED"
 )
+
+type DemandEvidence struct {
+	Verified  bool
+	Saturated bool
+	Method    string
+}
+
+type AlgorithmRun struct {
+	AlgorithmID string
+	WorkloadID  string
+	Report      AggregationReport
+}
+
+type AlgorithmComparison struct {
+	Comparable               bool
+	AlgorithmA               string
+	AlgorithmB               string
+	WorkloadID               string
+	UsefulMeanDeltaMbps      float64
+	UsefulP10DeltaMbps       float64
+	EfficiencyDelta          float64
+	TimeBelowBestSingleDelta float64
+}
 
 type AggregateMetrics struct {
 	BestSingleMbps              float64
@@ -233,6 +269,7 @@ type BaselineReport struct {
 type AggregationReport struct {
 	Evidence   EvidenceReport
 	Load       LoadClass
+	Demand     DemandEvidence
 	Baseline   BaselineReport
 	Aggregate  RunMetrics
 	Comparison AggregateMetrics
@@ -241,6 +278,13 @@ type AggregationReport struct {
 }
 
 func AnalyzeAggregation(baseline0Snapshots, baseline1Snapshots, aggregateSnapshots []StatusSnapshot, topology Topology, load LoadClass, journal *JournalReport) (AggregationReport, error) {
+	return AnalyzeAggregationWithDemand(baseline0Snapshots, baseline1Snapshots, aggregateSnapshots, topology, load, DemandEvidence{}, journal)
+}
+
+func AnalyzeAggregationWithDemand(baseline0Snapshots, baseline1Snapshots, aggregateSnapshots []StatusSnapshot, topology Topology, load LoadClass, demand DemandEvidence, journal *JournalReport) (AggregationReport, error) {
+	if load == LoadSaturating && (!demand.Verified || !demand.Saturated || demand.Method == "") {
+		return AggregationReport{}, ErrUnverifiedDemand
+	}
 	b0Timeline, err := BuildTimeline(baseline0Snapshots)
 	if err != nil {
 		return AggregationReport{}, fmt.Errorf("baseline leg0 timeline: %w", err)
@@ -270,7 +314,7 @@ func AnalyzeAggregation(baseline0Snapshots, baseline1Snapshots, aggregateSnapsho
 		return AggregationReport{}, err
 	}
 	agg.Useful.TimeBelowBestSingleRatio = comparison.TimeBelowBestSingleRatio
-	findings, open, err := Diagnose(agg, comparison, load)
+	findings, open, err := Diagnose(agg, comparison, load, demand)
 	if err != nil {
 		return AggregationReport{}, err
 	}
@@ -283,6 +327,7 @@ func AnalyzeAggregation(baseline0Snapshots, baseline1Snapshots, aggregateSnapsho
 			TemporalResolutionDegraded: aggTimeline.TemporalResolutionDegraded,
 		},
 		Load:       load,
+		Demand:     demand,
 		Baseline:   BaselineReport{Leg0: b0, Leg1: b1},
 		Aggregate:  agg,
 		Comparison: comparison,
@@ -293,4 +338,45 @@ func AnalyzeAggregation(baseline0Snapshots, baseline1Snapshots, aggregateSnapsho
 		report.Evidence.Journal = *journal
 	}
 	return report, nil
+}
+
+func CompareAlgorithms(a, b AlgorithmRun) (AlgorithmComparison, error) {
+	if a.AlgorithmID == "" || b.AlgorithmID == "" || a.AlgorithmID == b.AlgorithmID ||
+		a.WorkloadID == "" || a.WorkloadID != b.WorkloadID {
+		return AlgorithmComparison{}, ErrAlgorithmNotComparable
+	}
+	if !a.Report.Demand.Verified || !a.Report.Demand.Saturated ||
+		!b.Report.Demand.Verified || !b.Report.Demand.Saturated ||
+		a.Report.Load != LoadSaturating || b.Report.Load != LoadSaturating {
+		return AlgorithmComparison{}, ErrAlgorithmNotComparable
+	}
+	if a.Report.Evidence.StatusSchemaVersion != StatusSchemaVersion || b.Report.Evidence.StatusSchemaVersion != StatusSchemaVersion ||
+		!a.Report.Evidence.Journal.Provided || !b.Report.Evidence.Journal.Provided ||
+		!a.Report.Evidence.Journal.EvidenceComplete || !b.Report.Evidence.Journal.EvidenceComplete ||
+		a.Report.Evidence.Journal.DroppedEvents != 0 || b.Report.Evidence.Journal.DroppedEvents != 0 ||
+		a.Report.Evidence.Journal.SequenceGaps != 0 || b.Report.Evidence.Journal.SequenceGaps != 0 ||
+		a.Report.Evidence.TemporalResolutionDegraded || b.Report.Evidence.TemporalResolutionDegraded ||
+		len(a.Report.Aggregate.Windows) < 2 || len(b.Report.Aggregate.Windows) < 2 ||
+		a.Report.Aggregate.UsefulBytes == 0 || b.Report.Aggregate.UsefulBytes == 0 ||
+		a.Report.Aggregate.LegBytes[0] == 0 || a.Report.Aggregate.LegBytes[1] == 0 ||
+		b.Report.Aggregate.LegBytes[0] == 0 || b.Report.Aggregate.LegBytes[1] == 0 ||
+		a.Report.Aggregate.PreferredAssignmentEvidenceWindowRatio == 0 || b.Report.Aggregate.PreferredAssignmentEvidenceWindowRatio == 0 ||
+		a.Report.Aggregate.RemoteSenderEvidenceWindowRatio == 0 || b.Report.Aggregate.RemoteSenderEvidenceWindowRatio == 0 {
+		return AlgorithmComparison{}, ErrAlgorithmNotComparable
+	}
+	if math.Abs(a.Report.Baseline.Leg0.Useful.MeanMbps-b.Report.Baseline.Leg0.Useful.MeanMbps) > 1e-9 ||
+		math.Abs(a.Report.Baseline.Leg1.Useful.MeanMbps-b.Report.Baseline.Leg1.Useful.MeanMbps) > 1e-9 ||
+		math.Abs(a.Report.Comparison.ReferenceMbps-b.Report.Comparison.ReferenceMbps) > 1e-9 {
+		return AlgorithmComparison{}, ErrAlgorithmNotComparable
+	}
+	return AlgorithmComparison{
+		Comparable:               true,
+		AlgorithmA:               a.AlgorithmID,
+		AlgorithmB:               b.AlgorithmID,
+		WorkloadID:               a.WorkloadID,
+		UsefulMeanDeltaMbps:      b.Report.Aggregate.Useful.MeanMbps - a.Report.Aggregate.Useful.MeanMbps,
+		UsefulP10DeltaMbps:       b.Report.Aggregate.Useful.P10Mbps - a.Report.Aggregate.Useful.P10Mbps,
+		EfficiencyDelta:          b.Report.Comparison.EfficiencyVsReference - a.Report.Comparison.EfficiencyVsReference,
+		TimeBelowBestSingleDelta: b.Report.Comparison.TimeBelowBestSingleRatio - a.Report.Comparison.TimeBelowBestSingleRatio,
+	}, nil
 }

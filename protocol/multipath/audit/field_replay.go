@@ -144,7 +144,7 @@ type DiagnosticClosure struct {
 // correctness. V3 passes FIELD acceptance only when the evidence can answer the
 // performance questions needed to change the aggregation algorithm. OPEN is not
 // an automatic waiver.
-func EvaluateDiagnosticClosure(report *AggregationReport, journal JournalReport) DiagnosticClosure {
+func EvaluateDiagnosticClosure(report *AggregationReport, journal JournalReport, algorithmComparisons ...AlgorithmComparison) DiagnosticClosure {
 	closure := DiagnosticClosure{
 		Baseline:              AnswerMissing,
 		AggregateUseful:       AnswerMissing,
@@ -163,55 +163,105 @@ func EvaluateDiagnosticClosure(report *AggregationReport, journal JournalReport)
 			closure.SchedulerAllocation = AnswerPartial
 			closure.DegradationLayer = AnswerPartial
 		}
+		if journal.Provided && (!journal.EvidenceComplete || journal.DroppedEvents > 0 || journal.SequenceGaps > 0) {
+			closure.Blocking = append(closure.Blocking, "journal evidence is incomplete or contains dropped/sequence-gap events")
+		}
 		return closure
 	}
 
-	closure.Baseline = AnswerFull
-	closure.AggregateUseful = AnswerFull
-	closure.PerLegDelivery = AnswerFull
-	closure.Stability = AnswerFull
-	closure.Efficiency = AnswerFull
-	closure.AlgorithmABComparable = AnswerFull
-
-	// Frozen status gives exact preferred assignment cumulative bytes and, when
-	// remote sender telemetry is fresh, exact peer leg1 DATA bytes actually sent.
-	// The latter is scheduler-output transmission evidence, not an exact
-	// per-decision "assignment reason", so allocation remains PARTIAL rather than
-	// fabricated as FULL.
-	if report.Aggregate.RemoteSenderEvidenceWindowRatio > 0 && journal.CapacityWindows > 0 {
-		// Preferred assignment comes from the frozen server CAP controller; peer
-		// leg1 TX comes from fresh remote-sender status. Together they answer the
-		// operational allocation question needed to distinguish scheduler output
-		// from path delivery, without claiming a per-decision reason.
-		closure.SchedulerAllocation = AnswerFull
-	} else if report.Aggregate.RemoteSenderEvidenceWindowRatio > 0 || journal.CapacityWindows > 0 {
-		closure.SchedulerAllocation = AnswerPartial
+	b0 := report.Baseline.Leg0
+	b1 := report.Baseline.Leg1
+	if b0.SinglePathVerified && b1.SinglePathVerified && b0.Duration > 0 && b1.Duration > 0 &&
+		b0.LegBytes[0] > 0 && b0.LegBytes[1] == 0 && b1.LegBytes[1] > 0 && b1.LegBytes[0] == 0 {
+		closure.Baseline = AnswerFull
+	} else {
+		closure.Blocking = append(closure.Blocking, "single-path baselines are missing or not physically verified")
 	}
 
-	// Degradation location is considered FULL when measured path delivery plus
-	// logical delivery is available and at least one independent diagnostic
-	// discriminator (assignment/sender-TX, memory, reorder or write-stall) exists.
-	discriminator := report.Aggregate.RemoteSenderEvidenceWindowRatio > 0
+	if report.Aggregate.Duration > 0 && len(report.Aggregate.Windows) > 0 && report.Aggregate.UsefulBytes > 0 {
+		closure.AggregateUseful = AnswerFull
+	} else {
+		closure.Blocking = append(closure.Blocking, "aggregate useful-delivery evidence is missing")
+	}
+	if report.Aggregate.LegBytes[0] > 0 && report.Aggregate.LegBytes[1] > 0 {
+		closure.PerLegDelivery = AnswerFull
+	} else if report.Aggregate.LegBytes[0] > 0 || report.Aggregate.LegBytes[1] > 0 {
+		closure.PerLegDelivery = AnswerPartial
+		closure.Blocking = append(closure.Blocking, "both-leg physical delivery was not observed")
+	} else {
+		closure.Blocking = append(closure.Blocking, "per-leg physical delivery evidence is missing")
+	}
+
+	if len(report.Aggregate.Windows) >= 2 {
+		if report.Aggregate.Useful.TemporalResolutionDegraded || report.Evidence.TemporalResolutionDegraded {
+			closure.Stability = AnswerPartial
+			closure.Blocking = append(closure.Blocking, "stability evidence has degraded temporal resolution")
+		} else {
+			closure.Stability = AnswerFull
+		}
+	} else if len(report.Aggregate.Windows) == 1 {
+		closure.Stability = AnswerPartial
+		closure.Blocking = append(closure.Blocking, "stability requires multiple aggregate windows")
+	} else {
+		closure.Blocking = append(closure.Blocking, "stability evidence is missing")
+	}
+
+	if report.Comparison.BestSingleMbps > 0 && report.Comparison.ReferenceMbps > 0 {
+		closure.Efficiency = AnswerFull
+	} else {
+		closure.Blocking = append(closure.Blocking, "efficiency reference is missing")
+	}
+
+	journalComplete := journal.Provided && journal.EvidenceComplete && journal.DroppedEvents == 0 && journal.SequenceGaps == 0
+	if !journalComplete {
+		closure.Blocking = append(closure.Blocking, "journal evidence must be complete with zero dropped events and zero sequence gaps")
+	}
+	if report.Load != LoadSaturating || !report.Demand.Verified || !report.Demand.Saturated || report.Demand.Method == "" {
+		closure.Blocking = append(closure.Blocking, "saturating demand is not independently verified")
+	}
+
+	preferredAssignment := report.Aggregate.PreferredAssignmentEvidenceWindowRatio > 0
+	boosterSender := report.Aggregate.RemoteSenderEvidenceWindowRatio > 0
+	if preferredAssignment && boosterSender {
+		// The frozen producer gives exact normal preferred-leg assignment and fresh
+		// peer leg1 DATA transmission. This closes the operational
+		// sender-output-vs-path-delivery question, but it is intentionally PARTIAL
+		// because leg1 transmission is not exact normal scheduler assignment and no
+		// per-decision reason exists in the frozen runtime.
+		closure.SchedulerAllocation = AnswerPartial
+	} else if preferredAssignment || boosterSender || journal.CapacityWindows > 0 {
+		closure.SchedulerAllocation = AnswerPartial
+		closure.Blocking = append(closure.Blocking, "need both preferred-assignment status evidence and fresh peer leg1 sender-TX evidence")
+	} else {
+		closure.Blocking = append(closure.Blocking, "scheduler-output evidence is missing")
+	}
+
+	discriminator := preferredAssignment && boosterSender
 	for _, finding := range report.Findings {
 		switch finding.Code {
 		case FindingRemoteWriteStallObserved, FindingRemoteMemoryPressureObserved,
-			FindingLocalMemoryPressureObserved, FindingReorderBacklogObserved,
-			FindingRemoteTelemetryStale:
+			FindingLocalMemoryPressureObserved, FindingReorderBacklogObserved:
 			discriminator = true
 		}
 	}
-	if discriminator {
+	if closure.PerLegDelivery == AnswerFull && discriminator {
 		closure.DegradationLayer = AnswerFull
-	} else {
+	} else if closure.PerLegDelivery != AnswerMissing {
 		closure.DegradationLayer = AnswerPartial
-		closure.Blocking = append(closure.Blocking, "no assignment/sender-TX or queue/resource discriminator during aggregate windows")
+		closure.Blocking = append(closure.Blocking, "no complete sender-output/path-delivery or queue/resource discriminator during aggregate windows")
+	} else {
+		closure.Blocking = append(closure.Blocking, "degradation layer cannot be localized without per-leg delivery")
 	}
 
-	if closure.SchedulerAllocation != AnswerFull {
-		closure.Blocking = append(closure.Blocking, "need both server preferred-assignment CAP evidence and fresh peer leg1 sender-TX evidence")
+	if len(algorithmComparisons) == 1 && algorithmComparisons[0].Comparable {
+		closure.AlgorithmABComparable = AnswerFull
+	} else {
+		closure.Blocking = append(closure.Blocking, "missing comparable algorithm A/B runs for the same verified workload")
 	}
-	closure.Pass = closure.Baseline == AnswerFull && closure.AggregateUseful == AnswerFull &&
-		closure.PerLegDelivery == AnswerFull && closure.SchedulerAllocation == AnswerFull &&
+
+	closure.Pass = journalComplete && report.Load == LoadSaturating && report.Demand.Verified && report.Demand.Saturated && report.Demand.Method != "" &&
+		closure.Baseline == AnswerFull && closure.AggregateUseful == AnswerFull &&
+		closure.PerLegDelivery == AnswerFull && closure.SchedulerAllocation != AnswerMissing &&
 		closure.Stability == AnswerFull && closure.Efficiency == AnswerFull &&
 		closure.DegradationLayer == AnswerFull && closure.AlgorithmABComparable == AnswerFull
 	return closure

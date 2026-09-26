@@ -27,7 +27,7 @@ func TestS01StablePositiveAggregation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings, _, err := Diagnose(agg, comparison, LoadSaturating)
+	findings, _, err := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestS03NegativeAggregationGain(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	agg := mustRun(t, traceFromRates(start, []int{500, 500, 500}, []int{270, 270, 270}, []int{250, 250, 250}, time.Second))
 	comparison, _ := CompareToBaselines(agg, b0, b1, Topology{})
-	findings, _, _ := Diagnose(agg, comparison, LoadSaturating)
+	findings, _, _ := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	if comparison.GainVsBestSingle >= 0 || comparison.TimeBelowBestSingleRatio != 1 || !hasFinding(findings, FindingNegativeAggregationGain) {
 		t.Fatalf("negative gain missed: %+v %+v", comparison, findings)
 	}
@@ -60,7 +60,7 @@ func TestS04BothPathsBelowStandaloneDoesNotClaimSchedulerBug(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	agg := mustRun(t, traceFromRates(start, []int{500, 500}, []int{270, 270}, []int{250, 250}, time.Second))
 	comparison, _ := CompareToBaselines(agg, b0, b1, Topology{})
-	findings, open, _ := Diagnose(agg, comparison, LoadSaturating)
+	findings, open, _ := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	if !hasFinding(findings, FindingBothPathRatesBelowStandalone) {
 		t.Fatal("both-path observation missing")
 	}
@@ -110,7 +110,7 @@ func TestS09StaleRemoteTelemetryCannotCreateWriteStallFinding(t *testing.T) {
 	}
 	agg := mustRun(t, trace)
 	comparison, _ := CompareToBaselines(agg, b0, b1, Topology{})
-	findings, _, _ := Diagnose(agg, comparison, LoadSaturating)
+	findings, _, _ := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	if !hasFinding(findings, FindingRemoteTelemetryStale) || hasFinding(findings, FindingRemoteWriteStallObserved) {
 		t.Fatalf("stale telemetry used as current evidence: %+v", findings)
 	}
@@ -121,7 +121,7 @@ func TestS10ExactSchedulerAssignmentRemainsOpen(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	agg := mustRun(t, traceFromRates(start, []int{800}, []int{500}, []int{320}, time.Second))
 	comparison, _ := CompareToBaselines(agg, b0, b1, Topology{})
-	_, open, _ := Diagnose(agg, comparison, LoadSaturating)
+	_, open, _ := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	for _, code := range []string{"LEG1_EXACT_ASSIGNMENT", "SCHEDULER_DECISION_REASON", "PER_LEG_UNIQUE_USEFUL_ATTRIBUTION"} {
 		if !slices.ContainsFunc(open, func(item OpenQuestion) bool { return item.Code == code }) {
 			t.Fatalf("%s was not kept OPEN: %+v", code, open)
@@ -134,7 +134,7 @@ func TestUnverifiedLoadCannotClaimNegativeAggregationGain(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	agg := mustRun(t, traceFromRates(start, []int{200}, []int{120}, []int{90}, time.Second))
 	comparison, _ := CompareToBaselines(agg, b0, b1, Topology{})
-	findings, _, _ := Diagnose(agg, comparison, LoadUnverified)
+	findings, _, _ := Diagnose(agg, comparison, LoadUnverified, DemandEvidence{})
 	if hasFinding(findings, FindingNegativeAggregationGain) || !hasFinding(findings, FindingLoadNotProvenSaturated) {
 		t.Fatalf("unverified demand received capability verdict: %+v", findings)
 	}
@@ -200,27 +200,120 @@ func TestBaselineLegIdentityCannotBeSwapped(t *testing.T) {
 	}
 }
 
-func TestDiagnosticClosureCanPassWithFrozenStatusAndCAPEvidence(t *testing.T) {
+func completeDiagnosticReport(t *testing.T, aggregateRates []int) AggregationReport {
+	t.Helper()
 	b0, b1 := baselineRuns(t)
 	start := time.Unix(1000, 0).UTC()
-	trace := traceFromRates(start, []int{1000, 1000}, []int{520, 520}, []int{500, 500}, time.Second)
+	leg0 := make([]int, len(aggregateRates))
+	leg1 := make([]int, len(aggregateRates))
+	for i, rate := range aggregateRates {
+		leg0[i] = rate * 52 / 100
+		leg1[i] = rate * 50 / 100
+	}
+	trace := traceFromRates(start, aggregateRates, leg0, leg1, time.Second)
 	for i := range trace {
+		trace[i].Node.Logical.State = "aggregating"
+		trace[i].Node.Logical.Connections = 1
 		trace[i].Node.Logical.RemoteSender.Available = true
 		trace[i].Node.Logical.RemoteSender.Stale = false
 		trace[i].Node.Logical.RemoteSender.Leg1TXBytes = uint64(i) * bytesForMbps(510, time.Second)
+		trace[i].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{
+			TargetMbps:             640,
+			PreferredAssignedBytes: uint64(i) * bytesForMbps(520, time.Second),
+		}
 	}
 	agg := mustRun(t, trace)
 	comparison, err := CompareToBaselines(agg, b0, b1, Topology{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings, open, err := Diagnose(agg, comparison, LoadSaturating)
+	findings, open, err := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := AggregationReport{Baseline: BaselineReport{Leg0: b0, Leg1: b1}, Aggregate: agg, Comparison: comparison, Findings: findings, Open: open}
-	closure := EvaluateDiagnosticClosure(&report, JournalReport{Provided: true, CapacityWindows: 2, EvidenceComplete: true})
+	journal := JournalReport{Provided: true, RecognizedEvents: 2, CapacityWindows: 2, EvidenceComplete: true}
+	return AggregationReport{
+		Evidence:   EvidenceReport{StatusSchemaVersion: StatusSchemaVersion, AggregateStatusSnapshots: len(trace), AggregateEpochs: 1, AggregateWindows: len(agg.Windows), Journal: journal},
+		Load:       LoadSaturating,
+		Demand:     DemandEvidence{Verified: true, Saturated: true, Method: "controlled-saturated-download"},
+		Baseline:   BaselineReport{Leg0: b0, Leg1: b1},
+		Aggregate:  agg,
+		Comparison: comparison,
+		Findings:   findings,
+		Open:       open,
+	}
+}
+
+func TestDiagnosticClosureRejectsEmptyReport(t *testing.T) {
+	closure := EvaluateDiagnosticClosure(&AggregationReport{}, JournalReport{})
+	if closure.Pass || closure.Baseline == AnswerFull || closure.AggregateUseful == AnswerFull || closure.AlgorithmABComparable == AnswerFull {
+		t.Fatalf("empty report falsely closed: %+v", closure)
+	}
+}
+
+func TestDiagnosticClosureRejectsIncompleteJournal(t *testing.T) {
+	report := completeDiagnosticReport(t, []int{1000, 1000})
+	bad := report.Evidence.Journal
+	bad.EvidenceComplete = false
+	bad.DroppedEvents = 3
+	bad.SequenceGaps = 1
+	closure := EvaluateDiagnosticClosure(&report, bad)
+	if closure.Pass {
+		t.Fatalf("incomplete journal falsely closed: %+v", closure)
+	}
+}
+
+func TestSaturatingAggregationRequiresVerifiedDemandEvidence(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	b0 := traceFromRates(start, []int{700, 700}, []int{700, 700}, []int{0, 0}, time.Second)
+	b1 := traceFromRates(start, []int{650, 650}, []int{0, 0}, []int{650, 650}, time.Second)
+	agg := traceFromRates(start, []int{1000, 1000}, []int{520, 520}, []int{500, 500}, time.Second)
+	if _, err := AnalyzeAggregation(b0, b1, agg, Topology{}, LoadSaturating, nil); !errors.Is(err, ErrUnverifiedDemand) {
+		t.Fatalf("unverified saturating load accepted: %v", err)
+	}
+}
+
+func TestAlgorithmABRequiresSameVerifiedWorkload(t *testing.T) {
+	a := completeDiagnosticReport(t, []int{900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000})
+	comparison, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
+	)
+	if err != nil || !comparison.Comparable || comparison.UsefulMeanDeltaMbps <= 0 {
+		t.Fatalf("valid A/B comparison rejected: comparison=%+v err=%v", comparison, err)
+	}
+	if _, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "workload-a", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "workload-b", Report: b},
+	); !errors.Is(err, ErrAlgorithmNotComparable) {
+		t.Fatalf("different workloads accepted: %v", err)
+	}
+}
+
+func TestDiagnosticClosureRequiresAlgorithmABEvidence(t *testing.T) {
+	report := completeDiagnosticReport(t, []int{1000, 1000})
+	closure := EvaluateDiagnosticClosure(&report, report.Evidence.Journal)
+	if closure.Pass || closure.AlgorithmABComparable != AnswerMissing {
+		t.Fatalf("single run falsely declared A/B comparable: %+v", closure)
+	}
+}
+
+func TestDiagnosticClosureCanPassWithOperationalSchedulerEvidenceAndAB(t *testing.T) {
+	a := completeDiagnosticReport(t, []int{900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000})
+	ab, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := EvaluateDiagnosticClosure(&b, b.Evidence.Journal, ab)
 	if !closure.Pass {
-		t.Fatalf("existing frozen evidence surfaces should be able to close a future complete replay: %+v", closure)
+		t.Fatalf("complete evidence should close: %+v", closure)
+	}
+	if closure.SchedulerAllocation != AnswerPartial {
+		t.Fatalf("leg1 transmission was overclaimed as exact assignment: %+v", closure)
 	}
 }
