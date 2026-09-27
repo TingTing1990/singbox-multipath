@@ -108,11 +108,13 @@ jobs:
             'protocol/multipath/audit/aggregation.go':'a15fc54b8d523b8724611ded70375b8d4a9e12a8c4ab7cee158bed85cf09709f',
             'protocol/multipath/audit/aggregation_v3_test.go':'fcee7884d4848b9944a46abac14f3f72a8ffc30fb1ebc480c6f5f8d7bd9d572c',
             'protocol/multipath/audit/diagnosis.go':'55d697fd311dacd4340f304e6756d9748fe429ceaacc06902bd1e4e0c31c40e3',
-            'protocol/multipath/audit/field_replay.go':'f9d3ed782248ccb4b44fef9aca40e812d15eee70057f18d4967a36a322f232fd',
+            'protocol/multipath/audit/field_replay.go':'1bbf02b755354b10328913fa4423462af1a5310818e4aa8febd05b3cecc2e482',
+            'protocol/multipath/audit/field_acquisition.go':'cadc7b165fe0f6883a20de72fc974d981ac94a1ec0be57f702b34e34ad7a518a',
+            'protocol/multipath/audit/field_offline_closure_test.go':'9232445b116126b1572752625f833bfaee1f04afc03718421b1df88c38f9c4c1',
             'protocol/multipath/audit/field_replay_test.go':'fd88ca1bc5612a52ac76e9ed4c890fe79b6c4cc8e161a3f668b58de69f87ab79',
-            'protocol/multipath/audit/status.go':'380bb52b7453ff13cf821816a771b71baecbcede1bf456cac86399fb9b30e5eb',
+            'protocol/multipath/audit/status.go':'e4fec79e7ff60f7df4eb24582948e321977391f7a79c3c4fe393117aff0e2726',
             'protocol/multipath/audit/status_v3_test.go':'7f2c76821e645e44dab7d606fd3cc5013dc3f1879c2df49ff139a6871b55d57d',
-            'protocol/multipath/audit/timeline.go':'3dc50a845d3ddd8b1abdd5a3cfa747008238801142768273d9e30c6cb70261c9',
+            'protocol/multipath/audit/timeline.go':'692b122d00afcc15eb3791970cd130e5b10cd11f12e15172a1f7c3bb436779ee',
             'protocol/multipath/audit/timeline_v3_test.go':'27ab05035e1fde95bc0900d850890724ee42e9e9d4d01c9bfb7eb3d0c3e7556d',
             'protocol/multipath/audit/v3_test_helpers_test.go':'78d1b761f1e609703fef31f3f4653e97a4ee071f45e19b39b2195221fea64bfb',
           }
@@ -176,6 +178,7 @@ jobs:
             'protocol/multipath/audit/schema.go','protocol/multipath/audit/aggregation.go',
             'protocol/multipath/audit/aggregation_v3_test.go','protocol/multipath/audit/diagnosis.go',
             'protocol/multipath/audit/field_replay.go','protocol/multipath/audit/field_replay_test.go',
+            'protocol/multipath/audit/field_acquisition.go','protocol/multipath/audit/field_offline_closure_test.go',
             'protocol/multipath/audit/status.go','protocol/multipath/audit/status_v3_test.go',
             'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
             'protocol/multipath/audit/v3_test_helpers_test.go'}
@@ -227,7 +230,7 @@ jobs:
           gt,rt=tracked(GOLDEN),tracked(ROOT)
           mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
           req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
-          print('PASS exact Golden delta 12M/25A/0D including modes/gitlinks')
+          print('PASS exact Golden delta 12M/27A/0D including modes/gitlinks')
           for rel,(mode,oid) in gt.items():
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
@@ -283,7 +286,7 @@ jobs:
           for name,want in v2_expected.items(): req(sha(audit_dir/name)==want,'Server Audit V2 byte drift '+name)
           req(not (ROOT/'cmd/multipath-audit-v3').exists(),'forbidden V3 cmd boundary exists')
           req(not (ROOT/'protocol/multipath/auditv3').exists(),'forbidden split auditv3 package exists')
-          v3_prod='\n'.join((audit_dir/name).read_text(errors='replace') for name in ('status.go','timeline.go','aggregation.go','diagnosis.go','field_replay.go'))
+          v3_prod='\n'.join((audit_dir/name).read_text(errors='replace') for name in ('status.go','timeline.go','aggregation.go','diagnosis.go','field_replay.go','field_acquisition.go'))
           req('package audit' in v3_prod,'V3 did not extend existing audit package')
           req('unsafe' not in v3_prod and 'go:linkname' not in v3_prod,'V3 bypasses frozen boundary')
           req('LEG1_EXACT_ASSIGNMENT' in (audit_dir/'diagnosis.go').read_text(),'scheduler uncertainty guard missing')
@@ -291,7 +294,7 @@ jobs:
           timeline_v3=(audit_dir/'timeline.go').read_text()
           aggregation_v3=(audit_dir/'aggregation.go').read_text()
           replay_v3=(audit_dir/'field_replay.go').read_text()
-          tests_v3='\n'.join((audit_dir/name).read_text() for name in ('timeline_v3_test.go','aggregation_v3_test.go','field_replay_test.go'))
+          tests_v3='\n'.join((audit_dir/name).read_text() for name in ('timeline_v3_test.go','aggregation_v3_test.go','field_replay_test.go','field_offline_closure_test.go'))
           req('preferred_assigned_bytes' in status_v3,'frozen local preferred-capacity status evidence parser missing')
           req('LocalPreferredAssignmentEvidence' in timeline_v3 and 'ServerPreferredAssignmentEvidence' in timeline_v3 and 'AttachServerCapacityEvidence' in timeline_v3,'directional CAP/status evidence model missing')
           req('LocalPreferredAssignmentEvidence' not in aggregation_v3 and 'LocalPreferredAssignmentEvidence' not in replay_v3,'client-local capacity leaked into download acceptance')
@@ -300,7 +303,29 @@ jobs:
           req('ReportAFingerprint' in aggregation_v3 and 'ReportBFingerprint' in aggregation_v3,'A/B source-report binding missing')
           req('ErrUnverifiedDemand' in aggregation_v3 and 'CompareAlgorithms' in aggregation_v3,'verified-demand or A/B comparison contract missing')
           req('RecognizedEvents == 0' in replay_v3 and 'len(closure.Blocking) == 0' in replay_v3,'fail-closed journal/blocking acceptance contract missing')
-          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation'):
+          acquisition_v3=(audit_dir/'field_acquisition.go').read_text()
+          req('CaptureStatusFile' in acquisition_v3 and 'defaultStatusCapturePoll' in acquisition_v3,'external status_file acquisition closure missing')
+          req('ReplayFieldRun' in replay_v3 and 'AnalyzeJournalForInstance' in replay_v3,'FIELD dual-end replay entry point missing')
+          req('WriteFieldRunReplayJSON' in replay_v3 and 'does not overlap the client status trace' in replay_v3,'FIELD replay report or cross-end time binding missing')
+          req('SequenceEpochs' in replay_v3 and 'ValidationErrors' in replay_v3,'V2 journal validation evidence retention missing')
+          req('ServerCapacityEvidence' in timeline_v3 and 'ServerCAPEvents' in timeline_v3 and 'ServerLatestCAPEvent' in timeline_v3 and 'Snapshots' in timeline_v3,'forensic timeline evidence retention missing')
+          req('UsefulTXMbps' in timeline_v3 and 'LegTXMbps' in timeline_v3,'bidirectional TCP replay missing')
+          producer=(ROOT/'protocol/multipath/status.go').read_text()
+          recovery=(ROOT/'protocol/multipath/recovery_status.go').read_text()
+          def json_fields(src,name):
+              m=re.search(r'(?ms)^type\s+'+re.escape(name)+r'\s+struct\s*\{(.*?)^\}',src)
+              req(m is not None,'missing struct '+name)
+              return set(re.findall(r'`json:"([^",]+)',m.group(1))) - {'-'}
+          for producer_name,audit_name in (
+              ('statusTraffic','Traffic'),('statusRate','Rate'),('statusPeakRate','PeakRate'),('statusFrames','Frames'),('statusActivation','ActivationStatus'),
+              ('statusParameters','ParametersStatus'),('statusPreferredCapacity','PreferredCapacityStatus'),
+              ('statusMemory','MemoryStatus'),('statusSenderDiagnostics','SenderDiagnostics'),
+              ('statusLogical','LogicalStatus'),('statusFlow','FlowStatus'),('statusLeg','LegStatus'),('statusNode','StatusNode'),
+              ('statusDocument','StatusSnapshot')):
+              req(json_fields(producer,producer_name)==json_fields(status_v3,audit_name),'frozen status producer fields not losslessly represented '+producer_name+' -> '+audit_name)
+          req(json_fields(recovery,'recoveryStatus')==json_fields(status_v3,'RecoveryStatus'),'frozen recovery producer fields not losslessly represented')
+          req(json_fields(recovery,'recoveryPathStatus')==json_fields(status_v3,'RecoveryPathStatus'),'frozen recovery path fields not losslessly represented')
+          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation','TestOfflineClosureStatusParserPreservesFrozenProducerFields','TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots','TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState','TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation','TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence','TestOfflineClosureReportSerializesForensicEvidence','TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField','TestOfflineClosureCaptureStatusFileWritesInitialSnapshot','TestOfflineClosureLatestCAPEventPreservesInWindowStateChange'):
               req(test_name in tests_v3,'V3 repair regression missing '+test_name)
           req('diagnostic closure failed' in replay_v3,'FIELD diagnostic closure gate missing')
           print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
@@ -482,10 +507,11 @@ jobs:
         run: |
           set -euo pipefail
           AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -race -count=20 -timeout=15m -tags "$BUILD_TAGS" \
-            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall)$' \
+            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall|TestOfflineClosureStatusParserPreservesFrozenProducerFields|TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots|TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState|TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation|TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence|TestOfflineClosureReportSerializesForensicEvidence|TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField|TestOfflineClosureCaptureStatusFileWritesInitialSnapshot|TestOfflineClosureLatestCAPEventPreservesInWindowStateChange)$' \
             ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-repair-contracts.log"
           echo 'PASS historical FIELD journals replay and remain fail-closed without missing status/baseline/A-B inputs'
           echo 'PASS deterministic integrated status + server CAP + verified-demand + bound A/B repair contracts'
+          echo 'PASS V3 offline FIELD closure: outbound status_file capture + explicit server-instance journal binding + lossless frozen status schema + exact CAP/window timeline retention'
           echo 'NOTE integrated positive closure is LOCAL/SIMULATION evidence, not a claim that historical FIELD fixtures contain complete status traces'
 
       - name: Server Audit V3 repair mutation controls
@@ -521,6 +547,30 @@ jobs:
              '\t\tif current.Node.Tag != result.SourceNodeTag {',
              '\t\tif false && current.Node.Tag != result.SourceNodeTag {',
              '^TestBuildTimelineRejectsMixedNodeTags$'),
+            ('v3-offline-instance-cross-contamination','protocol/multipath/audit/field_replay.go',
+             '\t\tif strings.Contains(line, marker) || strings.Contains(line, capacityMarker) {',
+             '\t\tif strings.Contains(line, marker) || strings.Contains(line, capacityMarker) || strings.Contains(line, "other-instance") {',
+             '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
+            ('v3-offline-cap-state-loss','protocol/multipath/audit/timeline.go',
+             '\t\twindow.ServerTargetMbps = latest.TargetMbps',
+             '\t\twindow.ServerTargetMbps = 0',
+             '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
+            ('v3-offline-status-sample-dup','protocol/multipath/audit/field_acquisition.go',
+             '\tif s.haveLast && identity == s.lastIdentity {',
+             '\tif false && s.haveLast && identity == s.lastIdentity {',
+             '^TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation$'),
+            ('v3-offline-cross-end-time-fail-open','protocol/multipath/audit/field_replay.go',
+             '\tif correlatedCapacityWindows == 0 {',
+             '\tif false && correlatedCapacityWindows == 0 {',
+             '^TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence$'),
+            ('v3-offline-required-status-field-drop','protocol/multipath/audit/status.go',
+             '\t\t"activation_window_ms", "chunk_size", "queue_frames", "queue_bytes", "max_reorder_frames", "max_reorder_bytes",',
+             '\t\t"chunk_size", "queue_frames", "queue_bytes", "max_reorder_frames", "max_reorder_bytes",',
+             '^TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField$'),
+            ('v3-offline-latest-cap-state-loss','protocol/multipath/audit/timeline.go',
+             '\t\t\twindow.ServerProtectedMbps = latestEvent.ProtectedMbps',
+             '\t\t\twindow.ServerProtectedMbps = latestWindow.ProtectedMbps',
+             '^TestOfflineClosureLatestCAPEventPreservesInWindowStateChange$'),
           ]
           for name,rel,old,new,test in mutations:
               work=temp/name
@@ -546,7 +596,7 @@ jobs:
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 5 V3 REPAIR MUTANTS KILLED')
+          print('ALL 11 V3 REPAIR/OFFLINE-CLOSURE MUTANTS KILLED')
           PY
 
       - name: Existing repeated-booster-disconnect regression x20
