@@ -46,31 +46,48 @@ type WindowDiagnostics struct {
 }
 
 type Window struct {
-	Epoch                       int
-	Start                       time.Time
-	End                         time.Time
-	Duration                    time.Duration
-	UsefulRXBytes               uint64
-	LegRXBytes                  [2]uint64
-	UsefulMbps                  float64
-	LegMbps                     [2]float64
-	PhysicalMbps                float64
-	PathLogicalGapMbps          float64
-	BoosterSenderTXMbps         float64
-	RemoteSenderEvidence        bool
-	PreferredAssignedMbps       float64
-	PreferredAssignmentEvidence bool
-	LogicalState                string
-	LogicalConnections          int
-	Active                      bool
-	Diagnostics                 WindowDiagnostics
-	ResolutionDegraded          bool
+	Epoch                int
+	Start                time.Time
+	End                  time.Time
+	Duration             time.Duration
+	UsefulRXBytes        uint64
+	LegRXBytes           [2]uint64
+	UsefulMbps           float64
+	LegMbps              [2]float64
+	PhysicalMbps         float64
+	PathLogicalGapMbps   float64
+	BoosterSenderTXMbps  float64
+	RemoteSenderEvidence bool
+
+	// LocalPreferredAssignedMbps is the status node's own preferred-capacity
+	// controller. For a client-side download trace this belongs to the opposite
+	// (client -> server) direction and must never satisfy server download
+	// assignment evidence.
+	LocalPreferredAssignedMbps       float64
+	LocalPreferredAssignmentEvidence bool
+
+	// Server preferred assignment/delivery are correlated offline from existing
+	// server CAP_WINDOW evidence. No runtime field or collector is added.
+	ServerPreferredAssignedMbps       float64
+	ServerPreferredDeliveryMbps       float64
+	ServerPreferredAssignmentEvidence bool
+	ServerPreferredDeliveryEvidence   bool
+	ServerCapacityInstance            string
+	ServerControllerWindowSeq         uint64
+	ServerCapacityEventCount          int
+
+	LogicalState       string
+	LogicalConnections int
+	Active             bool
+	Diagnostics        WindowDiagnostics
+	ResolutionDegraded bool
 }
 
 type Timeline struct {
 	Windows                    []Window
 	Epochs                     int
 	StatusSnapshots            int
+	SourceNodeTag              string
 	TemporalResolutionDegraded bool
 }
 
@@ -126,10 +143,17 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 	if len(snapshots) == 0 {
 		return result, nil
 	}
+	result.SourceNodeTag = snapshots[0].Node.Tag
+	if result.SourceNodeTag == "" {
+		return result, fmt.Errorf("%w: empty node.tag", ErrInvalidStatus)
+	}
 	var previous *StatusSnapshot
 	epoch := -1
 	for index := range snapshots {
 		current := snapshots[index]
+		if current.Node.Tag != result.SourceNodeTag {
+			return result, fmt.Errorf("%w: mixed node.tag in one trace: %q then %q", ErrInvalidStatus, result.SourceNodeTag, current.Node.Tag)
+		}
 		if previous == nil || !current.ProcessStartedAt.Equal(previous.ProcessStartedAt) {
 			epoch++
 			result.Epochs++
@@ -183,14 +207,14 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 		window.PathLogicalGapMbps = window.PhysicalMbps - window.UsefulMbps
 
 		if previous.Node.Logical.PreferredCapacity != nil && current.Node.Logical.PreferredCapacity != nil {
-			assigned, assignmentErr := counterDelta("preferred assigned bytes",
+			assigned, assignmentErr := counterDelta("local preferred assigned bytes",
 				previous.Node.Logical.PreferredCapacity.PreferredAssignedBytes,
 				current.Node.Logical.PreferredCapacity.PreferredAssignedBytes)
 			if assignmentErr != nil {
 				return result, assignmentErr
 			}
-			window.PreferredAssignedMbps = float64(assigned) * 8 / seconds / 1_000_000
-			window.PreferredAssignmentEvidence = true
+			window.LocalPreferredAssignedMbps = float64(assigned) * 8 / seconds / 1_000_000
+			window.LocalPreferredAssignmentEvidence = true
 		}
 
 		// For a client-side download trace, frozen remote-sender telemetry exposes
@@ -218,6 +242,57 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 		previous = &current
 	}
 	return result, nil
+}
+
+// AttachServerCapacityEvidence correlates existing frozen server CAP_WINDOW
+// evidence to client status windows. CAP evidence is accepted only from one
+// explicit server instance with a timestamp; evidence from another side is not
+// re-labeled as download assignment.
+func AttachServerCapacityEvidence(timeline *Timeline, journal JournalReport) error {
+	if timeline == nil || len(timeline.Windows) == 0 {
+		return nil
+	}
+	instances := make(map[string]struct{})
+	for _, evidence := range journal.CapacityEvidence {
+		if !evidence.ValidServerEvidence() {
+			continue
+		}
+		instances[evidence.Instance] = struct{}{}
+	}
+	if len(instances) > 1 {
+		return fmt.Errorf("%w: multiple server CAP instances cannot be correlated to one status trace", ErrInvalidStatus)
+	}
+
+	for windowIndex := range timeline.Windows {
+		window := &timeline.Windows[windowIndex]
+		var assignmentSum, deliverySum float64
+		var count int
+		var instance string
+		var lastSeq uint64
+		for _, evidence := range journal.CapacityEvidence {
+			if !evidence.ValidServerEvidence() || !evidence.At.After(window.Start) || evidence.At.After(window.End) {
+				continue
+			}
+			assignmentSum += evidence.PreferredAssignmentMbps
+			deliverySum += evidence.DeliveryMbps
+			count++
+			instance = evidence.Instance
+			if evidence.ControllerWindowSeq > lastSeq {
+				lastSeq = evidence.ControllerWindowSeq
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		window.ServerPreferredAssignedMbps = assignmentSum / float64(count)
+		window.ServerPreferredDeliveryMbps = deliverySum / float64(count)
+		window.ServerPreferredAssignmentEvidence = true
+		window.ServerPreferredDeliveryEvidence = true
+		window.ServerCapacityInstance = instance
+		window.ServerControllerWindowSeq = lastSeq
+		window.ServerCapacityEventCount = count
+	}
+	return nil
 }
 
 func ActiveEnvelope(windows []Window) ([]Window, error) {

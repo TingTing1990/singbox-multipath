@@ -4,8 +4,31 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
+	"time"
 )
+
+type CapacityWindowEvidence struct {
+	At                      time.Time
+	Side                    string
+	Instance                string
+	ControllerWindowSeq     uint64
+	TargetMbps              float64
+	PreferredAssignmentMbps float64
+	DeliveryMbps            float64
+	DeliveryReady           bool
+	ProtectedMbps           float64
+	ProtectionValid         bool
+	ProtectionActive        bool
+	DegradeWindows          int
+	BacklogBytes            int64
+	QueueBytes              int64
+}
+
+func (e CapacityWindowEvidence) ValidServerEvidence() bool {
+	return e.Side == "server" && e.Instance != "" && !e.At.IsZero()
+}
 
 // JournalReport summarizes only evidence already emitted by the frozen runtime.
 // CAP_WINDOW delivery/assignment are preferred-leg capacity-controller evidence;
@@ -18,6 +41,7 @@ type JournalReport struct {
 	DroppedEvents                 uint64
 	SequenceGaps                  uint64
 	CapacityWindows               int
+	ServerCapacityWindows         int
 	DeliveryReadyWindows          int
 	GateOpened                    int
 	GateBlocked                   int
@@ -30,6 +54,19 @@ type JournalReport struct {
 	PreferredDeliveryMaxMbps      float64
 	LegAttached                   [2]bool
 	LegDataActive                 [2]bool
+	CapacityEvidence              []CapacityWindowEvidence
+}
+
+func journalCompleteForV3(report JournalReport) bool {
+	if !report.Provided || report.RecognizedEvents == 0 || !report.EvidenceComplete || report.DroppedEvents != 0 || report.SequenceGaps != 0 {
+		return false
+	}
+	for _, evidence := range report.CapacityEvidence {
+		if evidence.ValidServerEvidence() {
+			return true
+		}
+	}
+	return false
 }
 
 func journalMedian(values []float64) float64 {
@@ -82,11 +119,33 @@ func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 			switch event.Capacity.Event {
 			case "CAP_WINDOW":
 				report.CapacityWindows++
+				evidence := CapacityWindowEvidence{
+					At:                      event.Capacity.At,
+					Side:                    event.Capacity.Side,
+					Instance:                event.Capacity.Instance,
+					ControllerWindowSeq:     event.Capacity.ControllerWindowSeq,
+					TargetMbps:              event.Capacity.TargetMbps,
+					PreferredAssignmentMbps: event.Capacity.PreferredAssignmentMbps,
+					DeliveryMbps:            event.Capacity.DeliveryMbps,
+					DeliveryReady:           event.Capacity.DeliveryReady,
+					ProtectedMbps:           event.Capacity.ProtectedMbps,
+					ProtectionValid:         event.Capacity.ProtectionValid,
+					ProtectionActive:        event.Capacity.ProtectionActive,
+					DegradeWindows:          event.Capacity.DegradeWindows,
+					BacklogBytes:            event.Capacity.BacklogBytes,
+					QueueBytes:              event.Capacity.QueueBytes,
+				}
+				report.CapacityEvidence = append(report.CapacityEvidence, evidence)
+				if evidence.ValidServerEvidence() {
+					report.ServerCapacityWindows++
+				}
 				if event.Capacity.DeliveryReady {
 					report.DeliveryReadyWindows++
 				}
-				assignments = append(assignments, event.Capacity.PreferredAssignmentMbps)
-				deliveries = append(deliveries, event.Capacity.DeliveryMbps)
+				if evidence.ValidServerEvidence() {
+					assignments = append(assignments, event.Capacity.PreferredAssignmentMbps)
+					deliveries = append(deliveries, event.Capacity.DeliveryMbps)
+				}
 			case "CAP_GATE_OPENED":
 				report.GateOpened++
 			case "CAP_GATE_BLOCKED":
@@ -163,8 +222,8 @@ func EvaluateDiagnosticClosure(report *AggregationReport, journal JournalReport,
 			closure.SchedulerAllocation = AnswerPartial
 			closure.DegradationLayer = AnswerPartial
 		}
-		if journal.Provided && (!journal.EvidenceComplete || journal.DroppedEvents > 0 || journal.SequenceGaps > 0) {
-			closure.Blocking = append(closure.Blocking, "journal evidence is incomplete or contains dropped/sequence-gap events")
+		if journal.Provided && !journalCompleteForV3(journal) {
+			closure.Blocking = append(closure.Blocking, "journal evidence is incomplete, empty, lacks server CAP_WINDOW evidence, or contains dropped/sequence-gap events")
 		}
 		return closure
 	}
@@ -212,58 +271,71 @@ func EvaluateDiagnosticClosure(report *AggregationReport, journal JournalReport,
 		closure.Blocking = append(closure.Blocking, "efficiency reference is missing")
 	}
 
-	journalComplete := journal.Provided && journal.EvidenceComplete && journal.DroppedEvents == 0 && journal.SequenceGaps == 0
+	journalComplete := journalCompleteForV3(journal)
 	if !journalComplete {
-		closure.Blocking = append(closure.Blocking, "journal evidence must be complete with zero dropped events and zero sequence gaps")
+		closure.Blocking = append(closure.Blocking, "journal evidence must contain recognized complete server CAP_WINDOW evidence with zero dropped events and zero sequence gaps")
+	}
+	if !reflect.DeepEqual(journal, report.Evidence.Journal) {
+		closure.Blocking = append(closure.Blocking, "closure journal does not match the journal embedded in the analyzed report")
 	}
 	if report.Load != LoadSaturating || !report.Demand.Verified || !report.Demand.Saturated || report.Demand.Method == "" {
 		closure.Blocking = append(closure.Blocking, "saturating demand is not independently verified")
 	}
 
-	preferredAssignment := report.Aggregate.PreferredAssignmentEvidenceWindowRatio > 0
-	boosterSender := report.Aggregate.RemoteSenderEvidenceWindowRatio > 0
-	if preferredAssignment && boosterSender {
-		// The frozen producer gives exact normal preferred-leg assignment and fresh
-		// peer leg1 DATA transmission. This closes the operational
-		// sender-output-vs-path-delivery question, but it is intentionally PARTIAL
-		// because leg1 transmission is not exact normal scheduler assignment and no
-		// per-decision reason exists in the frozen runtime.
+	// Exact scheduler internals remain OPEN by design. V3 needs only the
+	// operational chain already exposed by frozen evidence: server CAP preferred
+	// assignment plus fresh peer leg1 sender output in the same status window.
+	if report.Aggregate.SenderOutputEvidenceOverlapWindowRatio > 0 {
 		closure.SchedulerAllocation = AnswerPartial
-	} else if preferredAssignment || boosterSender || journal.CapacityWindows > 0 {
+	} else if report.Aggregate.ServerPreferredAssignmentEvidenceRatio > 0 || report.Aggregate.RemoteSenderEvidenceWindowRatio > 0 || journal.ServerCapacityWindows > 0 {
 		closure.SchedulerAllocation = AnswerPartial
-		closure.Blocking = append(closure.Blocking, "need both preferred-assignment status evidence and fresh peer leg1 sender-TX evidence")
+		closure.Blocking = append(closure.Blocking, "need same-window server preferred-assignment CAP evidence and fresh peer leg1 sender-TX evidence")
 	} else {
 		closure.Blocking = append(closure.Blocking, "scheduler-output evidence is missing")
 	}
 
-	discriminator := preferredAssignment && boosterSender
-	for _, finding := range report.Findings {
-		switch finding.Code {
-		case FindingRemoteWriteStallObserved, FindingRemoteMemoryPressureObserved,
-			FindingLocalMemoryPressureObserved, FindingReorderBacklogObserved:
-			discriminator = true
+	if closure.PerLegDelivery == AnswerFull {
+		if report.Comparison.DegradedWindowCount == 0 {
+			if report.Aggregate.SenderOutputEvidenceOverlapWindowRatio > 0 {
+				closure.DegradationLayer = AnswerFull
+			} else {
+				closure.DegradationLayer = AnswerPartial
+				closure.Blocking = append(closure.Blocking, "no same-window sender-output/path-delivery evidence across the aggregate run")
+			}
+		} else if report.Comparison.DegradationEvidenceCoverageRatio >= 1-1e-12 {
+			closure.DegradationLayer = AnswerFull
+		} else {
+			closure.DegradationLayer = AnswerPartial
+			closure.Blocking = append(closure.Blocking, "one or more degraded windows lack same-window sender-output/path-delivery or queue/resource evidence")
 		}
-	}
-	if closure.PerLegDelivery == AnswerFull && discriminator {
-		closure.DegradationLayer = AnswerFull
 	} else if closure.PerLegDelivery != AnswerMissing {
 		closure.DegradationLayer = AnswerPartial
-		closure.Blocking = append(closure.Blocking, "no complete sender-output/path-delivery or queue/resource discriminator during aggregate windows")
+		closure.Blocking = append(closure.Blocking, "degradation layer cannot fully close without both-leg physical delivery")
 	} else {
 		closure.Blocking = append(closure.Blocking, "degradation layer cannot be localized without per-leg delivery")
 	}
 
-	if len(algorithmComparisons) == 1 && algorithmComparisons[0].Comparable {
-		closure.AlgorithmABComparable = AnswerFull
+	currentFingerprint, fingerprintErr := reportFingerprint(*report)
+	if fingerprintErr != nil {
+		closure.Blocking = append(closure.Blocking, "unable to bind algorithm A/B evidence to the current report")
+	} else if len(algorithmComparisons) == 1 {
+		comparison := algorithmComparisons[0]
+		bound := comparison.Comparable && comparison.AlgorithmA != "" && comparison.AlgorithmB != "" && comparison.AlgorithmA != comparison.AlgorithmB && comparison.WorkloadID != "" &&
+			(comparison.ReportAFingerprint == currentFingerprint || comparison.ReportBFingerprint == currentFingerprint)
+		if bound {
+			closure.AlgorithmABComparable = AnswerFull
+		} else {
+			closure.Blocking = append(closure.Blocking, "algorithm A/B result is not bound to the report being accepted")
+		}
 	} else {
 		closure.Blocking = append(closure.Blocking, "missing comparable algorithm A/B runs for the same verified workload")
 	}
 
-	closure.Pass = journalComplete && report.Load == LoadSaturating && report.Demand.Verified && report.Demand.Saturated && report.Demand.Method != "" &&
+	closure.Pass = journalComplete && reflect.DeepEqual(journal, report.Evidence.Journal) && report.Load == LoadSaturating && report.Demand.Verified && report.Demand.Saturated && report.Demand.Method != "" &&
 		closure.Baseline == AnswerFull && closure.AggregateUseful == AnswerFull &&
 		closure.PerLegDelivery == AnswerFull && closure.SchedulerAllocation != AnswerMissing &&
 		closure.Stability == AnswerFull && closure.Efficiency == AnswerFull &&
-		closure.DegradationLayer == AnswerFull && closure.AlgorithmABComparable == AnswerFull
+		closure.DegradationLayer == AnswerFull && closure.AlgorithmABComparable == AnswerFull && len(closure.Blocking) == 0
 	return closure
 }
 

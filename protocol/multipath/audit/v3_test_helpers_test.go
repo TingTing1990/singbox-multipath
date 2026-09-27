@@ -2,6 +2,8 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,4 +78,28 @@ func marshalSnapshot(t *testing.T, snapshot StatusSnapshot) []byte {
 		t.Fatal(err)
 	}
 	return content
+}
+
+func syntheticServerCAPJournal(t *testing.T, start time.Time, assignments []int, present []bool) JournalReport {
+	t.Helper()
+	if present != nil && len(present) != len(assignments) {
+		t.Fatal("capacity presence length mismatch")
+	}
+	var builder strings.Builder
+	var eventSeq uint64
+	for index, assignment := range assignments {
+		if present != nil && !present[index] {
+			continue
+		}
+		eventSeq++
+		at := start.Add(time.Duration(index+2) * time.Second).Format(time.RFC3339Nano)
+		fmt.Fprintf(&builder,
+			"CAP_AUDIT schema_version=1 event_seq=%d event=CAP_WINDOW side=server instance=\"mp-in-test\" session_id=\"\" destination=\"\" at=%s original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=%.2f delivery_ready=true protected_mbps=%.2f protection_valid=true protection_active=true preferred_assignment_mbps=%.2f degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=%d\n",
+			eventSeq, at, float64(assignment), float64(assignment), float64(assignment), index+1)
+	}
+	journal, err := AnalyzeJournal(strings.NewReader(builder.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return journal
 }

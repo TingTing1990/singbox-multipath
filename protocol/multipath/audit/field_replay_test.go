@@ -62,14 +62,12 @@ func TestFieldReplayAllRecordedFixtures(t *testing.T) {
 	}
 }
 
-// The acceptance gate has two responsibilities: historical journal-only FIELD
-// evidence must fail closed, while a complete status+CAP replay with verified
-// demand and a comparable A/B pair must close successfully. The real historical
-// fixtures remain privacy-safe runner-only inputs and are never promoted into
-// fabricated status evidence.
+// The historical FIELD gate proves byte-preserved journal ingestion and fail-closed
+// behavior only. The available historical recordings do not contain the matching
+// status/baseline/A-B inputs, so this test must not claim end-to-end FIELD closure.
 func TestFieldReplayDiagnosticClosureGate(t *testing.T) {
 	if os.Getenv("AUDIT_V3_FIELD_GATE") != "1" {
-		t.Skip("FIELD closure gate is enabled by the V3 workflow")
+		t.Skip("historical FIELD replay gate is enabled by the V3 workflow")
 	}
 	fixtures := fieldFixtures(t)
 	for _, path := range fixtures {
@@ -82,11 +80,18 @@ func TestFieldReplayDiagnosticClosureGate(t *testing.T) {
 		if analyzeErr != nil {
 			t.Fatalf("%s: journal analysis: %v", filepath.Base(path), analyzeErr)
 		}
-		if EvaluateDiagnosticClosure(nil, journal).Pass {
+		closure := EvaluateDiagnosticClosure(nil, journal)
+		if closure.Pass || closure.Error() == nil {
 			t.Fatalf("%s: journal-only FIELD evidence falsely closed", filepath.Base(path))
 		}
 	}
+}
 
+// TestIntegratedDiagnosticClosureSimulation exercises the complete offline V3
+// pipeline with parsed server CAP evidence, status timelines, verified demand,
+// baselines and a bound A/B comparison. It is a deterministic simulation contract,
+// not a claim that the historical FIELD fixtures contain those inputs.
+func TestIntegratedDiagnosticClosureSimulation(t *testing.T) {
 	a := completeDiagnosticReport(t, []int{900, 900, 900})
 	b := completeDiagnosticReport(t, []int{1000, 1000, 1000})
 	ab, err := CompareAlgorithms(

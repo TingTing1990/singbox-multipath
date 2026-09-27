@@ -3,6 +3,7 @@ package audit
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -202,13 +203,16 @@ func TestBaselineLegIdentityCannotBeSwapped(t *testing.T) {
 
 func completeDiagnosticReport(t *testing.T, aggregateRates []int) AggregationReport {
 	t.Helper()
-	b0, b1 := baselineRuns(t)
 	start := time.Unix(1000, 0).UTC()
+	b0Trace := traceFromRates(start, []int{700, 700, 700}, []int{700, 700, 700}, []int{0, 0, 0}, time.Second)
+	b1Trace := traceFromRates(start, []int{650, 650, 650}, []int{0, 0, 0}, []int{650, 650, 650}, time.Second)
 	leg0 := make([]int, len(aggregateRates))
 	leg1 := make([]int, len(aggregateRates))
+	assignments := make([]int, len(aggregateRates))
 	for i, rate := range aggregateRates {
 		leg0[i] = rate * 52 / 100
 		leg1[i] = rate * 50 / 100
+		assignments[i] = leg0[i]
 	}
 	trace := traceFromRates(start, aggregateRates, leg0, leg1, time.Second)
 	for i := range trace {
@@ -217,30 +221,29 @@ func completeDiagnosticReport(t *testing.T, aggregateRates []int) AggregationRep
 		trace[i].Node.Logical.RemoteSender.Available = true
 		trace[i].Node.Logical.RemoteSender.Stale = false
 		trace[i].Node.Logical.RemoteSender.Leg1TXBytes = uint64(i) * bytesForMbps(510, time.Second)
-		trace[i].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{
-			TargetMbps:             640,
-			PreferredAssignedBytes: uint64(i) * bytesForMbps(520, time.Second),
-		}
+		// A client-local capacity controller is deliberately absent. Download
+		// assignment must come from the existing server CAP journal instead.
+		trace[i].Node.Logical.PreferredCapacity = nil
 	}
-	agg := mustRun(t, trace)
-	comparison, err := CompareToBaselines(agg, b0, b1, Topology{})
+	journal := syntheticServerCAPJournal(t, start, assignments, nil)
+	report, err := AnalyzeAggregationWithDemand(
+		b0Trace, b1Trace, trace, Topology{}, LoadSaturating,
+		DemandEvidence{Verified: true, Saturated: true, Method: "controlled-saturated-download"}, &journal,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings, open, err := Diagnose(agg, comparison, LoadSaturating, DemandEvidence{Verified: true, Saturated: true, Method: "controlled-test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	journal := JournalReport{Provided: true, RecognizedEvents: 2, CapacityWindows: 2, EvidenceComplete: true}
-	return AggregationReport{
-		Evidence:   EvidenceReport{StatusSchemaVersion: StatusSchemaVersion, AggregateStatusSnapshots: len(trace), AggregateEpochs: 1, AggregateWindows: len(agg.Windows), Journal: journal},
-		Load:       LoadSaturating,
-		Demand:     DemandEvidence{Verified: true, Saturated: true, Method: "controlled-saturated-download"},
-		Baseline:   BaselineReport{Leg0: b0, Leg1: b1},
-		Aggregate:  agg,
-		Comparison: comparison,
-		Findings:   findings,
-		Open:       open,
+	return report
+}
+
+func TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{500}, []int{300}, []int{220}, time.Second)
+	trace[0].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{PreferredAssignedBytes: 1000}
+	trace[1].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{PreferredAssignedBytes: 1000 + bytesForMbps(310, time.Second)}
+	run := mustRun(t, trace)
+	if run.ServerPreferredAssignmentEvidenceRatio != 0 || run.SenderOutputEvidenceOverlapWindowRatio != 0 {
+		t.Fatalf("client-local capacity was accepted as server download evidence: %+v", run)
 	}
 }
 
@@ -258,8 +261,45 @@ func TestDiagnosticClosureRejectsIncompleteJournal(t *testing.T) {
 	bad.DroppedEvents = 3
 	bad.SequenceGaps = 1
 	closure := EvaluateDiagnosticClosure(&report, bad)
-	if closure.Pass {
+	if closure.Pass || closure.Error() == nil {
 		t.Fatalf("incomplete journal falsely closed: %+v", closure)
+	}
+}
+
+func TestAlgorithmABRejectsEmptyEmbeddedJournal(t *testing.T) {
+	a := completeDiagnosticReport(t, []int{900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000})
+	empty, err := AnalyzeJournal(strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Evidence.Journal = empty
+	b.Evidence.Journal = empty
+	if _, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
+	); !errors.Is(err, ErrAlgorithmNotComparable) {
+		t.Fatalf("empty embedded journals accepted for A/B: %v", err)
+	}
+}
+
+func TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB(t *testing.T) {
+	a := completeDiagnosticReport(t, []int{900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000})
+	ab, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := AnalyzeJournal(strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := EvaluateDiagnosticClosure(&b, empty, ab)
+	if closure.Pass || len(closure.Blocking) == 0 {
+		t.Fatalf("empty journal falsely closed: %+v", closure)
 	}
 }
 
@@ -280,7 +320,7 @@ func TestAlgorithmABRequiresSameVerifiedWorkload(t *testing.T) {
 		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
 		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
 	)
-	if err != nil || !comparison.Comparable || comparison.UsefulMeanDeltaMbps <= 0 {
+	if err != nil || !comparison.Comparable || comparison.UsefulMeanDeltaMbps <= 0 || comparison.ReportAFingerprint == "" || comparison.ReportBFingerprint == "" {
 		t.Fatalf("valid A/B comparison rejected: comparison=%+v err=%v", comparison, err)
 	}
 	if _, err := CompareAlgorithms(
@@ -299,7 +339,63 @@ func TestDiagnosticClosureRequiresAlgorithmABEvidence(t *testing.T) {
 	}
 }
 
-func TestDiagnosticClosureCanPassWithOperationalSchedulerEvidenceAndAB(t *testing.T) {
+func TestDiagnosticClosureRejectsUnboundAlgorithmAB(t *testing.T) {
+	report := completeDiagnosticReport(t, []int{1000, 1000})
+	closure := EvaluateDiagnosticClosure(&report, report.Evidence.Journal, AlgorithmComparison{Comparable: true})
+	if closure.Pass || closure.AlgorithmABComparable == AnswerFull {
+		t.Fatalf("unbound Comparable bool accepted as A/B evidence: %+v", closure)
+	}
+}
+
+func TestDisjointEvidenceCannotCloseDegradationLayer(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	b0 := traceFromRates(start, []int{700, 700, 700}, []int{700, 700, 700}, []int{0, 0, 0}, time.Second)
+	b1 := traceFromRates(start, []int{650, 650, 650}, []int{0, 0, 0}, []int{650, 650, 650}, time.Second)
+	agg := traceFromRates(start, []int{1000, 500, 500}, []int{520, 270, 270}, []int{500, 250, 250}, time.Second)
+	for i := range agg {
+		agg[i].Node.Logical.State = "aggregating"
+		agg[i].Node.Logical.Connections = 1
+		agg[i].Node.Logical.RemoteSender.Available = i >= 2
+		agg[i].Node.Logical.RemoteSender.Stale = false
+		agg[i].Node.Logical.RemoteSender.Leg1TXBytes = uint64(i) * bytesForMbps(510, time.Second)
+	}
+	journal := syntheticServerCAPJournal(t, start, []int{520, 270, 270}, []bool{true, false, false})
+	report, err := AnalyzeAggregationWithDemand(b0, b1, agg, Topology{}, LoadSaturating,
+		DemandEvidence{Verified: true, Saturated: true, Method: "controlled-disjoint-evidence"}, &journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Aggregate.SenderOutputEvidenceOverlapWindowRatio != 0 {
+		t.Fatalf("counterexample unexpectedly has overlapping evidence: %+v", report.Aggregate)
+	}
+	if report.Comparison.DegradationEvidenceCoverageRatio != 0 {
+		t.Fatalf("disjoint evidence covered degraded windows: %+v", report.Comparison)
+	}
+	closure := EvaluateDiagnosticClosure(&report, report.Evidence.Journal)
+	if closure.Pass || closure.DegradationLayer == AnswerFull {
+		t.Fatalf("disjoint evidence falsely closed degradation layer: %+v", closure)
+	}
+}
+
+func TestDiagnosticClosureMustNotPassWithBlocking(t *testing.T) {
+	a := completeDiagnosticReport(t, []int{900, 900})
+	b := completeDiagnosticReport(t, []int{1000, 1000})
+	ab, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same-controlled-run", Report: a},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same-controlled-run", Report: b},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := b
+	bad.Aggregate.SenderOutputEvidenceOverlapWindowRatio = 0
+	closure := EvaluateDiagnosticClosure(&bad, bad.Evidence.Journal, ab)
+	if len(closure.Blocking) == 0 || closure.Pass || closure.Error() == nil {
+		t.Fatalf("blocking evidence did not fail closed: %+v", closure)
+	}
+}
+
+func TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB(t *testing.T) {
 	a := completeDiagnosticReport(t, []int{900, 900})
 	b := completeDiagnosticReport(t, []int{1000, 1000})
 	ab, err := CompareAlgorithms(
@@ -310,10 +406,10 @@ func TestDiagnosticClosureCanPassWithOperationalSchedulerEvidenceAndAB(t *testin
 		t.Fatal(err)
 	}
 	closure := EvaluateDiagnosticClosure(&b, b.Evidence.Journal, ab)
-	if !closure.Pass {
+	if !closure.Pass || len(closure.Blocking) != 0 {
 		t.Fatalf("complete evidence should close: %+v", closure)
 	}
 	if closure.SchedulerAllocation != AnswerPartial {
-		t.Fatalf("leg1 transmission was overclaimed as exact assignment: %+v", closure)
+		t.Fatalf("exact scheduler internals were overclaimed: %+v", closure)
 	}
 }

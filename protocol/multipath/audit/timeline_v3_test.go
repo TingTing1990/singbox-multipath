@@ -65,6 +65,22 @@ func TestBuildTimelineRejectsCounterRegression(t *testing.T) {
 	}
 }
 
+func TestBuildTimelineRejectsMixedNodeTags(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{500, 500}, []int{300, 300}, []int{220, 220}, time.Second)
+	trace[1].Node.Tag = "different-node"
+	for index := range trace {
+		var err error
+		trace[index], err = ParseStatus(marshalSnapshot(t, trace[index]))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := BuildTimeline(trace); !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("mixed node tags accepted: %v", err)
+	}
+}
+
 func TestActiveEnvelopePreservesTrailingActiveStall(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	trace := traceFromRates(start, []int{500, 0, 0}, []int{300, 0, 0}, []int{220, 0, 0}, time.Second)
@@ -81,7 +97,7 @@ func TestActiveEnvelopePreservesTrailingActiveStall(t *testing.T) {
 	}
 }
 
-func TestBuildTimelineCapturesPreferredAssignmentFromFrozenStatus(t *testing.T) {
+func TestBuildTimelineKeepsLocalPreferredAssignmentDirectional(t *testing.T) {
 	start := time.Unix(1000, 0).UTC()
 	trace := traceFromRates(start, []int{500}, []int{300}, []int{220}, time.Second)
 	trace[0].Node.Logical.PreferredCapacity = &PreferredCapacityStatus{PreferredAssignedBytes: 1000}
@@ -91,7 +107,27 @@ func TestBuildTimelineCapturesPreferredAssignmentFromFrozenStatus(t *testing.T) 
 		t.Fatal(err)
 	}
 	window := timeline.Windows[0]
-	if !window.PreferredAssignmentEvidence || window.PreferredAssignedMbps != 310 {
-		t.Fatalf("preferred assignment evidence not recovered: %+v", window)
+	if !window.LocalPreferredAssignmentEvidence || window.LocalPreferredAssignedMbps != 310 {
+		t.Fatalf("local preferred assignment evidence not recovered: %+v", window)
+	}
+	if window.ServerPreferredAssignmentEvidence {
+		t.Fatalf("client-local preferred assignment was promoted to server download evidence: %+v", window)
+	}
+}
+
+func TestAttachServerCapacityEvidenceUsesServerCAPWindow(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{500}, []int{300}, []int{220}, time.Second)
+	timeline, err := BuildTimeline(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := syntheticServerCAPJournal(t, start, []int{420}, nil)
+	if err := AttachServerCapacityEvidence(&timeline, journal); err != nil {
+		t.Fatal(err)
+	}
+	window := timeline.Windows[0]
+	if !window.ServerPreferredAssignmentEvidence || !window.ServerPreferredDeliveryEvidence || window.ServerPreferredAssignedMbps != 420 || window.ServerCapacityInstance != "mp-in-test" || window.ServerControllerWindowSeq != 1 {
+		t.Fatalf("server CAP evidence not correlated: %+v", window)
 	}
 }

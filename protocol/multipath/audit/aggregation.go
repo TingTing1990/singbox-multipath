@@ -1,6 +1,9 @@
 package audit
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -40,8 +43,9 @@ type RunMetrics struct {
 	PathLogicalGapMeanMbps                 float64
 	BoosterSenderTXMeanMbps                float64
 	RemoteSenderEvidenceWindowRatio        float64
-	PreferredAssignmentMeanMbps            float64
-	PreferredAssignmentEvidenceWindowRatio float64
+	ServerPreferredAssignmentMeanMbps      float64
+	ServerPreferredAssignmentEvidenceRatio float64
+	SenderOutputEvidenceOverlapWindowRatio float64
 	SinglePathVerified                     bool
 }
 
@@ -89,8 +93,9 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 	var gapNumerator float64
 	var boosterSenderNumerator float64
 	var remoteSenderDuration time.Duration
-	var preferredAssignmentNumerator float64
-	var preferredAssignmentDuration time.Duration
+	var serverAssignmentNumerator float64
+	var serverAssignmentDuration time.Duration
+	var senderOutputOverlapDuration time.Duration
 	for _, window := range active {
 		seconds := window.Duration.Seconds()
 		if seconds <= 0 {
@@ -110,9 +115,12 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 			boosterSenderNumerator += window.BoosterSenderTXMbps * seconds
 			remoteSenderDuration += window.Duration
 		}
-		if window.PreferredAssignmentEvidence {
-			preferredAssignmentNumerator += window.PreferredAssignedMbps * seconds
-			preferredAssignmentDuration += window.Duration
+		if window.ServerPreferredAssignmentEvidence {
+			serverAssignmentNumerator += window.ServerPreferredAssignedMbps * seconds
+			serverAssignmentDuration += window.Duration
+		}
+		if window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {
+			senderOutputOverlapDuration += window.Duration
 		}
 		for leg := range result.Paths {
 			result.LegBytes[leg] += window.LegRXBytes[leg]
@@ -146,10 +154,13 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 		result.BoosterSenderTXMeanMbps = boosterSenderNumerator / remoteSeconds
 		result.RemoteSenderEvidenceWindowRatio = remoteSeconds / seconds
 	}
-	if preferredAssignmentDuration > 0 {
-		assignmentSeconds := preferredAssignmentDuration.Seconds()
-		result.PreferredAssignmentMeanMbps = preferredAssignmentNumerator / assignmentSeconds
-		result.PreferredAssignmentEvidenceWindowRatio = assignmentSeconds / seconds
+	if serverAssignmentDuration > 0 {
+		assignmentSeconds := serverAssignmentDuration.Seconds()
+		result.ServerPreferredAssignmentMeanMbps = serverAssignmentNumerator / assignmentSeconds
+		result.ServerPreferredAssignmentEvidenceRatio = assignmentSeconds / seconds
+	}
+	if senderOutputOverlapDuration > 0 {
+		result.SenderOutputEvidenceOverlapWindowRatio = senderOutputOverlapDuration.Seconds() / seconds
 	}
 	var totalLegBytes uint64
 	for leg := range result.Paths {
@@ -198,6 +209,8 @@ type AlgorithmComparison struct {
 	AlgorithmA               string
 	AlgorithmB               string
 	WorkloadID               string
+	ReportAFingerprint       string
+	ReportBFingerprint       string
 	UsefulMeanDeltaMbps      float64
 	UsefulP10DeltaMbps       float64
 	EfficiencyDelta          float64
@@ -205,12 +218,35 @@ type AlgorithmComparison struct {
 }
 
 type AggregateMetrics struct {
-	BestSingleMbps              float64
-	ReferenceMbps               float64
-	GainVsBestSingle            float64
-	EfficiencyVsReference       float64
-	TimeBelowBestSingleRatio    float64
-	BothPathsBelowBaselineRatio float64
+	BestSingleMbps                   float64
+	ReferenceMbps                    float64
+	GainVsBestSingle                 float64
+	EfficiencyVsReference            float64
+	TimeBelowBestSingleRatio         float64
+	BothPathsBelowBaselineRatio      float64
+	DegradedWindowCount              int
+	DegradationEvidenceCoverageRatio float64
+}
+
+func windowHasDegradationDiscriminator(window Window) bool {
+	if window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {
+		return true
+	}
+	d := window.Diagnostics
+	if d.LocalMemoryPressure || d.ReorderBytes > 0 {
+		return true
+	}
+	if d.RemoteSenderAvailable && !d.RemoteSenderStale {
+		if d.RemoteMemoryPressure {
+			return true
+		}
+		for _, leg := range d.Leg {
+			if leg.RemoteWriteBlockedMS > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func CompareToBaselines(aggregate RunMetrics, baselineLeg0, baselineLeg1 RunMetrics, topology Topology) (AggregateMetrics, error) {
@@ -236,10 +272,14 @@ func CompareToBaselines(aggregate RunMetrics, baselineLeg0, baselineLeg1 RunMetr
 	}
 	result.GainVsBestSingle = aggregate.Useful.MeanMbps/result.BestSingleMbps - 1
 	result.EfficiencyVsReference = aggregate.Useful.MeanMbps / result.ReferenceMbps
-	var belowDuration, bothBelowDuration time.Duration
+	var belowDuration, bothBelowDuration, coveredDegradationDuration time.Duration
 	for _, window := range aggregate.Windows {
 		if window.UsefulMbps < result.BestSingleMbps {
 			belowDuration += window.Duration
+			result.DegradedWindowCount++
+			if windowHasDegradationDiscriminator(window) {
+				coveredDegradationDuration += window.Duration
+			}
 		}
 		if window.LegMbps[0] < a && window.LegMbps[1] < b {
 			bothBelowDuration += window.Duration
@@ -249,6 +289,11 @@ func CompareToBaselines(aggregate RunMetrics, baselineLeg0, baselineLeg1 RunMetr
 		result.TimeBelowBestSingleRatio = float64(belowDuration) / float64(aggregate.Duration)
 		result.BothPathsBelowBaselineRatio = float64(bothBelowDuration) / float64(aggregate.Duration)
 	}
+	if belowDuration > 0 {
+		result.DegradationEvidenceCoverageRatio = float64(coveredDegradationDuration) / float64(belowDuration)
+	} else {
+		result.DegradationEvidenceCoverageRatio = 1
+	}
 	return result, nil
 }
 
@@ -257,6 +302,7 @@ type EvidenceReport struct {
 	AggregateStatusSnapshots   int
 	AggregateEpochs            int
 	AggregateWindows           int
+	AggregateNodeTag           string
 	TemporalResolutionDegraded bool
 	Journal                    JournalReport
 }
@@ -297,6 +343,11 @@ func AnalyzeAggregationWithDemand(baseline0Snapshots, baseline1Snapshots, aggreg
 	if err != nil {
 		return AggregationReport{}, fmt.Errorf("aggregate timeline: %w", err)
 	}
+	if journal != nil {
+		if err := AttachServerCapacityEvidence(&aggTimeline, *journal); err != nil {
+			return AggregationReport{}, fmt.Errorf("aggregate CAP correlation: %w", err)
+		}
+	}
 	b0, err := AnalyzeRun(b0Timeline.Windows)
 	if err != nil {
 		return AggregationReport{}, fmt.Errorf("baseline leg0: %w", err)
@@ -324,6 +375,7 @@ func AnalyzeAggregationWithDemand(baseline0Snapshots, baseline1Snapshots, aggreg
 			AggregateStatusSnapshots:   aggTimeline.StatusSnapshots,
 			AggregateEpochs:            aggTimeline.Epochs,
 			AggregateWindows:           len(agg.Windows),
+			AggregateNodeTag:           aggTimeline.SourceNodeTag,
 			TemporalResolutionDegraded: aggTimeline.TemporalResolutionDegraded,
 		},
 		Load:       load,
@@ -340,6 +392,15 @@ func AnalyzeAggregationWithDemand(baseline0Snapshots, baseline1Snapshots, aggreg
 	return report, nil
 }
 
+func reportFingerprint(report AggregationReport) (string, error) {
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func CompareAlgorithms(a, b AlgorithmRun) (AlgorithmComparison, error) {
 	if a.AlgorithmID == "" || b.AlgorithmID == "" || a.AlgorithmID == b.AlgorithmID ||
 		a.WorkloadID == "" || a.WorkloadID != b.WorkloadID {
@@ -351,17 +412,13 @@ func CompareAlgorithms(a, b AlgorithmRun) (AlgorithmComparison, error) {
 		return AlgorithmComparison{}, ErrAlgorithmNotComparable
 	}
 	if a.Report.Evidence.StatusSchemaVersion != StatusSchemaVersion || b.Report.Evidence.StatusSchemaVersion != StatusSchemaVersion ||
-		!a.Report.Evidence.Journal.Provided || !b.Report.Evidence.Journal.Provided ||
-		!a.Report.Evidence.Journal.EvidenceComplete || !b.Report.Evidence.Journal.EvidenceComplete ||
-		a.Report.Evidence.Journal.DroppedEvents != 0 || b.Report.Evidence.Journal.DroppedEvents != 0 ||
-		a.Report.Evidence.Journal.SequenceGaps != 0 || b.Report.Evidence.Journal.SequenceGaps != 0 ||
+		!journalCompleteForV3(a.Report.Evidence.Journal) || !journalCompleteForV3(b.Report.Evidence.Journal) ||
 		a.Report.Evidence.TemporalResolutionDegraded || b.Report.Evidence.TemporalResolutionDegraded ||
 		len(a.Report.Aggregate.Windows) < 2 || len(b.Report.Aggregate.Windows) < 2 ||
 		a.Report.Aggregate.UsefulBytes == 0 || b.Report.Aggregate.UsefulBytes == 0 ||
 		a.Report.Aggregate.LegBytes[0] == 0 || a.Report.Aggregate.LegBytes[1] == 0 ||
 		b.Report.Aggregate.LegBytes[0] == 0 || b.Report.Aggregate.LegBytes[1] == 0 ||
-		a.Report.Aggregate.PreferredAssignmentEvidenceWindowRatio == 0 || b.Report.Aggregate.PreferredAssignmentEvidenceWindowRatio == 0 ||
-		a.Report.Aggregate.RemoteSenderEvidenceWindowRatio == 0 || b.Report.Aggregate.RemoteSenderEvidenceWindowRatio == 0 {
+		a.Report.Aggregate.SenderOutputEvidenceOverlapWindowRatio == 0 || b.Report.Aggregate.SenderOutputEvidenceOverlapWindowRatio == 0 {
 		return AlgorithmComparison{}, ErrAlgorithmNotComparable
 	}
 	if math.Abs(a.Report.Baseline.Leg0.Useful.MeanMbps-b.Report.Baseline.Leg0.Useful.MeanMbps) > 1e-9 ||
@@ -369,11 +426,21 @@ func CompareAlgorithms(a, b AlgorithmRun) (AlgorithmComparison, error) {
 		math.Abs(a.Report.Comparison.ReferenceMbps-b.Report.Comparison.ReferenceMbps) > 1e-9 {
 		return AlgorithmComparison{}, ErrAlgorithmNotComparable
 	}
+	reportAID, err := reportFingerprint(a.Report)
+	if err != nil {
+		return AlgorithmComparison{}, fmt.Errorf("algorithm A report identity: %w", err)
+	}
+	reportBID, err := reportFingerprint(b.Report)
+	if err != nil {
+		return AlgorithmComparison{}, fmt.Errorf("algorithm B report identity: %w", err)
+	}
 	return AlgorithmComparison{
 		Comparable:               true,
 		AlgorithmA:               a.AlgorithmID,
 		AlgorithmB:               b.AlgorithmID,
 		WorkloadID:               a.WorkloadID,
+		ReportAFingerprint:       reportAID,
+		ReportBFingerprint:       reportBID,
 		UsefulMeanDeltaMbps:      b.Report.Aggregate.Useful.MeanMbps - a.Report.Aggregate.Useful.MeanMbps,
 		UsefulP10DeltaMbps:       b.Report.Aggregate.Useful.P10Mbps - a.Report.Aggregate.Useful.P10Mbps,
 		EfficiencyDelta:          b.Report.Comparison.EfficiencyVsReference - a.Report.Comparison.EfficiencyVsReference,
