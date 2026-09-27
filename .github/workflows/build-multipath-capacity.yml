@@ -105,18 +105,18 @@ jobs:
             'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
             'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
             'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
-            'protocol/multipath/audit/aggregation.go':'a15fc54b8d523b8724611ded70375b8d4a9e12a8c4ab7cee158bed85cf09709f',
-            'protocol/multipath/audit/aggregation_v3_test.go':'fcee7884d4848b9944a46abac14f3f72a8ffc30fb1ebc480c6f5f8d7bd9d572c',
+            'protocol/multipath/audit/aggregation.go':'dad28f0a87619c54c19e9e9a976f724b6758445fe344f388961c0cfa6dfca462',
+            'protocol/multipath/audit/aggregation_v3_test.go':'286e9699d92ae0be3683d53e3090eda6300ac0b07ce60bd49ce697b9ce369df1',
             'protocol/multipath/audit/diagnosis.go':'55d697fd311dacd4340f304e6756d9748fe429ceaacc06902bd1e4e0c31c40e3',
-            'protocol/multipath/audit/field_replay.go':'1bbf02b755354b10328913fa4423462af1a5310818e4aa8febd05b3cecc2e482',
+            'protocol/multipath/audit/field_replay.go':'6feee5ae9c9f3406f6e1f68a38476cada03e6003c671125df36a481af1292758',
             'protocol/multipath/audit/field_acquisition.go':'cadc7b165fe0f6883a20de72fc974d981ac94a1ec0be57f702b34e34ad7a518a',
-            'protocol/multipath/audit/field_offline_closure_test.go':'9232445b116126b1572752625f833bfaee1f04afc03718421b1df88c38f9c4c1',
+            'protocol/multipath/audit/field_offline_closure_test.go':'7abb9cf02b802edf74c11bdea11c01f509523c59a59069fc50df44535e06baef',
             'protocol/multipath/audit/field_replay_test.go':'fd88ca1bc5612a52ac76e9ed4c890fe79b6c4cc8e161a3f668b58de69f87ab79',
             'protocol/multipath/audit/status.go':'e4fec79e7ff60f7df4eb24582948e321977391f7a79c3c4fe393117aff0e2726',
             'protocol/multipath/audit/status_v3_test.go':'7f2c76821e645e44dab7d606fd3cc5013dc3f1879c2df49ff139a6871b55d57d',
-            'protocol/multipath/audit/timeline.go':'692b122d00afcc15eb3791970cd130e5b10cd11f12e15172a1f7c3bb436779ee',
+            'protocol/multipath/audit/timeline.go':'10705a37d05989c3ab727f6c8614e300a42866713c99cd8b01b0db6776f91049',
             'protocol/multipath/audit/timeline_v3_test.go':'27ab05035e1fde95bc0900d850890724ee42e9e9d4d01c9bfb7eb3d0c3e7556d',
-            'protocol/multipath/audit/v3_test_helpers_test.go':'78d1b761f1e609703fef31f3f4653e97a4ee071f45e19b39b2195221fea64bfb',
+            'protocol/multipath/audit/v3_test_helpers_test.go':'c21e170281b9ed254c5398f26468de5db0fdca2cd57511a0e67ff71b443f4390',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -299,7 +299,9 @@ jobs:
           req('LocalPreferredAssignmentEvidence' in timeline_v3 and 'ServerPreferredAssignmentEvidence' in timeline_v3 and 'AttachServerCapacityEvidence' in timeline_v3,'directional CAP/status evidence model missing')
           req('LocalPreferredAssignmentEvidence' not in aggregation_v3 and 'LocalPreferredAssignmentEvidence' not in replay_v3,'client-local capacity leaked into download acceptance')
           req('CapacityEvidence' in replay_v3 and 'ValidServerEvidence' in replay_v3,'server CAP per-window provenance missing')
-          req('SenderOutputEvidenceOverlapWindowRatio' in aggregation_v3 and 'DegradationEvidenceCoverageRatio' in aggregation_v3,'same-window degradation evidence coverage missing')
+          req('ValidServerInterval' in replay_v3 and 'IntervalStart' in replay_v3 and 'IntervalEnd' in replay_v3 and 'IntervalKnown' in replay_v3,'server CAP statistical-interval provenance missing')
+          req('ServerCapacityCoverageDuration' in timeline_v3 and 'ServerCapacityCoverageRatio' in timeline_v3 and 'resetServerCapacityCorrelation' in timeline_v3,'CAP duration coverage or replace-not-append binding missing')
+          req('SenderOutputEvidenceOverlapWindowRatio' in aggregation_v3 and 'DegradationEvidenceCoverageRatio' in aggregation_v3 and 'boundedServerCapacityCoverage' in aggregation_v3,'duration-bounded degradation evidence coverage missing')
           req('ReportAFingerprint' in aggregation_v3 and 'ReportBFingerprint' in aggregation_v3,'A/B source-report binding missing')
           req('ErrUnverifiedDemand' in aggregation_v3 and 'CompareAlgorithms' in aggregation_v3,'verified-demand or A/B comparison contract missing')
           req('RecognizedEvents == 0' in replay_v3 and 'len(closure.Blocking) == 0' in replay_v3,'fail-closed journal/blocking acceptance contract missing')
@@ -325,7 +327,7 @@ jobs:
               req(json_fields(producer,producer_name)==json_fields(status_v3,audit_name),'frozen status producer fields not losslessly represented '+producer_name+' -> '+audit_name)
           req(json_fields(recovery,'recoveryStatus')==json_fields(status_v3,'RecoveryStatus'),'frozen recovery producer fields not losslessly represented')
           req(json_fields(recovery,'recoveryPathStatus')==json_fields(status_v3,'RecoveryPathStatus'),'frozen recovery path fields not losslessly represented')
-          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation','TestOfflineClosureStatusParserPreservesFrozenProducerFields','TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots','TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState','TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation','TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence','TestOfflineClosureReportSerializesForensicEvidence','TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField','TestOfflineClosureCaptureStatusFileWritesInitialSnapshot','TestOfflineClosureLatestCAPEventPreservesInWindowStateChange'):
+          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation','TestOfflineClosureStatusParserPreservesFrozenProducerFields','TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots','TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState','TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation','TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence','TestOfflineClosureReportSerializesForensicEvidence','TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField','TestOfflineClosureCaptureStatusFileWritesInitialSnapshot','TestOfflineClosureLatestCAPEventPreservesInWindowStateChange','TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail','TestOfflineClosureCAPIntervalRequiresConsecutiveSequence','TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback','TestOfflineClosureRebindingClearsPreviousInstanceEvidence','TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap','TestOfflineClosureCaptureToReplayUsesProvableCAPInterval'):
               req(test_name in tests_v3,'V3 repair regression missing '+test_name)
           req('diagnostic closure failed' in replay_v3,'FIELD diagnostic closure gate missing')
           print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
@@ -507,11 +509,11 @@ jobs:
         run: |
           set -euo pipefail
           AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -race -count=20 -timeout=15m -tags "$BUILD_TAGS" \
-            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall|TestOfflineClosureStatusParserPreservesFrozenProducerFields|TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots|TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState|TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation|TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence|TestOfflineClosureReportSerializesForensicEvidence|TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField|TestOfflineClosureCaptureStatusFileWritesInitialSnapshot|TestOfflineClosureLatestCAPEventPreservesInWindowStateChange)$' \
+            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall|TestOfflineClosureStatusParserPreservesFrozenProducerFields|TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots|TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState|TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation|TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence|TestOfflineClosureReportSerializesForensicEvidence|TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField|TestOfflineClosureCaptureStatusFileWritesInitialSnapshot|TestOfflineClosureLatestCAPEventPreservesInWindowStateChange|TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail|TestOfflineClosureCAPIntervalRequiresConsecutiveSequence|TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback|TestOfflineClosureRebindingClearsPreviousInstanceEvidence|TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap|TestOfflineClosureCaptureToReplayUsesProvableCAPInterval)$' \
             ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-repair-contracts.log"
           echo 'PASS historical FIELD journals replay and remain fail-closed without missing status/baseline/A-B inputs'
           echo 'PASS deterministic integrated status + server CAP + verified-demand + bound A/B repair contracts'
-          echo 'PASS V3 offline FIELD closure: outbound status_file capture + explicit server-instance journal binding + lossless frozen status schema + exact CAP/window timeline retention'
+          echo 'PASS LOCAL/SIMULATION V3 offline data contract: outbound status_file capture + explicit server-instance journal binding + lossless frozen status schema + interval-accurate CAP/window retention'
           echo 'NOTE integrated positive closure is LOCAL/SIMULATION evidence, not a claim that historical FIELD fixtures contain complete status traces'
 
       - name: Server Audit V3 repair mutation controls
@@ -529,8 +531,8 @@ jobs:
           journal_new = "func journalCompleteForV3(report JournalReport) bool {\n\treturn report.Provided && report.EvidenceComplete && report.DroppedEvents == 0 && report.SequenceGaps == 0\n}"
           mutations=[
             ('v3-f01-local-capacity-leak','protocol/multipath/audit/aggregation.go',
-             '\t\tif window.ServerPreferredAssignmentEvidence {',
-             '\t\tif window.LocalPreferredAssignmentEvidence {',
+             '\t\tif window.ServerPreferredAssignmentEvidence {\n\t\t\tcoverage := boundedServerCapacityCoverage(window)',
+             '\t\tif window.LocalPreferredAssignmentEvidence {\n\t\t\tcoverage := window.Duration',
              '^TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence$'),
             ('v3-f02-empty-journal-pass','protocol/multipath/audit/field_replay.go',
              journal_old, journal_new,
@@ -552,9 +554,25 @@ jobs:
              '\t\tif strings.Contains(line, marker) || strings.Contains(line, capacityMarker) || strings.Contains(line, "other-instance") {',
              '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
             ('v3-offline-cap-state-loss','protocol/multipath/audit/timeline.go',
-             '\t\twindow.ServerTargetMbps = latest.TargetMbps',
-             '\t\twindow.ServerTargetMbps = 0',
+             '\t\t\twindow.ServerTargetMbps = latestEvent.TargetMbps',
+             '\t\t\twindow.ServerTargetMbps = 0',
              '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
+            ('v3-offline-cap-endpoint-full-window','protocol/multipath/audit/timeline.go',
+             '\t\t\tcoveredDuration += overlap',
+             '\t\t\tcoveredDuration = window.Duration',
+             '^TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail$'),
+            ('v3-offline-cap-sequence-gap-bridged','protocol/multipath/audit/field_replay.go',
+             '\t\tconsecutive := current.ControllerWindowSeq == previous.value.ControllerWindowSeq+1',
+             '\t\tconsecutive := true',
+             '^TestOfflineClosureCAPIntervalRequiresConsecutiveSequence$'),
+            ('v3-offline-cap-time-rollback-bridged','protocol/multipath/audit/field_replay.go',
+             '\t\tstrictlyForward := current.At.After(previous.maxObserved)',
+             '\t\tstrictlyForward := true',
+             '^TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback$'),
+            ('v3-offline-cap-rebind-retains-old','protocol/multipath/audit/timeline.go',
+             '\t\tresetServerCapacityCorrelation(&timeline.Windows[windowIndex])',
+             '\t\tif false { resetServerCapacityCorrelation(&timeline.Windows[windowIndex]) }',
+             '^TestOfflineClosureRebindingClearsPreviousInstanceEvidence$'),
             ('v3-offline-status-sample-dup','protocol/multipath/audit/field_acquisition.go',
              '\tif s.haveLast && identity == s.lastIdentity {',
              '\tif false && s.haveLast && identity == s.lastIdentity {',
@@ -596,7 +614,7 @@ jobs:
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 11 V3 REPAIR/OFFLINE-CLOSURE MUTANTS KILLED')
+          print('ALL 15 V3 REPAIR/OFFLINE-CLOSURE MUTANTS KILLED')
           PY
 
       - name: Existing repeated-booster-disconnect regression x20
