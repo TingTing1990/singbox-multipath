@@ -2,10 +2,12 @@ package audit
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -40,6 +42,8 @@ type JournalReport struct {
 	EvidenceComplete              bool
 	DroppedEvents                 uint64
 	SequenceGaps                  uint64
+	SequenceEpochs                uint64
+	ValidationErrors              []string
 	CapacityWindows               int
 	ServerCapacityWindows         int
 	DeliveryReadyWindows          int
@@ -55,6 +59,8 @@ type JournalReport struct {
 	LegAttached                   [2]bool
 	LegDataActive                 [2]bool
 	CapacityEvidence              []CapacityWindowEvidence
+	CapacityEvents                []CapacityState
+	Events                        []Event
 }
 
 func journalCompleteForV3(report JournalReport) bool {
@@ -94,6 +100,46 @@ func journalMinMax(values []float64) (float64, float64) {
 	return minimum, maximum
 }
 
+func frozenLogTimestamp(raw string) (time.Time, bool) {
+	const layout = "-0700 2006-01-02 15:04:05"
+	const width = len("+0800 2026-09-27 11:23:23")
+	if len(raw) < width {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(layout, raw[:width])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// AnalyzeJournalForInstance filters a mixed server journal by the explicit
+// inbound instance before V2 sequence validation. CAP event_seq is instance
+// scoped, so validating an interleaved multi-instance journal as one sequence
+// would create false gaps and cross-instance evidence.
+func AnalyzeJournalForInstance(reader io.Reader, serverInstance string) (JournalReport, error) {
+	if serverInstance == "" {
+		return JournalReport{}, fmt.Errorf("missing server instance binding")
+	}
+	marker := "[" + serverInstance + "]"
+	capacityMarker := "instance=\"" + serverInstance + "\""
+	var filtered strings.Builder
+	scanner := bufio.NewScanner(reader)
+	buffer := make([]byte, 64<<10)
+	scanner.Buffer(buffer, 8<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, marker) || strings.Contains(line, capacityMarker) {
+			filtered.WriteString(line)
+			filtered.WriteByte('\n')
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return JournalReport{}, err
+	}
+	return AnalyzeJournal(strings.NewReader(filtered.String()))
+}
+
 func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 	report := JournalReport{Provided: true}
 	analyzer := NewAnalyzer()
@@ -102,7 +148,8 @@ func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 	buffer := make([]byte, 64<<10)
 	scanner.Buffer(buffer, 8<<20)
 	for scanner.Scan() {
-		event, ok, err := ParseLine(scanner.Text())
+		rawLine := scanner.Text()
+		event, ok, err := ParseLine(rawLine)
 		if err != nil {
 			return report, err
 		}
@@ -110,9 +157,16 @@ func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 			report.IgnoredLines++
 			continue
 		}
+		if event.ObservedAt.IsZero() {
+			if at, timestamped := frozenLogTimestamp(rawLine); timestamped {
+				event.ObservedAt = at
+			}
+		}
 		report.RecognizedEvents++
+		report.Events = append(report.Events, event)
 		analyzer.Consume(event)
 		if event.Capacity != nil {
+			report.CapacityEvents = append(report.CapacityEvents, *event.Capacity)
 			if event.Capacity.TargetMbps > 0 {
 				report.TargetMbps = event.Capacity.TargetMbps
 			}
@@ -171,11 +225,96 @@ func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 	report.EvidenceComplete = v2.EvidenceComplete
 	report.DroppedEvents = v2.DroppedEvents
 	report.SequenceGaps = v2.SequenceGaps
+	report.SequenceEpochs = v2.SequenceEpochs
+	report.ValidationErrors = append([]string(nil), v2.ValidationErrors...)
 	report.PreferredAssignmentMedianMbps = journalMedian(assignments)
 	report.PreferredAssignmentMinMbps, report.PreferredAssignmentMaxMbps = journalMinMax(assignments)
 	report.PreferredDeliveryMedianMbps = journalMedian(deliveries)
 	report.PreferredDeliveryMinMbps, report.PreferredDeliveryMaxMbps = journalMinMax(deliveries)
 	return report, nil
+}
+
+type FieldRunBinding struct {
+	ClientNodeTag  string
+	ServerInstance string
+}
+
+type FieldRunReplay struct {
+	Binding  FieldRunBinding
+	Timeline Timeline
+	Journal  JournalReport
+	Run      RunMetrics
+}
+
+// ReplayFieldRun is the V3 FIELD entry point for one real run. It consumes the
+// external trace of the frozen outbound status_file plus the frozen server
+// journal, binds them explicitly, then returns the correlated per-window replay.
+// It does not add or require any runtime collector or runtime field.
+func ReplayFieldRun(statusTrace io.Reader, serverJournal io.Reader, binding FieldRunBinding) (FieldRunReplay, error) {
+	var result FieldRunReplay
+	result.Binding = binding
+	if binding.ClientNodeTag == "" || binding.ServerInstance == "" {
+		return result, fmt.Errorf("FIELD replay requires explicit client node tag and server instance binding")
+	}
+	snapshots, err := ReadStatusTrace(statusTrace)
+	if err != nil {
+		return result, fmt.Errorf("status trace: %w", err)
+	}
+	if len(snapshots) < 2 {
+		return result, fmt.Errorf("status trace requires at least two snapshots")
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.Node.Tag != binding.ClientNodeTag {
+			return result, fmt.Errorf("%w: status node.tag=%q want=%q", ErrInvalidStatus, snapshot.Node.Tag, binding.ClientNodeTag)
+		}
+	}
+	journal, err := AnalyzeJournalForInstance(serverJournal, binding.ServerInstance)
+	if err != nil {
+		return result, fmt.Errorf("server journal: %w", err)
+	}
+	if !journalCompleteForV3(journal) {
+		return result, fmt.Errorf("server journal lacks complete CAP_WINDOW evidence for instance %q", binding.ServerInstance)
+	}
+	timeline, err := BuildTimeline(snapshots)
+	if err != nil {
+		return result, fmt.Errorf("status timeline: %w", err)
+	}
+	if err := AttachServerCapacityEvidenceForInstance(&timeline, journal, binding.ServerInstance); err != nil {
+		return result, fmt.Errorf("server CAP correlation: %w", err)
+	}
+	correlatedCapacityWindows := 0
+	for _, window := range timeline.Windows {
+		if len(window.ServerCapacityEvidence) > 0 {
+			correlatedCapacityWindows++
+		}
+	}
+	if correlatedCapacityWindows == 0 {
+		return result, fmt.Errorf("server CAP evidence for instance %q does not overlap the client status trace", binding.ServerInstance)
+	}
+	run, err := AnalyzeRun(timeline.Windows)
+	if err != nil {
+		return result, fmt.Errorf("FIELD run: %w", err)
+	}
+	result.Timeline = timeline
+	result.Journal = journal
+	result.Run = run
+	return result, nil
+}
+
+// WriteFieldRunReplayJSON serializes the complete correlated offline replay.
+// It is intentionally a pure offline sink: the raw FIELD inputs remain the
+// evidence source, while this report contains the typed status snapshots,
+// exact CAP/runtime events, per-window correlations, and derived run metrics.
+func WriteFieldRunReplayJSON(writer io.Writer, replay FieldRunReplay) error {
+	if writer == nil {
+		return fmt.Errorf("nil FIELD replay report writer")
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(replay); err != nil {
+		return fmt.Errorf("encode FIELD replay report: %w", err)
+	}
+	return nil
 }
 
 type AnswerState string

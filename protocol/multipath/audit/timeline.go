@@ -30,6 +30,15 @@ type PathDiagnostics struct {
 }
 
 type WindowDiagnostics struct {
+	// Full frozen status evidence is retained here so V3 does not discard fields
+	// that already exist in status_file. The legacy scalar fields below remain for
+	// existing diagnosis code and compatibility.
+	Memory       MemoryStatus
+	Logical      LogicalStatus
+	LocalSender  SenderDiagnostics
+	RemoteSender SenderDiagnostics
+	LegStatus    [2]LegStatus
+
 	LocalMemoryPressure  bool
 	LocalMemoryUsedBytes int64
 	ReorderBytes         int64
@@ -46,16 +55,23 @@ type WindowDiagnostics struct {
 }
 
 type Window struct {
-	Epoch                int
-	Start                time.Time
-	End                  time.Time
-	Duration             time.Duration
-	UsefulRXBytes        uint64
-	LegRXBytes           [2]uint64
-	UsefulMbps           float64
-	LegMbps              [2]float64
-	PhysicalMbps         float64
-	PathLogicalGapMbps   float64
+	Epoch    int
+	Start    time.Time
+	End      time.Time
+	Duration time.Duration
+
+	// TCP traffic is derived from frozen cumulative counters with UDP removed.
+	UsefulTXBytes      uint64
+	UsefulRXBytes      uint64
+	LegTXBytes         [2]uint64
+	LegRXBytes         [2]uint64
+	UsefulTXMbps       float64
+	UsefulMbps         float64
+	LegTXMbps          [2]float64
+	LegMbps            [2]float64
+	PhysicalMbps       float64
+	PathLogicalGapMbps float64
+
 	BoosterSenderTXMbps  float64
 	RemoteSenderEvidence bool
 
@@ -66,8 +82,9 @@ type Window struct {
 	LocalPreferredAssignedMbps       float64
 	LocalPreferredAssignmentEvidence bool
 
-	// Server preferred assignment/delivery are correlated offline from existing
-	// server CAP_WINDOW evidence. No runtime field or collector is added.
+	// Existing frozen server CAP_WINDOW evidence. Mean assignment/delivery are
+	// retained for existing aggregation metrics; the exact per-event values and
+	// all other CAP state are retained below for forensic replay.
 	ServerPreferredAssignedMbps       float64
 	ServerPreferredDeliveryMbps       float64
 	ServerPreferredAssignmentEvidence bool
@@ -75,16 +92,35 @@ type Window struct {
 	ServerCapacityInstance            string
 	ServerControllerWindowSeq         uint64
 	ServerCapacityEventCount          int
+	ServerTargetMbps                  float64
+	ServerDeliveryReady               bool
+	ServerProtectedMbps               float64
+	ServerProtectionValid             bool
+	ServerProtectionActive            bool
+	ServerDegradeWindows              int
+	ServerBacklogBytes                int64
+	ServerQueueBytes                  int64
+	ServerCapacityEvidence            []CapacityWindowEvidence
+	ServerCAPEvents                   []CapacityState
+	ServerLatestCAPEvent              *CapacityState
+	ServerCAPEventCount               int
+	RuntimeEvents                     []Event
 
 	LogicalState       string
 	LogicalConnections int
 	Active             bool
+	Parameters         ParametersStatus
+	Recovery           *RecoveryStatus
+	NodeAggregation    string
+	UDPOutbound        string
+	TCPFastOpen        bool
 	Diagnostics        WindowDiagnostics
 	ResolutionDegraded bool
 }
 
 type Timeline struct {
 	Windows                    []Window
+	Snapshots                  []StatusSnapshot
 	Epochs                     int
 	StatusSnapshots            int
 	SourceNodeTag              string
@@ -94,6 +130,10 @@ type Timeline struct {
 func diagnosticsFromSnapshot(snapshot StatusSnapshot) WindowDiagnostics {
 	logical := snapshot.Node.Logical
 	d := WindowDiagnostics{
+		Memory:                snapshot.Node.Memory,
+		Logical:               logical,
+		LocalSender:           logical.LocalSender,
+		RemoteSender:          logical.RemoteSender,
 		LocalMemoryPressure:   snapshot.Node.Memory.Pressure,
 		LocalMemoryUsedBytes:  snapshot.Node.Memory.UsedBytes,
 		ReorderBytes:          logical.ReorderBytes,
@@ -107,6 +147,7 @@ func diagnosticsFromSnapshot(snapshot StatusSnapshot) WindowDiagnostics {
 	}
 	for index := range d.Leg {
 		leg := snapshot.Node.Legs[index]
+		d.LegStatus[index] = leg
 		d.Leg[index] = PathDiagnostics{
 			BacklogBytes:                 leg.BacklogBytes,
 			WritingBytes:                 leg.WritingBytes,
@@ -140,6 +181,7 @@ func counterDelta(name string, previous, current uint64) (uint64, error) {
 func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 	var result Timeline
 	result.StatusSnapshots = len(snapshots)
+	result.Snapshots = append([]StatusSnapshot(nil), snapshots...)
 	if len(snapshots) == 0 {
 		return result, nil
 	}
@@ -171,13 +213,21 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 		if err != nil {
 			return result, err
 		}
-		useful, err := counterDelta("logical tcp rx", previousView.LogicalRX, currentView.LogicalRX)
+		usefulTX, err := counterDelta("logical tcp tx", previousView.LogicalTX, currentView.LogicalTX)
 		if err != nil {
 			return result, err
 		}
-		var legBytes [2]uint64
-		for leg := range legBytes {
-			legBytes[leg], err = counterDelta(fmt.Sprintf("leg%d tcp rx", leg), previousView.LegRX[leg], currentView.LegRX[leg])
+		usefulRX, err := counterDelta("logical tcp rx", previousView.LogicalRX, currentView.LogicalRX)
+		if err != nil {
+			return result, err
+		}
+		var legTXBytes, legRXBytes [2]uint64
+		for leg := range legRXBytes {
+			legTXBytes[leg], err = counterDelta(fmt.Sprintf("leg%d tcp tx", leg), previousView.LegTX[leg], currentView.LegTX[leg])
+			if err != nil {
+				return result, err
+			}
+			legRXBytes[leg], err = counterDelta(fmt.Sprintf("leg%d tcp rx", leg), previousView.LegRX[leg], currentView.LegRX[leg])
 			if err != nil {
 				return result, err
 			}
@@ -192,16 +242,25 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 			Start:              previous.GeneratedAt,
 			End:                current.GeneratedAt,
 			Duration:           duration,
-			UsefulRXBytes:      useful,
-			LegRXBytes:         legBytes,
+			UsefulTXBytes:      usefulTX,
+			UsefulRXBytes:      usefulRX,
+			LegTXBytes:         legTXBytes,
+			LegRXBytes:         legRXBytes,
 			LogicalState:       current.Node.Logical.State,
 			LogicalConnections: current.Node.Logical.Connections,
 			Active:             previous.Node.Logical.Connections > 0 || current.Node.Logical.Connections > 0,
+			Parameters:         current.Node.Parameters,
+			Recovery:           current.Node.Recovery,
+			NodeAggregation:    current.Node.Aggregation,
+			UDPOutbound:        current.Node.UDPOutbound,
+			TCPFastOpen:        current.Node.TCPFastOpen,
 			Diagnostics:        diagnosticsFromSnapshot(current),
 		}
-		window.UsefulMbps = float64(useful) * 8 / seconds / 1_000_000
+		window.UsefulTXMbps = float64(usefulTX) * 8 / seconds / 1_000_000
+		window.UsefulMbps = float64(usefulRX) * 8 / seconds / 1_000_000
 		for leg := range window.LegMbps {
-			window.LegMbps[leg] = float64(legBytes[leg]) * 8 / seconds / 1_000_000
+			window.LegTXMbps[leg] = float64(legTXBytes[leg]) * 8 / seconds / 1_000_000
+			window.LegMbps[leg] = float64(legRXBytes[leg]) * 8 / seconds / 1_000_000
 		}
 		window.PhysicalMbps = window.LegMbps[0] + window.LegMbps[1]
 		window.PathLogicalGapMbps = window.PhysicalMbps - window.UsefulMbps
@@ -249,48 +308,94 @@ func BuildTimeline(snapshots []StatusSnapshot) (Timeline, error) {
 // explicit server instance with a timestamp; evidence from another side is not
 // re-labeled as download assignment.
 func AttachServerCapacityEvidence(timeline *Timeline, journal JournalReport) error {
+	instances := make(map[string]struct{})
+	for _, evidence := range journal.CapacityEvidence {
+		if evidence.ValidServerEvidence() {
+			instances[evidence.Instance] = struct{}{}
+		}
+	}
+	if len(instances) > 1 {
+		return fmt.Errorf("%w: multiple server CAP instances cannot be correlated to one status trace without an explicit binding", ErrInvalidStatus)
+	}
+	instance := ""
+	for value := range instances {
+		instance = value
+	}
+	return AttachServerCapacityEvidenceForInstance(timeline, journal, instance)
+}
+
+// AttachServerCapacityEvidenceForInstance binds a client/outbound status trace to
+// one explicit frozen server/inbound instance. This is required in production
+// journals that contain more than one multipath inbound; it prevents evidence
+// from another instance being merged into the replay.
+func AttachServerCapacityEvidenceForInstance(timeline *Timeline, journal JournalReport, serverInstance string) error {
 	if timeline == nil || len(timeline.Windows) == 0 {
 		return nil
 	}
-	instances := make(map[string]struct{})
-	for _, evidence := range journal.CapacityEvidence {
-		if !evidence.ValidServerEvidence() {
-			continue
-		}
-		instances[evidence.Instance] = struct{}{}
+	if serverInstance == "" {
+		return fmt.Errorf("%w: missing server CAP instance binding", ErrInvalidStatus)
 	}
-	if len(instances) > 1 {
-		return fmt.Errorf("%w: multiple server CAP instances cannot be correlated to one status trace", ErrInvalidStatus)
-	}
-
 	for windowIndex := range timeline.Windows {
 		window := &timeline.Windows[windowIndex]
 		var assignmentSum, deliverySum float64
 		var count int
-		var instance string
-		var lastSeq uint64
-		for _, evidence := range journal.CapacityEvidence {
-			if !evidence.ValidServerEvidence() || !evidence.At.After(window.Start) || evidence.At.After(window.End) {
+		var latestWindow *CapacityWindowEvidence
+		var latestEvent *CapacityState
+		for evidenceIndex := range journal.CapacityEvidence {
+			evidence := journal.CapacityEvidence[evidenceIndex]
+			if !evidence.ValidServerEvidence() || evidence.Instance != serverInstance || !evidence.At.After(window.Start) || evidence.At.After(window.End) {
 				continue
 			}
+			window.ServerCapacityEvidence = append(window.ServerCapacityEvidence, evidence)
 			assignmentSum += evidence.PreferredAssignmentMbps
 			deliverySum += evidence.DeliveryMbps
 			count++
-			instance = evidence.Instance
-			if evidence.ControllerWindowSeq > lastSeq {
-				lastSeq = evidence.ControllerWindowSeq
+			if latestWindow == nil || evidence.At.After(latestWindow.At) || (evidence.At.Equal(latestWindow.At) && evidence.ControllerWindowSeq > latestWindow.ControllerWindowSeq) {
+				copy := evidence
+				latestWindow = &copy
 			}
 		}
-		if count == 0 {
-			continue
+		for eventIndex := range journal.CapacityEvents {
+			event := journal.CapacityEvents[eventIndex]
+			if event.Side != "server" || event.Instance != serverInstance || event.At.IsZero() || !event.At.After(window.Start) || event.At.After(window.End) {
+				continue
+			}
+			window.ServerCAPEvents = append(window.ServerCAPEvents, event)
+			if latestEvent == nil || event.At.After(latestEvent.At) || (event.At.Equal(latestEvent.At) && event.EventSeq > latestEvent.EventSeq) {
+				copy := event
+				latestEvent = &copy
+			}
 		}
-		window.ServerPreferredAssignedMbps = assignmentSum / float64(count)
-		window.ServerPreferredDeliveryMbps = deliverySum / float64(count)
-		window.ServerPreferredAssignmentEvidence = true
-		window.ServerPreferredDeliveryEvidence = true
-		window.ServerCapacityInstance = instance
-		window.ServerControllerWindowSeq = lastSeq
-		window.ServerCapacityEventCount = count
+		for eventIndex := range journal.Events {
+			event := journal.Events[eventIndex]
+			if event.ObservedAt.IsZero() || !event.ObservedAt.After(window.Start) || event.ObservedAt.After(window.End) {
+				continue
+			}
+			window.RuntimeEvents = append(window.RuntimeEvents, event)
+		}
+		if count > 0 && latestWindow != nil {
+			window.ServerPreferredAssignedMbps = assignmentSum / float64(count)
+			window.ServerPreferredDeliveryMbps = deliverySum / float64(count)
+			window.ServerPreferredAssignmentEvidence = true
+			window.ServerPreferredDeliveryEvidence = true
+			window.ServerCapacityInstance = serverInstance
+			window.ServerCapacityEventCount = count
+		}
+		if latestEvent != nil {
+			copy := *latestEvent
+			window.ServerLatestCAPEvent = &copy
+			window.ServerCAPEventCount = len(window.ServerCAPEvents)
+			window.ServerCapacityInstance = serverInstance
+			window.ServerControllerWindowSeq = latestEvent.ControllerWindowSeq
+			window.ServerTargetMbps = latestEvent.TargetMbps
+			window.ServerDeliveryReady = latestEvent.DeliveryReady
+			window.ServerProtectedMbps = latestEvent.ProtectedMbps
+			window.ServerProtectionValid = latestEvent.ProtectionValid
+			window.ServerProtectionActive = latestEvent.ProtectionActive
+			window.ServerDegradeWindows = latestEvent.DegradeWindows
+			window.ServerBacklogBytes = latestEvent.BacklogBytes
+			window.ServerQueueBytes = latestEvent.QueueBytes
+		}
 	}
 	return nil
 }
