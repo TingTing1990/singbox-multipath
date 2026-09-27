@@ -26,10 +26,69 @@ type CapacityWindowEvidence struct {
 	DegradeWindows          int
 	BacklogBytes            int64
 	QueueBytes              int64
+
+	// CAP_WINDOW rates summarize the completed controller interval ending at At.
+	// The frozen runtime does not emit that interval's start explicitly. V3 may
+	// reconstruct it only when the immediately preceding CAP_WINDOW endpoint for
+	// the same side/instance is a trustworthy temporal anchor and the controller
+	// window sequence is consecutive. First endpoints, sequence gaps/resets and
+	// timestamp rollback therefore remain explicitly uncovered.
+	IntervalStart time.Time
+	IntervalEnd   time.Time
+	IntervalKnown bool
 }
 
 func (e CapacityWindowEvidence) ValidServerEvidence() bool {
 	return e.Side == "server" && e.Instance != "" && !e.At.IsZero()
+}
+
+func (e CapacityWindowEvidence) ValidServerInterval() bool {
+	return e.ValidServerEvidence() && e.IntervalKnown && !e.IntervalStart.IsZero() &&
+		e.IntervalEnd.Equal(e.At) && e.IntervalEnd.After(e.IntervalStart)
+}
+
+func deriveCapacityEvidenceIntervals(evidence []CapacityWindowEvidence) {
+	type groupKey struct {
+		side     string
+		instance string
+	}
+	type anchor struct {
+		value       CapacityWindowEvidence
+		trusted     bool
+		maxObserved time.Time
+	}
+
+	anchors := make(map[groupKey]anchor)
+	for index := range evidence {
+		current := &evidence[index]
+		if !current.ValidServerEvidence() {
+			continue
+		}
+		key := groupKey{side: current.Side, instance: current.Instance}
+		previous, ok := anchors[key]
+		if !ok {
+			anchors[key] = anchor{value: *current, trusted: true, maxObserved: current.At}
+			continue
+		}
+
+		strictlyForward := current.At.After(previous.maxObserved)
+		consecutive := current.ControllerWindowSeq == previous.value.ControllerWindowSeq+1
+		if previous.trusted && strictlyForward && consecutive {
+			current.IntervalStart = previous.value.At
+			current.IntervalEnd = current.At
+			current.IntervalKnown = true
+		}
+
+		maxObserved := previous.maxObserved
+		if current.At.After(maxObserved) {
+			maxObserved = current.At
+		}
+		// A non-monotonic timestamp cannot be used as the start anchor for the
+		// next interval. A sequence gap/reset at a forward timestamp leaves this
+		// interval unknown, but the observed endpoint can safely anchor the next
+		// consecutive interval.
+		anchors[key] = anchor{value: *current, trusted: strictlyForward, maxObserved: maxObserved}
+	}
 }
 
 // JournalReport summarizes only evidence already emitted by the frozen runtime.
@@ -231,6 +290,7 @@ func AnalyzeJournal(reader io.Reader) (JournalReport, error) {
 	report.PreferredAssignmentMinMbps, report.PreferredAssignmentMaxMbps = journalMinMax(assignments)
 	report.PreferredDeliveryMedianMbps = journalMedian(deliveries)
 	report.PreferredDeliveryMinMbps, report.PreferredDeliveryMaxMbps = journalMinMax(deliveries)
+	deriveCapacityEvidenceIntervals(report.CapacityEvidence)
 	return report, nil
 }
 

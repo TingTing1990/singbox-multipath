@@ -132,16 +132,19 @@ func TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState(t *testing.
 	}
 	var journal strings.Builder
 	journal.WriteString(capLine("other-instance", 1, start.Add(2*time.Second), 999, 999, true, 999, 0, 0, 0))
-	journal.WriteString(capLine("mp-in-field", 1, start.Add(2*time.Second), 420, 410, false, 400, 2, 1234, 5678))
+	// Seed the previous completed CAP_WINDOW endpoint. The first observed CAP rate
+	// has an unknown start and must not be relabeled as a full client interval.
+	journal.WriteString(capLine("mp-in-field", 1, start.Add(time.Second), 400, 390, false, 390, 1, 100, 200))
+	journal.WriteString(capLine("mp-in-field", 2, start.Add(2*time.Second), 420, 410, false, 400, 2, 1234, 5678))
 	journal.WriteString("+0000 2026-09-27 12:00:02 INFO inbound/multipath[mp-in-field]: multipath leg1 joined data path: side=server destination=example.invalid:443 reconnect=false reason=bytes current_bytes=3145728 threshold_bytes=2097152\n")
 	journal.WriteString(capLine("other-instance", 2, start.Add(3*time.Second), 998, 998, true, 998, 0, 0, 0))
-	journal.WriteString(capLine("mp-in-field", 2, start.Add(3*time.Second), 430, 420, true, 415, 0, 10, 20))
+	journal.WriteString(capLine("mp-in-field", 3, start.Add(3*time.Second), 430, 420, true, 415, 0, 10, 20))
 
 	replay, err := ReplayFieldRun(&status, strings.NewReader(journal.String()), FieldRunBinding{ClientNodeTag: "mp-out-field", ServerInstance: "mp-in-field"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.Journal.ServerCapacityWindows != 2 || replay.Journal.SequenceGaps != 0 || len(replay.Journal.CapacityEvents) != 2 {
+	if replay.Journal.ServerCapacityWindows != 3 || replay.Journal.SequenceGaps != 0 || len(replay.Journal.CapacityEvents) != 3 {
 		t.Fatalf("mixed journal was not isolated by instance: %+v", replay.Journal)
 	}
 	if len(replay.Timeline.Windows) != 2 {
@@ -151,7 +154,7 @@ func TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState(t *testing.
 	if first.ServerTargetMbps != 640 || first.ServerDeliveryReady || first.ServerProtectedMbps != 400 || first.ServerDegradeWindows != 2 || first.ServerBacklogBytes != 1234 || first.ServerQueueBytes != 5678 {
 		t.Fatalf("CAP state lost from replay: %+v", first)
 	}
-	if first.ServerPreferredAssignedMbps != 420 || first.ServerPreferredDeliveryMbps != 410 || len(first.ServerCapacityEvidence) != 1 || len(first.ServerCAPEvents) != 1 {
+	if first.ServerPreferredAssignedMbps != 420 || first.ServerPreferredDeliveryMbps != 410 || first.ServerCapacityCoverageRatio != 1 || len(first.ServerCapacityEvidence) != 1 || len(first.ServerCAPEvents) != 1 {
 		t.Fatalf("CAP evidence not retained exactly: %+v", first)
 	}
 	if len(first.RuntimeEvents) == 0 || first.RuntimeEvents[0].ObservedAt.IsZero() {
@@ -314,10 +317,11 @@ func TestOfflineClosureLatestCAPEventPreservesInWindowStateChange(t *testing.T) 
 		status.Write(encoded)
 		status.WriteByte('\n')
 	}
-	windowLine := capLine("mp-in-field", 1, start.Add(2200*time.Millisecond), 420, 410, false, 400, 2, 1234, 5678)
-	changedLine := capLine("mp-in-field", 2, start.Add(2800*time.Millisecond), 430, 420, true, 500, 0, 10, 20)
+	seedLine := capLine("mp-in-field", 1, start.Add(1200*time.Millisecond), 400, 390, false, 390, 1, 100, 200)
+	windowLine := capLine("mp-in-field", 2, start.Add(2200*time.Millisecond), 420, 410, false, 400, 2, 1234, 5678)
+	changedLine := capLine("mp-in-field", 3, start.Add(2800*time.Millisecond), 430, 420, true, 500, 0, 10, 20)
 	changedLine = strings.Replace(changedLine, "event=CAP_WINDOW", "event=CAP_PROTECTION_CHANGED", 1)
-	replay, err := ReplayFieldRun(&status, strings.NewReader(windowLine+changedLine), FieldRunBinding{ClientNodeTag: "mp-out-field", ServerInstance: "mp-in-field"})
+	replay, err := ReplayFieldRun(&status, strings.NewReader(seedLine+windowLine+changedLine), FieldRunBinding{ClientNodeTag: "mp-out-field", ServerInstance: "mp-in-field"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,5 +337,140 @@ func TestOfflineClosureLatestCAPEventPreservesInWindowStateChange(t *testing.T) 
 	}
 	if window.ServerPreferredAssignedMbps != 420 || window.ServerPreferredDeliveryMbps != 410 {
 		t.Fatalf("CAP_WINDOW assignment/delivery metrics were overwritten by non-window event: %+v", window)
+	}
+}
+
+func TestOfflineClosureCAPIntervalRequiresConsecutiveSequence(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	raw := capLine("mp-in-field", 1, start.Add(time.Second), 100, 100, false, 100, 0, 0, 0) +
+		capLine("mp-in-field", 3, start.Add(2*time.Second), 200, 200, false, 200, 0, 0, 0) +
+		capLine("mp-in-field", 4, start.Add(3*time.Second), 300, 300, true, 300, 0, 0, 0)
+	journal, err := AnalyzeJournal(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal.CapacityEvidence) != 3 {
+		t.Fatalf("capacity evidence=%d want=3", len(journal.CapacityEvidence))
+	}
+	if journal.CapacityEvidence[0].IntervalKnown || journal.CapacityEvidence[1].IntervalKnown {
+		t.Fatalf("first/gapped CAP endpoints became intervals: %+v", journal.CapacityEvidence)
+	}
+	last := journal.CapacityEvidence[2]
+	if !last.IntervalKnown || !last.IntervalStart.Equal(start.Add(2*time.Second)) || !last.IntervalEnd.Equal(start.Add(3*time.Second)) {
+		t.Fatalf("post-gap consecutive CAP interval not recovered exactly: %+v", last)
+	}
+}
+
+func TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	raw := capLine("mp-in-field", 1, start.Add(2*time.Second), 100, 100, false, 100, 0, 0, 0) +
+		capLine("mp-in-field", 2, start.Add(1500*time.Millisecond), 200, 200, false, 200, 0, 0, 0) +
+		capLine("mp-in-field", 3, start.Add(2500*time.Millisecond), 300, 300, false, 300, 0, 0, 0) +
+		capLine("mp-in-field", 4, start.Add(3500*time.Millisecond), 400, 400, true, 400, 0, 0, 0)
+	journal, err := AnalyzeJournal(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal.CapacityEvidence) != 4 {
+		t.Fatalf("capacity evidence=%d want=4", len(journal.CapacityEvidence))
+	}
+	if journal.CapacityEvidence[1].IntervalKnown || journal.CapacityEvidence[2].IntervalKnown {
+		t.Fatalf("timestamp rollback was used as a temporal anchor: %+v", journal.CapacityEvidence)
+	}
+	last := journal.CapacityEvidence[3]
+	if !last.IntervalKnown || !last.IntervalStart.Equal(start.Add(2500*time.Millisecond)) || !last.IntervalEnd.Equal(start.Add(3500*time.Millisecond)) {
+		t.Fatalf("timeline did not recover after a fresh monotonic anchor: %+v", last)
+	}
+}
+
+func TestOfflineClosureRebindingClearsPreviousInstanceEvidence(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	timeline := mustTimeline(t, traceFromRates(start, []int{500}, []int{270}, []int{250}, time.Second))
+	raw := capLine("mp-A", 1, start.Add(time.Second), 250, 250, false, 250, 0, 0, 0) +
+		capLine("mp-A", 2, start.Add(2*time.Second), 300, 300, true, 300, 0, 0, 0)
+	journal, err := AnalyzeJournal(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachServerCapacityEvidenceForInstance(&timeline, journal, "mp-A"); err != nil {
+		t.Fatal(err)
+	}
+	if !timeline.Windows[0].ServerPreferredAssignmentEvidence || timeline.Windows[0].ServerCapacityInstance != "mp-A" {
+		t.Fatalf("initial binding did not attach mp-A: %+v", timeline.Windows[0])
+	}
+	if err := AttachServerCapacityEvidenceForInstance(&timeline, JournalReport{}, "mp-B"); err != nil {
+		t.Fatal(err)
+	}
+	window := timeline.Windows[0]
+	if window.ServerPreferredAssignmentEvidence || window.ServerPreferredDeliveryEvidence || window.ServerCapacityInstance != "" ||
+		len(window.ServerCapacityEvidence) != 0 || len(window.ServerCAPEvents) != 0 || window.ServerLatestCAPEvent != nil || len(window.RuntimeEvents) != 0 ||
+		window.ServerCapacityCoverageDuration != 0 || window.ServerCapacityCoverageRatio != 0 {
+		t.Fatalf("rebinding to mp-B retained mp-A evidence: %+v", window)
+	}
+}
+
+func TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	timeline := mustTimeline(t, traceFromRates(start, []int{500}, []int{270}, []int{250}, time.Second))
+	raw := capLine("mp-in-field", 1, start.Add(500*time.Millisecond), 50, 50, false, 50, 0, 0, 0) +
+		capLine("mp-in-field", 2, start.Add(1250*time.Millisecond), 100, 100, false, 100, 0, 0, 0) +
+		capLine("mp-in-field", 3, start.Add(2500*time.Millisecond), 300, 300, true, 300, 0, 0, 0)
+	journal, err := AnalyzeJournal(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachServerCapacityEvidenceForInstance(&timeline, journal, "mp-in-field"); err != nil {
+		t.Fatal(err)
+	}
+	window := timeline.Windows[0]
+	// Client interval is [1s,2s]. CAP interval ending at 1.25s contributes
+	// 0.25s at 100 Mbps; the next contributes 0.75s at 300 Mbps.
+	if window.ServerCapacityCoverageDuration != time.Second || window.ServerCapacityCoverageRatio != 1 {
+		t.Fatalf("CAP temporal coverage wrong: %+v", window)
+	}
+	if window.ServerPreferredAssignedMbps != 250 || window.ServerPreferredDeliveryMbps != 250 {
+		t.Fatalf("CAP rates were event-count averaged instead of duration weighted: %+v", window)
+	}
+}
+
+func TestOfflineClosureCaptureToReplayUsesProvableCAPInterval(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	trace := traceFromRates(start, []int{1000}, []int{600}, []int{400}, time.Second)
+	for i := range trace {
+		trace[i].Node.Tag = "mp-out"
+	}
+	path := t.TempDir() + "/status.json"
+	var captured bytes.Buffer
+	for _, snapshot := range trace {
+		encoded, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		count, err := CaptureStatusFile(ctx, path, &captured, time.Millisecond)
+		if err != nil || count != 1 {
+			t.Fatalf("capture count=%d err=%v", count, err)
+		}
+	}
+	journal := capLine("mp-in", 1, start.Add(time.Second), 550, 550, false, 600, 0, 0, 0) +
+		capLine("mp-in", 2, start.Add(2*time.Second), 600, 600, true, 640, 0, 0, 0)
+	replay, err := ReplayFieldRun(&captured, strings.NewReader(journal), FieldRunBinding{ClientNodeTag: "mp-out", ServerInstance: "mp-in"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Run.Useful.MeanMbps != 1000 || len(replay.Timeline.Windows) != 1 {
+		t.Fatalf("unexpected replay metrics: %+v", replay.Run)
+	}
+	window := replay.Timeline.Windows[0]
+	if window.ServerCapacityCoverageRatio != 1 || window.ServerPreferredAssignedMbps != 600 {
+		t.Fatalf("producer capture -> CAP interval replay did not close: %+v", window)
+	}
+	var output bytes.Buffer
+	if err := WriteFieldRunReplayJSON(&output, replay); err != nil || !json.Valid(output.Bytes()) {
+		t.Fatalf("invalid replay JSON: err=%v output=%q", err, output.String())
 	}
 }

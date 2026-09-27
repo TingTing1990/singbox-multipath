@@ -116,11 +116,15 @@ func AnalyzeRun(windows []Window) (RunMetrics, error) {
 			remoteSenderDuration += window.Duration
 		}
 		if window.ServerPreferredAssignmentEvidence {
-			serverAssignmentNumerator += window.ServerPreferredAssignedMbps * seconds
-			serverAssignmentDuration += window.Duration
+			coverage := boundedServerCapacityCoverage(window)
+			if coverage > 0 {
+				coverageSeconds := coverage.Seconds()
+				serverAssignmentNumerator += window.ServerPreferredAssignedMbps * coverageSeconds
+				serverAssignmentDuration += coverage
+			}
 		}
 		if window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {
-			senderOutputOverlapDuration += window.Duration
+			senderOutputOverlapDuration += boundedServerCapacityCoverage(window)
 		}
 		for leg := range result.Paths {
 			result.LegBytes[leg] += window.LegRXBytes[leg]
@@ -228,25 +232,36 @@ type AggregateMetrics struct {
 	DegradationEvidenceCoverageRatio float64
 }
 
-func windowHasDegradationDiscriminator(window Window) bool {
-	if window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {
-		return true
+func boundedServerCapacityCoverage(window Window) time.Duration {
+	coverage := window.ServerCapacityCoverageDuration
+	if coverage < 0 {
+		return 0
 	}
+	if coverage > window.Duration {
+		return window.Duration
+	}
+	return coverage
+}
+
+func degradationDiscriminatorCoverage(window Window) time.Duration {
 	d := window.Diagnostics
 	if d.LocalMemoryPressure || d.ReorderBytes > 0 {
-		return true
+		return window.Duration
 	}
 	if d.RemoteSenderAvailable && !d.RemoteSenderStale {
 		if d.RemoteMemoryPressure {
-			return true
+			return window.Duration
 		}
 		for _, leg := range d.Leg {
 			if leg.RemoteWriteBlockedMS > 0 {
-				return true
+				return window.Duration
 			}
 		}
 	}
-	return false
+	if window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {
+		return boundedServerCapacityCoverage(window)
+	}
+	return 0
 }
 
 func CompareToBaselines(aggregate RunMetrics, baselineLeg0, baselineLeg1 RunMetrics, topology Topology) (AggregateMetrics, error) {
@@ -277,9 +292,7 @@ func CompareToBaselines(aggregate RunMetrics, baselineLeg0, baselineLeg1 RunMetr
 		if window.UsefulMbps < result.BestSingleMbps {
 			belowDuration += window.Duration
 			result.DegradedWindowCount++
-			if windowHasDegradationDiscriminator(window) {
-				coveredDegradationDuration += window.Duration
-			}
+			coveredDegradationDuration += degradationDiscriminatorCoverage(window)
 		}
 		if window.LegMbps[0] < a && window.LegMbps[1] < b {
 			bothBelowDuration += window.Duration

@@ -413,3 +413,46 @@ func TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB(t *testing.T)
 		t.Fatalf("exact scheduler internals were overclaimed: %+v", closure)
 	}
 }
+
+func TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail(t *testing.T) {
+	start := time.Unix(1000, 0).UTC()
+	b0 := traceFromRates(start, []int{700, 700}, []int{700, 700}, []int{0, 0}, time.Second)
+	b1 := traceFromRates(start, []int{650, 650}, []int{0, 0}, []int{650, 650}, time.Second)
+	aggregate := traceFromRates(start, []int{500, 500}, []int{270, 270}, []int{250, 250}, time.Second)
+	for index := range aggregate {
+		aggregate[index].Node.Logical.Connections = 1
+		aggregate[index].Node.Logical.RemoteSender = SenderDiagnostics{
+			Available:   true,
+			Leg1TXBytes: uint64(index) * bytesForMbps(250, time.Second),
+		}
+	}
+	raw := capLine("mp-in", 1, start.Add(500*time.Millisecond), 300, 300, false, 400, 0, 0, 0) +
+		capLine("mp-in", 2, start.Add(1500*time.Millisecond), 300, 300, false, 400, 0, 0, 0) +
+		capLine("mp-in", 3, start.Add(2500*time.Millisecond), 300, 300, false, 400, 0, 0, 0)
+	journal, err := AnalyzeJournal(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := AnalyzeAggregationWithDemand(b0, b1, aggregate, Topology{}, LoadSaturating,
+		DemandEvidence{Verified: true, Saturated: true, Method: "independent interval coverage"}, &journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Comparison.DegradationEvidenceCoverageRatio != 0.75 {
+		t.Fatalf("CAP evidence ending at 2.5s covered client tail through 3s: ratio=%.6f", report.Comparison.DegradationEvidenceCoverageRatio)
+	}
+	if report.Aggregate.ServerPreferredAssignmentEvidenceRatio != 0.75 || report.Aggregate.SenderOutputEvidenceOverlapWindowRatio != 0.75 {
+		t.Fatalf("aggregate CAP coverage was promoted to whole status windows: %+v", report.Aggregate)
+	}
+	comparison, err := CompareAlgorithms(
+		AlgorithmRun{AlgorithmID: "A", WorkloadID: "same", Report: report},
+		AlgorithmRun{AlgorithmID: "B", WorkloadID: "same", Report: report},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := EvaluateDiagnosticClosure(&report, journal, comparison)
+	if closure.Pass || closure.DegradationLayer == AnswerFull {
+		t.Fatalf("partial CAP interval coverage falsely closed degradation diagnosis: %+v", closure)
+	}
+}

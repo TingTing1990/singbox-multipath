@@ -82,11 +82,21 @@ func marshalSnapshot(t *testing.T, snapshot StatusSnapshot) []byte {
 
 func syntheticServerCAPJournal(t *testing.T, start time.Time, assignments []int, present []bool) JournalReport {
 	t.Helper()
+	if len(assignments) == 0 {
+		t.Fatal("capacity assignments must not be empty")
+	}
 	if present != nil && len(present) != len(assignments) {
 		t.Fatal("capacity presence length mismatch")
 	}
 	var builder strings.Builder
-	var eventSeq uint64
+	// CAP_WINDOW is an interval rate ending at At. Seed one preceding endpoint so
+	// the first requested client interval has a verifiable start. The seed itself
+	// remains interval-unknown, exactly like the first observed real CAP_WINDOW.
+	eventSeq := uint64(1)
+	seedAt := start.Add(time.Second).Format(time.RFC3339Nano)
+	fmt.Fprintf(&builder,
+		"CAP_AUDIT schema_version=1 event_seq=%d event=CAP_WINDOW side=server instance=\"mp-in-test\" session_id=\"\" destination=\"\" at=%s original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=%.2f delivery_ready=true protected_mbps=%.2f protection_valid=true protection_active=true preferred_assignment_mbps=%.2f degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=0\n",
+		eventSeq, seedAt, float64(assignments[0]), float64(assignments[0]), float64(assignments[0]))
 	for index, assignment := range assignments {
 		if present != nil && !present[index] {
 			continue

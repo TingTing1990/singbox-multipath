@@ -92,6 +92,8 @@ type Window struct {
 	ServerCapacityInstance            string
 	ServerControllerWindowSeq         uint64
 	ServerCapacityEventCount          int
+	ServerCapacityCoverageDuration    time.Duration
+	ServerCapacityCoverageRatio       float64
 	ServerTargetMbps                  float64
 	ServerDeliveryReady               bool
 	ServerProtectedMbps               float64
@@ -116,6 +118,46 @@ type Window struct {
 	TCPFastOpen        bool
 	Diagnostics        WindowDiagnostics
 	ResolutionDegraded bool
+}
+
+func intervalOverlap(startA, endA, startB, endB time.Time) time.Duration {
+	start := startA
+	if startB.After(start) {
+		start = startB
+	}
+	end := endA
+	if endB.Before(end) {
+		end = endB
+	}
+	if !end.After(start) {
+		return 0
+	}
+	return end.Sub(start)
+}
+
+func resetServerCapacityCorrelation(window *Window) {
+	window.ServerPreferredAssignedMbps = 0
+	window.ServerPreferredDeliveryMbps = 0
+	window.ServerPreferredAssignmentEvidence = false
+	window.ServerPreferredDeliveryEvidence = false
+	window.ServerCapacityInstance = ""
+	window.ServerControllerWindowSeq = 0
+	window.ServerCapacityEventCount = 0
+	window.ServerCapacityCoverageDuration = 0
+	window.ServerCapacityCoverageRatio = 0
+	window.ServerTargetMbps = 0
+	window.ServerDeliveryReady = false
+	window.ServerProtectedMbps = 0
+	window.ServerProtectionValid = false
+	window.ServerProtectionActive = false
+	window.ServerDegradeWindows = 0
+	window.ServerBacklogBytes = 0
+	window.ServerQueueBytes = 0
+	window.ServerCapacityEvidence = nil
+	window.ServerCAPEvents = nil
+	window.ServerLatestCAPEvent = nil
+	window.ServerCAPEventCount = 0
+	window.RuntimeEvents = nil
 }
 
 type Timeline struct {
@@ -335,25 +377,38 @@ func AttachServerCapacityEvidenceForInstance(timeline *Timeline, journal Journal
 	if serverInstance == "" {
 		return fmt.Errorf("%w: missing server CAP instance binding", ErrInvalidStatus)
 	}
+	// Association is replace-not-append. Rebinding a reusable offline timeline
+	// must never retain evidence from the previously selected server instance.
+	for windowIndex := range timeline.Windows {
+		resetServerCapacityCorrelation(&timeline.Windows[windowIndex])
+	}
 	for windowIndex := range timeline.Windows {
 		window := &timeline.Windows[windowIndex]
-		var assignmentSum, deliverySum float64
-		var count int
+		var assignmentWeighted, deliveryWeighted float64
+		var coveredDuration time.Duration
 		var latestWindow *CapacityWindowEvidence
 		var latestEvent *CapacityState
 		for evidenceIndex := range journal.CapacityEvidence {
 			evidence := journal.CapacityEvidence[evidenceIndex]
-			if !evidence.ValidServerEvidence() || evidence.Instance != serverInstance || !evidence.At.After(window.Start) || evidence.At.After(window.End) {
+			if !evidence.ValidServerInterval() || evidence.Instance != serverInstance {
+				continue
+			}
+			overlap := intervalOverlap(window.Start, window.End, evidence.IntervalStart, evidence.IntervalEnd)
+			if overlap <= 0 {
 				continue
 			}
 			window.ServerCapacityEvidence = append(window.ServerCapacityEvidence, evidence)
-			assignmentSum += evidence.PreferredAssignmentMbps
-			deliverySum += evidence.DeliveryMbps
-			count++
+			seconds := overlap.Seconds()
+			assignmentWeighted += evidence.PreferredAssignmentMbps * seconds
+			deliveryWeighted += evidence.DeliveryMbps * seconds
+			coveredDuration += overlap
 			if latestWindow == nil || evidence.At.After(latestWindow.At) || (evidence.At.Equal(latestWindow.At) && evidence.ControllerWindowSeq > latestWindow.ControllerWindowSeq) {
 				copy := evidence
 				latestWindow = &copy
 			}
+		}
+		if coveredDuration > window.Duration {
+			return fmt.Errorf("%w: overlapping server CAP intervals exceed client window duration for instance %q", ErrInvalidStatus, serverInstance)
 		}
 		for eventIndex := range journal.CapacityEvents {
 			event := journal.CapacityEvents[eventIndex]
@@ -373,13 +428,16 @@ func AttachServerCapacityEvidenceForInstance(timeline *Timeline, journal Journal
 			}
 			window.RuntimeEvents = append(window.RuntimeEvents, event)
 		}
-		if count > 0 && latestWindow != nil {
-			window.ServerPreferredAssignedMbps = assignmentSum / float64(count)
-			window.ServerPreferredDeliveryMbps = deliverySum / float64(count)
+		if coveredDuration > 0 && latestWindow != nil {
+			seconds := coveredDuration.Seconds()
+			window.ServerPreferredAssignedMbps = assignmentWeighted / seconds
+			window.ServerPreferredDeliveryMbps = deliveryWeighted / seconds
 			window.ServerPreferredAssignmentEvidence = true
 			window.ServerPreferredDeliveryEvidence = true
 			window.ServerCapacityInstance = serverInstance
-			window.ServerCapacityEventCount = count
+			window.ServerCapacityEventCount = len(window.ServerCapacityEvidence)
+			window.ServerCapacityCoverageDuration = coveredDuration
+			window.ServerCapacityCoverageRatio = float64(coveredDuration) / float64(window.Duration)
 		}
 		if latestEvent != nil {
 			copy := *latestEvent
