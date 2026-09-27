@@ -105,16 +105,16 @@ jobs:
             'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
             'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
             'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
-            'protocol/multipath/audit/aggregation.go':'9b2df829f6beb2c80c884415bac698bb0f39299d9bcfeb0ea3b0900cd6a23332',
-            'protocol/multipath/audit/aggregation_v3_test.go':'ed5d87256d423a98eca4ae4df9525b187a5e633f055b1a0a78e8b88f682edef3',
+            'protocol/multipath/audit/aggregation.go':'a15fc54b8d523b8724611ded70375b8d4a9e12a8c4ab7cee158bed85cf09709f',
+            'protocol/multipath/audit/aggregation_v3_test.go':'fcee7884d4848b9944a46abac14f3f72a8ffc30fb1ebc480c6f5f8d7bd9d572c',
             'protocol/multipath/audit/diagnosis.go':'55d697fd311dacd4340f304e6756d9748fe429ceaacc06902bd1e4e0c31c40e3',
-            'protocol/multipath/audit/field_replay.go':'0678d03d87d156899c67a7057e247165009eacdc87fcf5394c601736c1124b49',
-            'protocol/multipath/audit/field_replay_test.go':'dd6cdcae9f4737bc160e84f0e0e1354792745e36d0b82b7a43db81a9babd4a5b',
+            'protocol/multipath/audit/field_replay.go':'f9d3ed782248ccb4b44fef9aca40e812d15eee70057f18d4967a36a322f232fd',
+            'protocol/multipath/audit/field_replay_test.go':'fd88ca1bc5612a52ac76e9ed4c890fe79b6c4cc8e161a3f668b58de69f87ab79',
             'protocol/multipath/audit/status.go':'380bb52b7453ff13cf821816a771b71baecbcede1bf456cac86399fb9b30e5eb',
             'protocol/multipath/audit/status_v3_test.go':'7f2c76821e645e44dab7d606fd3cc5013dc3f1879c2df49ff139a6871b55d57d',
-            'protocol/multipath/audit/timeline.go':'af6dae0edc29584627db0dafcb5b103001c157f8d173f52c00e5dcb42bc3dfe4',
-            'protocol/multipath/audit/timeline_v3_test.go':'7663d6855d4164c104e419b4ce3e4e5c39e82f36582963840bf3ae5dbfebd3d4',
-            'protocol/multipath/audit/v3_test_helpers_test.go':'2b9766a8c5b9624ac4358db602b2162425fbb3d87b36c29bee8c7135c10b58e4',
+            'protocol/multipath/audit/timeline.go':'3dc50a845d3ddd8b1abdd5a3cfa747008238801142768273d9e30c6cb70261c9',
+            'protocol/multipath/audit/timeline_v3_test.go':'27ab05035e1fde95bc0900d850890724ee42e9e9d4d01c9bfb7eb3d0c3e7556d',
+            'protocol/multipath/audit/v3_test_helpers_test.go':'78d1b761f1e609703fef31f3f4653e97a4ee071f45e19b39b2195221fea64bfb',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -287,11 +287,22 @@ jobs:
           req('package audit' in v3_prod,'V3 did not extend existing audit package')
           req('unsafe' not in v3_prod and 'go:linkname' not in v3_prod,'V3 bypasses frozen boundary')
           req('LEG1_EXACT_ASSIGNMENT' in (audit_dir/'diagnosis.go').read_text(),'scheduler uncertainty guard missing')
-          req('preferred_assigned_bytes' in (audit_dir/'status.go').read_text(),'frozen preferred-assignment status evidence parser missing')
-          req('PreferredAssignmentEvidence' in (audit_dir/'timeline.go').read_text(),'preferred-assignment timeline evidence missing')
-          req('ErrUnverifiedDemand' in (audit_dir/'aggregation.go').read_text() and 'CompareAlgorithms' in (audit_dir/'aggregation.go').read_text(),'verified-demand or A/B comparison contract missing')
-          req('journal evidence must be complete with zero dropped events and zero sequence gaps' in (audit_dir/'field_replay.go').read_text(),'FIELD evidence-completeness gate missing')
-          req('diagnostic closure failed' in (audit_dir/'field_replay.go').read_text(),'FIELD diagnostic closure gate missing')
+          status_v3=(audit_dir/'status.go').read_text()
+          timeline_v3=(audit_dir/'timeline.go').read_text()
+          aggregation_v3=(audit_dir/'aggregation.go').read_text()
+          replay_v3=(audit_dir/'field_replay.go').read_text()
+          tests_v3='\n'.join((audit_dir/name).read_text() for name in ('timeline_v3_test.go','aggregation_v3_test.go','field_replay_test.go'))
+          req('preferred_assigned_bytes' in status_v3,'frozen local preferred-capacity status evidence parser missing')
+          req('LocalPreferredAssignmentEvidence' in timeline_v3 and 'ServerPreferredAssignmentEvidence' in timeline_v3 and 'AttachServerCapacityEvidence' in timeline_v3,'directional CAP/status evidence model missing')
+          req('LocalPreferredAssignmentEvidence' not in aggregation_v3 and 'LocalPreferredAssignmentEvidence' not in replay_v3,'client-local capacity leaked into download acceptance')
+          req('CapacityEvidence' in replay_v3 and 'ValidServerEvidence' in replay_v3,'server CAP per-window provenance missing')
+          req('SenderOutputEvidenceOverlapWindowRatio' in aggregation_v3 and 'DegradationEvidenceCoverageRatio' in aggregation_v3,'same-window degradation evidence coverage missing')
+          req('ReportAFingerprint' in aggregation_v3 and 'ReportBFingerprint' in aggregation_v3,'A/B source-report binding missing')
+          req('ErrUnverifiedDemand' in aggregation_v3 and 'CompareAlgorithms' in aggregation_v3,'verified-demand or A/B comparison contract missing')
+          req('RecognizedEvents == 0' in replay_v3 and 'len(closure.Blocking) == 0' in replay_v3,'fail-closed journal/blocking acceptance contract missing')
+          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation'):
+              req(test_name in tests_v3,'V3 repair regression missing '+test_name)
+          req('diagnostic closure failed' in replay_v3,'FIELD diagnostic closure gate missing')
           print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
           print('ARCHITECTURE_AUDIT=PASS')
           PY
@@ -466,14 +477,77 @@ jobs:
           print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
           PY
 
-      - name: Server Audit V3 FIELD replay closure acceptance
+      - name: Server Audit V3 historical FIELD replay and integrated repair contracts
         shell: bash
         run: |
           set -euo pipefail
-          AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -count=1 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureCanPassWithOperationalSchedulerEvidenceAndAB|TestActiveEnvelopePreservesTrailingActiveStall|TestBuildTimelineCapturesPreferredAssignmentFromFrozenStatus)$' \
-            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-field-closure.log"
-          echo 'PASS V3 fails closed on incomplete evidence and closes only with complete verified status/CAP/A-B evidence'
+          AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -race -count=20 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall)$' \
+            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-repair-contracts.log"
+          echo 'PASS historical FIELD journals replay and remain fail-closed without missing status/baseline/A-B inputs'
+          echo 'PASS deterministic integrated status + server CAP + verified-demand + bound A/B repair contracts'
+          echo 'NOTE integrated positive closure is LOCAL/SIMULATION evidence, not a claim that historical FIELD fixtures contain complete status traces'
+
+      - name: Server Audit V3 repair mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import json, os, subprocess
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          temp=Path(os.environ['MUTANT_ROOT'])
+          tags=os.environ['BUILD_TAGS']
+          journal_old = "func journalCompleteForV3(report JournalReport) bool {\n\tif !report.Provided || report.RecognizedEvents == 0 || !report.EvidenceComplete || report.DroppedEvents != 0 || report.SequenceGaps != 0 {\n\t\treturn false\n\t}\n\tfor _, evidence := range report.CapacityEvidence {\n\t\tif evidence.ValidServerEvidence() {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}"
+          journal_new = "func journalCompleteForV3(report JournalReport) bool {\n\treturn report.Provided && report.EvidenceComplete && report.DroppedEvents == 0 && report.SequenceGaps == 0\n}"
+          mutations=[
+            ('v3-f01-local-capacity-leak','protocol/multipath/audit/aggregation.go',
+             '\t\tif window.ServerPreferredAssignmentEvidence {',
+             '\t\tif window.LocalPreferredAssignmentEvidence {',
+             '^TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence$'),
+            ('v3-f02-empty-journal-pass','protocol/multipath/audit/field_replay.go',
+             journal_old, journal_new,
+             '^TestAlgorithmABRejectsEmptyEmbeddedJournal$'),
+            ('v3-f03-disjoint-window-merge','protocol/multipath/audit/aggregation.go',
+             '\t\tif window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {',
+             '\t\tif window.ServerPreferredAssignmentEvidence || window.RemoteSenderEvidence {',
+             '^TestDisjointEvidenceCannotCloseDegradationLayer$'),
+            ('v3-f04-unbound-ab','protocol/multipath/audit/field_replay.go',
+             '\t\tbound := comparison.Comparable && comparison.AlgorithmA != ""',
+             '\t\tbound := comparison.Comparable || comparison.AlgorithmA != ""',
+             '^TestDiagnosticClosureRejectsUnboundAlgorithmAB$'),
+            ('v3-f05-mixed-node-subtraction','protocol/multipath/audit/timeline.go',
+             '\t\tif current.Node.Tag != result.SourceNodeTag {',
+             '\t\tif false && current.Node.Tag != result.SourceNodeTag {',
+             '^TestBuildTimelineRejectsMixedNodeTags$'),
+          ]
+          for name,rel,old,new,test in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+              try:
+                  p=work/rel; text=p.read_text()
+                  if text.count(old)!=1: raise RuntimeError(f'{name} anchor count={text.count(old)}')
+                  p.write_text(text.replace(old,new,1))
+                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  print(run.stdout)
+                  expected=test[1:-1]
+                  ran=failed=False
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
+                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran or not failed: raise RuntimeError(f'{name}: target test did not fail correctly {test}')
+                  print('KILLED',name,'BY',test)
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 5 V3 REPAIR MUTANTS KILLED')
+          PY
 
       - name: Existing repeated-booster-disconnect regression x20
         shell: bash
