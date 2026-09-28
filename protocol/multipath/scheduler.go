@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
 	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
@@ -75,14 +76,36 @@ func (c *mpCore) pumpLoop() {
 			}
 			segment, ok := c.tx.NextRange(c.cfg.ChunkSize)
 			if !ok {
+				if c.tx.Next < c.tx.WriteNext {
+					c.auditWait("connection_window")
+				} else {
+					c.auditWait("no_pending_data")
+				}
 				break
 			}
 			selection := c.choosePathForSubmitLocked(segment.Length, now)
 			if selection.leg == nil {
+				if c.cfg.DownloadAudit != nil {
+					r := c.downloadRecord("WAIT")
+					r.decision = *selection.trace
+					r.decision.Reason = "no_eligible_path"
+					r.decision.Outcome = "waiting"
+					c.cfg.DownloadAudit.record(r)
+				}
 				break
 			}
 			pumpErr = c.submitLocked(selection.leg, segment, false, now)
 			selection.finish(pumpErr)
+			if c.cfg.DownloadAudit != nil {
+				r := c.downloadRecord("DECISION")
+				r.decision = *selection.trace
+				r.decision.LogicalSeq = segment.Seq
+				r.decision.Outcome = "submitted"
+				if pumpErr != nil {
+					r.decision.Outcome = "failed"
+				}
+				c.cfg.DownloadAudit.record(r)
+			}
 			if pumpErr != nil {
 				break
 			}
@@ -142,14 +165,27 @@ func (c *mpCore) feedbackLockedWithoutLegs() flowMessage {
 func (c *mpCore) handleWindow(message flowMessage) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	beforeACK := min(c.tx.Una, c.tx.WriteNext)
 	if err := c.tx.Acknowledge(message.Next, message.Limit); err != nil {
 		return err
+	}
+	if c.cfg.DownloadAudit != nil {
+		r := c.downloadRecord("FEEDBACK")
+		r.feedback.LogicalBytes = min(c.tx.Una, c.tx.WriteNext) - beforeACK
+		c.cfg.DownloadAudit.record(r)
 	}
 	c.peerPressure = message.Flags&flowFlagPressure != 0
 	now := time.Now()
 	for _, leg := range c.availableLegs() {
+		beforeReceipt := leg.path.Received
 		if err := leg.path.Feedback(message.Paths[leg.id], now); err != nil {
 			return err
+		}
+		if c.cfg.DownloadAudit != nil && leg.path.Received > beforeReceipt {
+			r := c.downloadRecord("FEEDBACK")
+			r.feedback.PathBytes[leg.id] = leg.path.Received - beforeReceipt
+			r.feedback.Generation[leg.id] = leg.path.Generation
+			c.cfg.DownloadAudit.record(r)
 		}
 		if leg.id == 0 && c.cfg.PreferredCapacity != nil {
 			if delivered := leg.confirmPreferredCapacityDelivery(leg.path.Received); delivered > 0 {
@@ -172,7 +208,9 @@ func (c *mpCore) handleWindow(message flowMessage) error {
 	return nil
 }
 
-func (c *mpCore) choosePathLocked(length int) *mpLeg {
+func (c *mpCore) choosePathLocked(length int) *mpLeg { return c.choosePathObservedLocked(length, nil) }
+
+func (c *mpCore) choosePathObservedLocked(length int, trace *D.Decision) *mpLeg {
 	legs := c.availableLegs()
 	provisionalRate := float64(0)
 	for _, leg := range legs {
@@ -181,17 +219,32 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 	var chosen *mpLeg
 	score := math.Inf(1)
 	for _, leg := range legs {
+		if trace != nil {
+			trace.Paths[leg.id].Evaluated = true
+		}
 		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
+			if trace != nil {
+				trace.Paths[leg.id].Excluded = "recovery"
+			}
 			continue
 		}
 		if leg.path.Stale || leg.busy {
+			if trace != nil {
+				trace.Paths[leg.id].Excluded = "stale_or_busy"
+			}
 			continue
 		}
 		emergency := c.cfg.Recovery != nil && c.controlLeg() == leg && leg.id == 1
 		if (!c.active.Load() && leg.id == 0) || emergency {
+			if trace != nil {
+				trace.Reason = "preferred_only_or_recovery"
+			}
 			return leg
 		}
 		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
+			if trace != nil {
+				trace.Paths[leg.id].Excluded = "activation_ready_peer_or_memory"
+			}
 			continue
 		}
 		// Startup sampling is bounded. Thereafter the connection-level byte
@@ -199,9 +252,16 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 		initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
 		pipeline := leg.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
 		if leg.path.Outstanding()+uint64(length) > pipeline {
+			if trace != nil {
+				trace.Paths[leg.id].Excluded = "pipeline_full"
+			}
 			continue
 		}
 		next := leg.path.DrainTime(provisionalRate)
+		if trace != nil {
+			trace.Paths[leg.id].DrainSeconds = next
+			trace.Reason = "minimum_drain_time"
+		}
 		if next < score {
 			chosen, score = leg, next
 		}
@@ -212,6 +272,7 @@ func (c *mpCore) choosePathLocked(length int) *mpLeg {
 type pathSelection struct {
 	leg         *mpLeg
 	reservation *preferredCapacityReservation
+	trace       *D.Decision
 }
 
 func (s pathSelection) finish(err error) {
@@ -231,8 +292,26 @@ func (s pathSelection) finish(err error) {
 // preferred rate (never merely caps/targets the configured threshold). It never
 // waits solely to repay preferred credit: if preferred is busy/full/unavailable,
 // the original candidate remains usable so booster can carry excess demand.
-func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelection {
-	chosen := c.choosePathLocked(length)
+func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pathSelection) {
+	var trace *D.Decision
+	var observation *D.Decision
+	if c.cfg.DownloadAudit != nil {
+		snapshot := c.downloadDecision(length)
+		trace = &snapshot
+		observation = trace
+	}
+	chosen := c.choosePathObservedLocked(length, observation)
+	if observation != nil {
+		if chosen != nil {
+			trace.Candidate = int(chosen.id)
+		}
+		defer func() {
+			if result.leg != nil {
+				trace.Selected = int(result.leg.id)
+			}
+			result.trace = trace
+		}()
+	}
 	controller := c.cfg.PreferredCapacity
 	if controller == nil || chosen == nil {
 		return pathSelection{leg: chosen}
@@ -270,6 +349,9 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelect
 
 	force, reservation := controller.reserveAssignment(now, length, false, true)
 	if force {
+		if observation != nil {
+			trace.Reason = "capacity_preferred_override"
+		}
 		return pathSelection{leg: preferred, reservation: reservation}
 	}
 	return pathSelection{leg: chosen}
@@ -380,7 +462,31 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		if !ok {
 			continue
 		}
-		if err := c.submitLocked(target, segment, true, now); err != nil {
+		var repairRecord downloadRecord
+		if c.cfg.DownloadAudit != nil {
+			repairRecord = c.downloadRecord("DECISION")
+			repairRecord.decision = c.downloadDecision(segment.Length)
+			repairRecord.decision.LogicalSeq = segment.Seq
+			repairRecord.decision.Selected = int(target.id)
+			repairRecord.decision.Candidate = int(target.id)
+			repairRecord.decision.Repair = true
+			repairRecord.decision.Reason = "repair_pruned"
+			if stale {
+				repairRecord.decision.Reason = "repair_stale"
+			}
+			if lost {
+				repairRecord.decision.Reason = "repair_lost"
+			}
+		}
+		err := c.submitLocked(target, segment, true, now)
+		if c.cfg.DownloadAudit != nil {
+			repairRecord.decision.Outcome = "submitted"
+			if err != nil {
+				repairRecord.decision.Outcome = "failed"
+			}
+			c.cfg.DownloadAudit.record(repairRecord)
+		}
+		if err != nil {
 			return false, err
 		}
 		mapping.path, mapping.generation = target.id, target.path.Generation

@@ -3,6 +3,7 @@ package multipath
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -70,6 +71,11 @@ func newCoreWithError(parent context.Context, cfg coreConfig) (*mpCore, net.Conn
 	c.txReserve <- budget.takeReservedBuffer(cfg.ChunkSize)
 	app.onClose = c.closeApplication
 	app.onCloseRead = func() error { c.localReadClosed.Store(true); return app.readConn.Close() }
+	if cfg.DownloadAudit != nil {
+		r := c.downloadRecord("SESSION_OPEN")
+		r.session.Config = downloadConfig(cfg)
+		cfg.DownloadAudit.record(r)
+	}
 	c.startWorkers(c.txLoop, c.rxLoop, c.pumpLoop, c.activationLoop)
 	return c, app, nil
 }
@@ -108,6 +114,11 @@ func (c *mpCore) Release(head bool) {
 func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
 	closeLegsAfterDrain(legs, err)
 	c.workerGroup.Wait()
+	if c.cfg.DownloadAudit != nil {
+		r := c.downloadRecord("SESSION_CLOSE")
+		r.session.Reason = err.Error()
+		c.cfg.DownloadAudit.record(r)
+	}
 	c.stateMu.Lock()
 	for _, leg := range legs {
 		leg.path.Close()
@@ -181,6 +192,11 @@ func (c *mpCore) commitLegWithReadPreamble(id uint8, conn net.Conn, onClose func
 		return nil, errCoreClosed
 	}
 	c.legCounters[id].joins.Add(1)
+	if c.cfg.DownloadAudit != nil {
+		r := c.downloadRecord("PATH_ATTACHED")
+		r.session.Reason = fmt.Sprintf("leg=%d generation=%d", id, leg.path.Generation)
+		c.cfg.DownloadAudit.record(r)
+	}
 	c.legsMu.Unlock()
 	c.stateMu.Unlock()
 	wakeFlow(c.pumpWake)

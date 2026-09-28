@@ -2,6 +2,7 @@ package multipath
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -147,6 +148,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Memory:                         memory,
 		},
 	}
+	if options.DownloadAudit {
+		var err error
+		i.cfg.DownloadAudit, err = newDownloadAudit(tag, i.cfg, func(line string) { i.logger.InfoContext(i.ctx, line) })
+		if err != nil {
+			return nil, E.Cause(err, "create download audit identity")
+		}
+	}
 	i.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -162,7 +170,9 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	i.cfg.DownloadAudit.start()
 	if err := i.listener.Start(); err != nil {
+		i.cfg.DownloadAudit.close()
 		return err
 	}
 	if controller := i.cfg.PreferredCapacity; controller != nil {
@@ -203,6 +213,14 @@ func (i *Inbound) Close() error {
 	i.access.Unlock()
 	for _, session := range sessions {
 		session.core.Close()
+	}
+	if audit := i.cfg.DownloadAudit; audit != nil {
+		go func() {
+			for _, session := range sessions {
+				<-session.core.released
+			}
+			audit.close()
+		}()
 	}
 	return listenerErr
 }
@@ -297,6 +315,9 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 	cfg.ChunkSize = int(hello.ChunkSize)
 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
+	if cfg.DownloadAudit != nil {
+		cfg.DownloadSession = hex.EncodeToString(hello.Session[:])
+	}
 	cfg.CapacityAuditSessionID = statusSessionID(hello.Session)
 	cfg.CapacityAuditDestination = destination.String()
 	cfg.OnProtocolError = func(err error) {
@@ -307,6 +328,14 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		cfg.SendStatus = true
 	}
 	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
+		if cfg.DownloadAudit != nil {
+			r := downloadRecord{}
+			r.header.Kind = "ACTIVATION"
+			r.header.Session = cfg.DownloadSession
+			r.header.Destination = cfg.CapacityAuditDestination
+			r.session.Reason = activationInfoString(info)
+			cfg.DownloadAudit.record(r)
+		}
 		i.logger.InfoContext(
 			ctx,
 			"multipath leg1 joined data path: side=server destination=", destination,
@@ -373,6 +402,11 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	metadata.Inbound = i.Tag()
 	metadata.InboundType = i.Type()
 	metadata.Destination = destination
+	if cfg.DownloadAudit != nil {
+		r := core.downloadRecord("SESSION_ESTABLISHED")
+		r.session.Reason = "handshake_complete"
+		cfg.DownloadAudit.record(r)
+	}
 	i.logger.InfoContext(ctx, "multipath session established to ", destination, " on leg ", hello.LegID)
 	logicalOnClose := N.OnceClose(func(closeErr error) {
 		// The router can report a target dial/early-write failure before it

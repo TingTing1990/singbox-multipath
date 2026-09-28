@@ -11,6 +11,8 @@ import (
 )
 
 type coreConfig struct {
+	DownloadAudit                  *downloadAudit
+	DownloadSession                string
 	Recovery                       *recoveryPolicy
 	PreferredCapacity              *preferredCapacityController
 	AggregationEnabled             bool
@@ -182,31 +184,33 @@ type mpLeg struct {
 }
 
 type mpCore struct {
-	finPath      *mpLeg // stateMu; retransmit FIN after a control path change
-	peerPressure bool   // stateMu; suppress speculative secondary assignments
-	cfg          coreConfig
-	ctx          context.Context
-	cancel       context.CancelFunc
-	appConn      *logicalConn
-	txPipe       net.Conn
-	rxPipe       net.Conn
-	legsMu       sync.RWMutex
-	legs         map[uint8]*mpLeg
-	reserved     map[uint8]bool
-	retiring     map[uint8]*mpLeg
-	done         chan struct{}
-	released     chan struct{}
-	closeOne     sync.Once
-	txSeq        atomic.Uint64
-	ingressBytes atomic.Uint64
-	egressBytes  atomic.Uint64
-	legCounters  [2]mpLegCounters
-	active       atomic.Bool
-	activeCh     chan struct{}
-	activateOnce sync.Once
-	activationMu sync.Mutex
-	activation   activationInfo
-	activationAt time.Time
+	downloadWaitReason string    // stateMu
+	downloadWaitAt     time.Time // stateMu
+	finPath            *mpLeg    // stateMu; retransmit FIN after a control path change
+	peerPressure       bool      // stateMu; suppress speculative secondary assignments
+	cfg                coreConfig
+	ctx                context.Context
+	cancel             context.CancelFunc
+	appConn            *logicalConn
+	txPipe             net.Conn
+	rxPipe             net.Conn
+	legsMu             sync.RWMutex
+	legs               map[uint8]*mpLeg
+	reserved           map[uint8]bool
+	retiring           map[uint8]*mpLeg
+	done               chan struct{}
+	released           chan struct{}
+	closeOne           sync.Once
+	txSeq              atomic.Uint64
+	ingressBytes       atomic.Uint64
+	egressBytes        atomic.Uint64
+	legCounters        [2]mpLegCounters
+	active             atomic.Bool
+	activeCh           chan struct{}
+	activateOnce       sync.Once
+	activationMu       sync.Mutex
+	activation         activationInfo
+	activationAt       time.Time
 	// activationLoop is the sole writer. These fields rate-limit server audit
 	// evidence to at most one blocked event per trigger/controller window.
 	capacityAuditBlockedSeen   [3]bool

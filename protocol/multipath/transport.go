@@ -2,6 +2,7 @@ package multipath
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"time"
@@ -98,6 +99,19 @@ func (c *mpCore) legWriteLoop(leg *mpLeg) {
 			frame.buffer.Release()
 			leg.busy = false
 			c.stateMu.Unlock()
+			if c.cfg.DownloadAudit != nil {
+				r := c.downloadRecord("WRITE")
+				r.transfer.Leg = int(leg.id)
+				r.transfer.Generation = frame.generation
+				r.transfer.LogicalSeq = frame.seq
+				r.transfer.Repair = frame.replay
+				r.transfer.Outcome = "failed"
+				if err == nil {
+					r.transfer.Bytes = uint64(length)
+					r.transfer.Outcome = "written"
+				}
+				c.cfg.DownloadAudit.record(r)
+			}
 			if err != nil {
 				c.legFailed(leg, legFailureWriteData, err)
 				return
@@ -244,6 +258,11 @@ func (c *mpCore) legFailed(leg *mpLeg, stage legFailureStage, err error) {
 	delete(c.legs, leg.id)
 	c.retiring[leg.id] = leg
 	c.legsMu.Unlock()
+	if c.cfg.DownloadAudit != nil {
+		r := c.downloadRecord("PATH_FAILED")
+		r.session.Reason = fmt.Sprintf("leg=%d generation=%d stage=%s error=%v", leg.id, leg.path.Generation, stage, err)
+		c.cfg.DownloadAudit.record(r)
+	}
 	c.stateMu.Lock()
 	leg.path.Close()
 	leg.closePreferredCapacityRanges()
