@@ -40,6 +40,7 @@ type MultipathOutboundOptions struct {
 }
 
 type MultipathInboundOptions struct {
+	DownloadAudit bool `json:"download_audit,omitempty"`
 	ListenOptions
 	PreferredCapacityMbps       uint32                   `json:"preferred_capacity_mbps,omitempty"`
 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
