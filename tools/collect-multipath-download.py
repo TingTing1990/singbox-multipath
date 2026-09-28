@@ -38,7 +38,6 @@ def main():
     p.add_argument('--service', default='singbox-multipath.service')
     p.add_argument('--instance', required=True)
     p.add_argument('--config', default='/opt/singbox-multipath/config/config.json')
-    p.add_argument('--max-bytes', type=int, default=512 * 1024 * 1024, help='stop incomplete at this capture size')
     p.add_argument('--output', required=True, help='new directory; existing paths are refused')
     a = p.parse_args()
     root = Path(a.output)
@@ -98,8 +97,6 @@ def main():
                             entry['MESSAGE'] = message
                             line = json.dumps(entry, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
                         output.write(line + b'\n')
-                        if output.tell() > a.max_bytes:
-                            raise RuntimeError('capture size limit reached')
                         manifest['end_cursor'] = entry['__CURSOR']
                         if not isinstance(message, str) or 'MP_DOWNLOAD_AUDIT ' not in message:
                             continue

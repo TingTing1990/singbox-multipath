@@ -71,6 +71,9 @@ class CollectorTests(unittest.TestCase):
             return collector.main()
 
     def test_runtime_collector_offline_and_tampering(self):
+        source = Path(collector.__file__).read_text()
+        self.assertNotIn("--max-bytes", source)
+        self.assertNotIn("capture size limit reached", source)
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / 'capture'
             self.assertEqual(self.collect(root), 0)
