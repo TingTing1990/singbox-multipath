@@ -163,7 +163,7 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 			}
 			if last != nil {
 				delta, ok := downloadDelta(last.Totals, s.Totals)
-				if !ok || e.MonoNS <= lastSnapshotNS {
+				if !ok {
 					issue("invalid cumulative window")
 					last = nil
 					continue
@@ -173,6 +173,23 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 				}
 				if delta != checked {
 					issue("window totals disagree with observed runtime events")
+				}
+				if e.MonoNS < lastSnapshotNS {
+					issue("invalid cumulative window")
+					last = nil
+					continue
+				}
+				if e.MonoNS == lastSnapshotNS {
+					if delta != (D.Totals{}) || checked != (D.Totals{}) {
+						issue("invalid cumulative window")
+						last = nil
+						continue
+					}
+					copy := s
+					last = &copy
+					lastSnapshotNS = e.MonoNS
+					checked = D.Totals{}
+					continue
 				}
 				seconds := float64(e.MonoNS-lastSnapshotNS) / 1e9
 				w := ServerDownloadWindow{StartNS: lastSnapshotNS, EndNS: e.MonoNS, Delta: delta, Config: s.Config, Memory: s.Memory}

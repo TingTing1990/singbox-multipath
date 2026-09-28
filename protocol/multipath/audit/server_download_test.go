@@ -95,3 +95,39 @@ func TestServerDownloadIndependentCountersAndFaults(t *testing.T) {
 		t.Fatalf("journal framing differs: %v", e)
 	}
 }
+
+func TestServerDownloadAllowsZeroDurationDuplicateSnapshotWithoutChanges(t *testing.T) {
+	lines := downloadFixture(t)
+	final := D.Snapshot{Memory: D.Memory{Limit: 1000}, Config: D.Config{ChunkSize: 100}, Totals: D.Totals{Decisions: 2, AssignedNormal: [2]uint64{30, 0}, AssignedRepair: [2]uint64{0, 10}, WrittenNormal: [2]uint64{30, 0}, WrittenRepair: [2]uint64{0, 10}, ConfirmedPath: [2]uint64{30, 10}, ConfirmedLogical: 25}}
+	data, err := D.Encode(D.Header{Schema: 1, Epoch: "epoch", Instance: "mp-in", Side: "server", Direction: "download", Seq: 8, At: time.Unix(1000, 0), MonoNS: 2000000000, Kind: "STOP", Session: "session"}, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines = append(lines, D.Marker+string(data))
+	report, err := AnalyzeServerDownload(strings.NewReader(strings.Join(lines, "\n")), "mp-in", "")
+	if err != nil || !report.Complete {
+		t.Fatalf("zero-duration duplicate boundary rejected: %v", err)
+	}
+	if len(report.Windows) != 1 {
+		t.Fatalf("zero-duration duplicate created throughput window: %d", len(report.Windows))
+	}
+}
+
+func TestServerDownloadRejectsZeroDurationSnapshotWithChanges(t *testing.T) {
+	lines := downloadFixture(t)
+	feedback, err := D.Encode(D.Header{Schema: 1, Epoch: "epoch", Instance: "mp-in", Side: "server", Direction: "download", Seq: 8, At: time.Unix(1000, 0), MonoNS: 2000000000, Kind: "FEEDBACK", Session: "session"}, D.Feedback{LogicalBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines = append(lines, D.Marker+string(feedback))
+	changed := D.Snapshot{Memory: D.Memory{Limit: 1000}, Config: D.Config{ChunkSize: 100}, Totals: D.Totals{Decisions: 2, AssignedNormal: [2]uint64{30, 0}, AssignedRepair: [2]uint64{0, 10}, WrittenNormal: [2]uint64{30, 0}, WrittenRepair: [2]uint64{0, 10}, ConfirmedPath: [2]uint64{30, 10}, ConfirmedLogical: 26}}
+	data, err := D.Encode(D.Header{Schema: 1, Epoch: "epoch", Instance: "mp-in", Side: "server", Direction: "download", Seq: 9, At: time.Unix(1000, 0), MonoNS: 2000000000, Kind: "STOP", Session: "session"}, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines = append(lines, D.Marker+string(data))
+	report, err := AnalyzeServerDownload(strings.NewReader(strings.Join(lines, "\n")), "mp-in", "")
+	if err == nil || report.Complete || !strings.Contains(err.Error(), "invalid cumulative window") {
+		t.Fatalf("zero-duration changed snapshot accepted: report=%+v err=%v", report, err)
+	}
+}
