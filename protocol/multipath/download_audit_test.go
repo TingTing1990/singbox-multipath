@@ -14,7 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/sagernet/sing-box/protocol/multipath/audit"
 	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
@@ -141,7 +140,7 @@ func TestDownloadProducerToOffline(t *testing.T) {
 	}
 }
 
-func TestDownloadQueueBoundedAndDropVisible(t *testing.T) {
+func TestDownloadBacklogPreservesAllEvents(t *testing.T) {
 	cfg := flowTestConfig()
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -152,32 +151,34 @@ func TestDownloadQueueBoundedAndDropVisible(t *testing.T) {
 	}
 	a.start()
 	<-entered
-	for i := 0; i < downloadAuditQueue*4; i++ {
+	const events = 4096
+	for i := 0; i < events; i++ {
 		a.record(downloadRecord{header: D.Header{Kind: "WAIT", Session: "x"}, decision: D.Decision{Reason: "test", Outcome: "waiting"}})
 	}
-	if len(a.queue) != downloadAuditQueue {
-		t.Fatal("queue not bounded")
-	}
-	if unsafe.Sizeof(downloadRecord{})*downloadAuditQueue > 2<<20 {
-		t.Fatal("observation queue exceeds fixed 2 MiB bound")
-	}
 	a.mu.Lock()
+	pending := a.queue.Len()
 	drops := a.dropped
 	a.mu.Unlock()
-	if drops == 0 {
-		t.Fatal("overflow not counted")
+	if pending != events {
+		t.Fatalf("observation backlog lost records: pending=%d want=%d", pending, events)
 	}
-	close(release)
-	deadline := time.Now().Add(time.Second)
-	for len(a.queue) > 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if drops != 0 {
+		t.Fatalf("observation backlog dropped records: %d", drops)
 	}
 	a.snapshot("WINDOW")
 	a.close()
-	<-a.done
+	close(release)
+	select {
+	case <-a.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("observation backlog did not drain")
+	}
 	r, e := audit.AnalyzeServerDownload(strings.NewReader(output.String()), "mp-in", "")
-	if e == nil || r.Complete || !strings.Contains(e.Error(), "dropped") {
-		t.Fatalf("overflow accepted: %v", e)
+	if e != nil || !r.Complete {
+		t.Fatalf("complete retained backlog rejected: %v", e)
+	}
+	if r.Reasons["test"] != events {
+		t.Fatalf("retained WAIT evidence=%d want=%d", r.Reasons["test"], events)
 	}
 }
 

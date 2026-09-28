@@ -1,19 +1,15 @@
 package multipath
 
 import (
+	"container/list"
 	"crypto/rand"
 	"encoding/hex"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
 )
-
-// Fixed capacity, separate from the frozen DATA memory admission policy.
-// No frame/payload/core references are retained in the observation queue.
-const downloadAuditQueue = 256
 
 type downloadRecord struct {
 	header   D.Header
@@ -26,7 +22,8 @@ type downloadRecord struct {
 
 type downloadAudit struct {
 	mu              sync.Mutex
-	queue           chan downloadRecord
+	queue           list.List
+	wake            chan struct{}
 	done            chan struct{}
 	closeOnce       sync.Once
 	startOnce       sync.Once
@@ -46,9 +43,7 @@ func newDownloadAudit(instance string, cfg coreConfig, write func(string)) (*dow
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, err
 	}
-	a := &downloadAudit{queue: make(chan downloadRecord, downloadAuditQueue), done: make(chan struct{}), started: time.Now(), epoch: hex.EncodeToString(id[:]), instance: instance, memory: cfg.Memory, capacity: cfg.PreferredCapacity, write: write, cfg: downloadConfig(cfg)}
-	a.cfg.ObservationQueueRecords = downloadAuditQueue
-	a.cfg.ObservationQueueBytes = int64(downloadAuditQueue) * int64(unsafe.Sizeof(downloadRecord{}))
+	a := &downloadAudit{wake: make(chan struct{}, 1), done: make(chan struct{}), started: time.Now(), epoch: hex.EncodeToString(id[:]), instance: instance, memory: cfg.Memory, capacity: cfg.PreferredCapacity, write: write, cfg: downloadConfig(cfg)}
 	return a, nil
 }
 
@@ -123,11 +118,23 @@ func (a *downloadAudit) enqueueLocked(r downloadRecord) {
 	r.header.At = now
 	r.header.MonoNS = now.Sub(a.started).Nanoseconds()
 	r.header.Dropped = a.dropped
+	a.queue.PushBack(r)
 	select {
-	case a.queue <- r:
+	case a.wake <- struct{}{}:
 	default:
-		a.dropped++
 	}
+}
+
+func (a *downloadAudit) dequeue() (downloadRecord, bool, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	front := a.queue.Front()
+	if front != nil {
+		r := front.Value.(downloadRecord)
+		a.queue.Remove(front)
+		return r, true, false
+	}
+	return downloadRecord{}, false, a.closed
 }
 
 func (a *downloadAudit) snapshot(kind string) {
@@ -146,7 +153,10 @@ func (a *downloadAudit) snapshotFinal(kind string, final bool) {
 		a.enqueueLocked(downloadRecord{header: D.Header{Kind: kind}, snapshot: D.Snapshot{Totals: a.totals, Memory: m, Config: a.cfg, Capacity: capacity}})
 		if final {
 			a.closed = true
-			close(a.queue)
+			select {
+			case a.wake <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -163,34 +173,43 @@ func (a *downloadAudit) start() {
 			defer timer.Stop()
 			for {
 				select {
-				case r, ok := <-a.queue:
-					if !ok {
-						return
-					}
-					var data any
-					switch r.header.Kind {
-					case "START", "WINDOW", "STOP":
-						data = r.snapshot
-					case "SESSION_OPEN", "SESSION_CLOSE", "ACTIVATION", "SESSION_ESTABLISHED", "PATH_ATTACHED", "PATH_FAILED":
-						data = r.session
-					case "DECISION", "WAIT":
-						data = r.decision
-					case "WRITE":
-						data = r.transfer
-					case "FEEDBACK":
-						data = r.feedback
-					}
-					encoded, err := D.Encode(r.header, data)
-					if err != nil {
-						a.mu.Lock()
-						a.dropped++
-						a.mu.Unlock()
-						continue
-					}
-					a.write(D.Marker + string(encoded))
 				case <-timer.C:
 					a.snapshot("WINDOW")
+				default:
 				}
+				r, ok, closed := a.dequeue()
+				if !ok {
+					if closed {
+						return
+					}
+					select {
+					case <-a.wake:
+					case <-timer.C:
+						a.snapshot("WINDOW")
+					}
+					continue
+				}
+				var data any
+				switch r.header.Kind {
+				case "START", "WINDOW", "STOP":
+					data = r.snapshot
+				case "SESSION_OPEN", "SESSION_CLOSE", "ACTIVATION", "SESSION_ESTABLISHED", "PATH_ATTACHED", "PATH_FAILED":
+					data = r.session
+				case "DECISION", "WAIT":
+					data = r.decision
+				case "WRITE":
+					data = r.transfer
+				case "FEEDBACK":
+					data = r.feedback
+				}
+				encoded, err := D.Encode(r.header, data)
+				if err != nil {
+					a.mu.Lock()
+					a.dropped++
+					a.mu.Unlock()
+					continue
+				}
+				a.write(D.Marker + string(encoded))
 			}
 		}()
 	})
