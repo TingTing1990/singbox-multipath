@@ -1,4 +1,4 @@
-name: Build SFA Android arm64-v8a Release Final Audit
+name: Build SFA Android arm64-v8a Release Research Beta
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       source_ref:
         description: sing-box fork branch/tag/commit to build
         required: true
-        default: feature/multipath-capacity-v2-beta6
+        default: feature/multipath-research-beta
         type: string
 
 permissions:
