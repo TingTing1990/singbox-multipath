@@ -1,0 +1,1074 @@
+name: Build Multipath Capacity Audit Final
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Repaired source branch/tag/commit to audit and build
+        required: true
+        default: feature/multipath-capacity-audit-final
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multipath-server-audit-v3-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.5'
+  VERSION: '1.14.0-multipath-beta6'
+  FROZEN_GOLDEN_SHA: 'e4245b3e7c79b1b90f2b36ddec36e8af2e63c2a6'
+  FROZEN_GOLDEN_TREE: '9dc79da54ffa4604c4649050915c7c5edc9d04f0'
+  B9_UPSTREAM_COMMIT: '9721ae7e3dd4da02a2baf9bb4461316e0aeeaf7d'
+
+jobs:
+  audit_test:
+    name: Frozen delta + A provenance + B9 guard + impacted regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+      parent_sha: ${{ steps.resolve.outputs.parent_sha }}
+
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup exact Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Resolve exact candidate against immutable Golden
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REF"
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          grep -Fx "go ${GO_VERSION}" go.mod
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          test "$(git rev-parse "${FROZEN_GOLDEN_SHA}^{tree}")" = "$FROZEN_GOLDEN_TREE"
+          test "$(git merge-base "$CANDIDATE_SHA" "$FROZEN_GOLDEN_SHA")" = "$FROZEN_GOLDEN_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=$FROZEN_GOLDEN_SHA" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$CANDIDATE_SHA"
+          echo "golden_sha=$FROZEN_GOLDEN_SHA"
+          echo "golden_tree=$FROZEN_GOLDEN_TREE"
+          echo "b9_upstream_commit=$B9_UPSTREAM_COMMIT"
+          echo "go=$(go version)"
+
+      - name: Verify exact repaired source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import hashlib
+          expected={
+            'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
+            'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
+            'protocol/multipath/core.go':'6c01d7804020ef099317c88bdeece572c23cf74712f9d9aac8c313effdd6884d',
+            'protocol/multipath/inbound.go':'e9cb8056dce6b6a48718c5862e8f4d2a52b76200ecdf7aa5d39be78eba3b01a9',
+            'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
+            'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
+            'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
+            'protocol/multipath/scheduler.go':'f90e1fee0196dee2d20cb829832f2739846a6292394252008fe64a7cdb31ac16',
+            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/transport.go':'6f950ab8b6df2c3fd988d6ff2423bb10ab5a8baed3c87d4d2b6aa28127d6aa8c',
+            'protocol/multipath/types.go':'61c2ec25359a21f269f3e0fcfb14f247d1d66dc92fab5bd397ae488e61408255',
+            'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
+            'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
+            'protocol/multipath/f01_staged_ack_test.go':'6afeef726bad4179002866cebaf0556f4e6a30775de20f31b288d75ec22b9b5d',
+            'protocol/multipath/memory_available_linux_test.go':'6e6f444997734b18f85a4f76302b7ece7b46c983ac90b7e2e251f4230659d291',
+            'protocol/multipath/memory_runtime.go':'70a2a22f367b9f70ed22bc466aa48b8724eafd4853d62d3ecdfa8ce3693297dd',
+            'protocol/multipath/memory_runtime_test.go':'e021dc2188f9c00242091608c54392d58bc97bb5c5131a99492959b1604dfb22',
+            'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
+            'protocol/multipath/stream/records_test.go':'f66daaacfc75eb676100cd1aaa94e21208ece1301c4b6e5efe09e7d1286a5f5f',
+            'protocol/multipath/audit/analyzer.go':'dcda89bfc030f9c135e1851b24e54853b8aa88006b57e1ec56712f6d9e86e4c4',
+            'protocol/multipath/audit/audit_test.go':'64cfd5d182028abef1669221906486ac1c0607d32c01cacc25cf1eb95628906b',
+            'protocol/multipath/audit/coverage.go':'d3385555fc774701cd0adecca0b8a5738a0d3487c172dc187053adf97ef2d1bf',
+            'protocol/multipath/audit/event.go':'7953044aa94246846fce722e8a3b03e97897fbdc1e106d1b46dfeae4f21be4d5',
+            'protocol/multipath/audit/event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
+            'protocol/multipath/audit/parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
+            'protocol/multipath/audit/schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff',
+            'protocol/multipath/audit/aggregation.go':'dad28f0a87619c54c19e9e9a976f724b6758445fe344f388961c0cfa6dfca462',
+            'protocol/multipath/audit/aggregation_v3_test.go':'286e9699d92ae0be3683d53e3090eda6300ac0b07ce60bd49ce697b9ce369df1',
+            'protocol/multipath/audit/diagnosis.go':'55d697fd311dacd4340f304e6756d9748fe429ceaacc06902bd1e4e0c31c40e3',
+            'protocol/multipath/audit/field_replay.go':'6feee5ae9c9f3406f6e1f68a38476cada03e6003c671125df36a481af1292758',
+            'protocol/multipath/audit/field_acquisition.go':'cadc7b165fe0f6883a20de72fc974d981ac94a1ec0be57f702b34e34ad7a518a',
+            'protocol/multipath/audit/field_offline_closure_test.go':'7abb9cf02b802edf74c11bdea11c01f509523c59a59069fc50df44535e06baef',
+            'protocol/multipath/audit/field_replay_test.go':'fd88ca1bc5612a52ac76e9ed4c890fe79b6c4cc8e161a3f668b58de69f87ab79',
+            'protocol/multipath/audit/status.go':'e4fec79e7ff60f7df4eb24582948e321977391f7a79c3c4fe393117aff0e2726',
+            'protocol/multipath/audit/status_v3_test.go':'7f2c76821e645e44dab7d606fd3cc5013dc3f1879c2df49ff139a6871b55d57d',
+            'protocol/multipath/audit/timeline.go':'10705a37d05989c3ab727f6c8614e300a42866713c99cd8b01b0db6776f91049',
+            'protocol/multipath/audit/timeline_v3_test.go':'27ab05035e1fde95bc0900d850890724ee42e9e9d4d01c9bfb7eb3d0c3e7556d',
+            'protocol/multipath/audit/v3_test_helpers_test.go':'c21e170281b9ed254c5398f26468de5db0fdca2cd57511a0e67ff71b443f4390',
+            'option/multipath.go':'769b02deee965dc443cabdb35de9b9fc3f93e1506330ad11a7c4ef918fa98d65',
+            'cmd/multipath-download-audit/main.go':'f5f7c39f3627b3a0029739cae02a6c0345226420519c0112c0cf1d509f59af4d',
+            'protocol/multipath/audit/server_download.go':'17af0a2f809a6f9a94d43372c0375ac96573d1847594efa41f4b39d1c40c551f',
+            'protocol/multipath/audit/server_download_bundle.go':'3cd2168a8787ae2150a310a3045c8f3e966e7b1704db28146c5df34aaac83b56',
+            'protocol/multipath/audit/server_download_test.go':'1e3f307f883e3c45222d5a62cc4447bcc2dc81ada3ec7b9c7e76734e5c31c727',
+            'protocol/multipath/download_audit.go':'c64462b69c7d46932994eefd29bbf31fbf1f18911642fc9078658ccb662b7b72',
+            'protocol/multipath/download_audit_test.go':'96b1879384baa03a2f979fdbfd59608a838b91d299bcc156f7a804608ae736bc',
+            'protocol/multipath/downloadevidence/schema.go':'3dbc1fcbef06a11afa8bc0d2e21723558936c7d76356477311255c492be0b852',
+            'tools/collect-multipath-download.py':'4c1976f9819e614b91f56dfb445b76f998c806e4af7e0bd26c1c5ac1e5e97e98',
+            'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
+            'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
+            'tools/verify-download-boundary.py':'957c742b1592941ed5254e808f81ce9aa79715dce5567cb322b49b9699866ae7',
+          }
+          for rel,want in expected.items():
+              got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
+              if got != want:
+                  raise SystemExit(f'FAIL identity {rel}: {got} != {want}')
+              print('PASS',rel,got)
+          PY
+
+      - name: Set audited build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          test -n "$BUILD_TAGS"
+          echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
+      - name: Materialize immutable Golden and evidence directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOLDEN_DIR="${RUNNER_TEMP}/frozen-golden"
+          INDEPENDENT_DIR="${RUNNER_TEMP}/independent-repair"
+          MUTANT_ROOT="${RUNNER_TEMP}/repair-mutants"
+          EVIDENCE_DIR="${RUNNER_TEMP}/memory-repair-evidence"
+          git worktree prune || true
+          rm -rf "$GOLDEN_DIR" "$INDEPENDENT_DIR" "$MUTANT_ROOT" "$EVIDENCE_DIR"
+          mkdir -p "$MUTANT_ROOT" "$EVIDENCE_DIR"
+          git worktree add --detach "$GOLDEN_DIR" "$FROZEN_GOLDEN_SHA"
+          echo "GOLDEN_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          echo "PARENT_DIR=$GOLDEN_DIR" >> "$GITHUB_ENV"
+          echo "INDEPENDENT_DIR=$INDEPENDENT_DIR" >> "$GITHUB_ENV"
+          echo "MUTANT_ROOT=$MUTANT_ROOT" >> "$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Complete-tree and architecture boundary audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY' | tee "${EVIDENCE_DIR}/architecture-audit.log"
+          from pathlib import Path
+          import hashlib, os, re, subprocess
+          ROOT=Path(os.environ['GITHUB_WORKSPACE'])
+          GOLDEN=Path(os.environ['GOLDEN_DIR'])
+          MOD={
+            'option/multipath.go',
+            'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
+            'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
+            'protocol/multipath/outbound.go','protocol/multipath/scheduler.go','protocol/multipath/stream/path.go',
+            'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go'}
+          ADD={
+            'cmd/multipath-download-audit/main.go',
+            'protocol/multipath/audit/server_download.go',
+            'protocol/multipath/audit/server_download_bundle.go',
+            'protocol/multipath/audit/server_download_test.go',
+            'protocol/multipath/download_audit.go',
+            'protocol/multipath/download_audit_test.go',
+            'protocol/multipath/downloadevidence/schema.go',
+            'tools/collect-multipath-download.py',
+            'tools/download-observation.patch',
+            'tools/test-download-collector.py',
+            'tools/verify-download-boundary.py',
+
+            'protocol/multipath/f01_memory_test.go','protocol/multipath/f01_retention_contract_test.go',
+            'protocol/multipath/f01_staged_ack_test.go','protocol/multipath/memory_available_linux_test.go',
+            'protocol/multipath/memory_runtime.go','protocol/multipath/memory_runtime_test.go',
+            'protocol/multipath/stream/records.go','protocol/multipath/stream/records_test.go',
+            'protocol/multipath/audit/analyzer.go','protocol/multipath/audit/audit_test.go',
+            'protocol/multipath/audit/coverage.go','protocol/multipath/audit/event.go',
+            'protocol/multipath/audit/event_type.go','protocol/multipath/audit/parser.go',
+            'protocol/multipath/audit/schema.go','protocol/multipath/audit/aggregation.go',
+            'protocol/multipath/audit/aggregation_v3_test.go','protocol/multipath/audit/diagnosis.go',
+            'protocol/multipath/audit/field_replay.go','protocol/multipath/audit/field_replay_test.go',
+            'protocol/multipath/audit/field_acquisition.go','protocol/multipath/audit/field_offline_closure_test.go',
+            'protocol/multipath/audit/status.go','protocol/multipath/audit/status_v3_test.go',
+            'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
+            'protocol/multipath/audit/v3_test_helpers_test.go'}
+          F01={
+            'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
+            'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
+            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
+            'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
+            'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
+            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
+            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
+            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/transport.go':'141a760282dca81dbe516a2d8054ca0ec0bb05a00d6a6d4bed774336b2c10b57',
+            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c'}
+          FORBIDDEN=('pendingReclaim','reclaimIssued','reclaimCompleted','reclaimRunning','memoryIdleReclaimDelay',
+                     'memoryScavenge','retireDetached','reclaimCutoff','waitReclaim','prepareReservedRelease',
+                     'prepareRelease','NewManagedBuffer','debug.FreeOSMemory')
+          def req(v,m):
+              if not v: raise RuntimeError(m)
+          import runpy
+          normalized=runpy.run_path(str(ROOT/'tools/verify-download-boundary.py'))['normalized_sources'](ROOT)
+          def source(rel): return normalized[rel] if rel in normalized else (ROOT/rel).read_bytes()
+          def sha(p): return hashlib.sha256(source(str(p.relative_to(ROOT)))).hexdigest()
+          def tracked(root):
+              raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
+              out={}
+              for rec in raw.split(b'\0'):
+                  if not rec: continue
+                  meta,path=rec.split(b'\t',1); mode,oid,stage=meta.split()
+                  req(stage==b'0','unmerged '+os.fsdecode(path))
+                  out[os.fsdecode(path)]=(mode.decode(),oid.decode())
+              return out
+          def function(src,name):
+              m=re.search(r'(?m)^func\s+(?:\([^\n]+\)\s+)?'+re.escape(name)+r'\s*\([^\n]*',src)
+              req(m is not None,'missing function '+name)
+              start=m.start(); brace=src.find('{',start); req(brace>=0,'missing brace '+name)
+              d=0; q=None; esc=False
+              for i in range(brace,len(src)):
+                  c=src[i]
+                  if q:
+                      if esc: esc=False
+                      elif c=='\\': esc=True
+                      elif c==q: q=None
+                  else:
+                      if c in ('"','`'): q=c
+                      elif c=='{': d+=1
+                      elif c=='}':
+                          d-=1
+                          if d==0: return src[start:i+1]
+              raise RuntimeError('unclosed '+name)
+          gt,rt=tracked(GOLDEN),tracked(ROOT)
+          mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
+          req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
+          print(f'PASS exact Golden delta {len(MOD)}M/{len(ADD)}A/0D including modes/gitlinks')
+          for rel,(mode,oid) in gt.items():
+              if rel in MOD: continue
+              req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
+          print('PASS complete-tree freeze outside authorized paths')
+          for rel,want in F01.items(): req(sha(ROOT/rel)==want,'F01 byte drift '+rel)
+          print('PASS F01/A identity after reversing approved download observation patch')
+          for rel in ('protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/activation.go',
+                      'protocol/multipath/telemetry.go','option/multipath.go','go.mod','go.sum',
+                      'protocol/multipath/flow_fault_test.go','protocol/multipath/memory_test.go',
+                      'protocol/multipath/recovery_packet.go','protocol/multipath/stream/receive.go',
+                      'protocol/multipath/stream/stream_test.go'):
+              req(source(rel)==(GOLDEN/rel).read_bytes(),'critical Golden drift '+rel)
+          print('PASS frozen critical files and restored B-touched files exact Golden')
+          prod='\n'.join(p.read_text(errors='replace') for p in (ROOT/'protocol/multipath').rglob('*.go') if not p.name.endswith('_test.go'))
+          for token in FORBIDDEN: req(token not in prod,'rejected B token remains '+token)
+          print('PASS rejected physical-credit B state machine absent')
+          mem=(ROOT/'protocol/multipath/memory.go').read_text(); runtime=(ROOT/'protocol/multipath/memory_runtime.go').read_text(); avail=(ROOT/'protocol/multipath/memory_available_linux.go').read_text()
+          req('processMemoryGuard.acquire()' in mem and 'func (b *memoryBudget) stopLogging()' in mem,'B9 guard lifecycle missing')
+          for token in ('debug.SetMemoryLimit','os.LookupEnv("GOMEMLIMIT")','g.users++','once.Do(g.release)'): req(token in runtime,'B9 runtime contract missing '+token)
+          for token in ('/proc/self/cgroup','/proc/self/mountinfo','memory.max','memory.current','memory.limit_in_bytes','memory.usage_in_bytes'): req(token in avail,'B9 cgroup contract missing '+token)
+          req((ROOT/'protocol/multipath/inbound.go').read_text().count('i.cfg.Memory.stopLogging()')==1,'inbound close guard release')
+          req((ROOT/'protocol/multipath/outbound.go').read_text().count('o.cfg.Memory.stopLogging()')==1,'outbound close guard release')
+          print('PASS B9 runtime/cgroup guard integration bounded to logging lifecycle')
+          for rel,line in (('protocol/multipath/inbound.go','\ti.cfg.Memory.stopLogging()\n'),('protocol/multipath/outbound.go','\to.cfg.Memory.stopLogging()\n')):
+              current=source(rel).decode()
+              req(current.count(line)==1,'compatibility hook count '+rel)
+              req(current.replace(line,'').encode()==(GOLDEN/rel).read_bytes(),'non-hook drift '+rel)
+          print('PASS inbound/outbound compatibility delta is exactly one upstream stopLogging hook each')
+          for rel,name in (('protocol/multipath/scheduler.go','choosePathLocked'),('protocol/multipath/scheduler.go','pumpLoop'),
+                           ('protocol/multipath/memory.go','boosterAllowed'),('protocol/multipath/memory.go','updatePressureLocked')):
+              req(function(source(rel).decode(),name)==function((GOLDEN/rel).read_text(),name),'frozen function drift '+rel+':'+name)
+          print('PASS normalized Frozen scheduler/pressure bodies; actual observed choice tested independently')
+          oracle=(ROOT/'protocol/multipath/download_audit_test.go').read_text()
+          req(function(oracle,'frozenDownloadChoiceLocked').replace('frozenDownloadChoiceLocked','choosePathLocked',1)==function(source('protocol/multipath/scheduler.go').decode(),'choosePathLocked'),'independent choice oracle drift')
+          req(function(oracle,'frozenDownloadSubmitChoiceLocked').replace('frozenDownloadSubmitChoiceLocked','choosePathForSubmitLocked',1).replace('frozenDownloadChoiceLocked','choosePathLocked')==function(source('protocol/multipath/scheduler.go').decode(),'choosePathForSubmitLocked'),'independent Capacity oracle drift')
+          req('processMemoryGuard' not in (ROOT/'protocol/multipath/scheduler.go').read_text(),'runtime guard leaked into scheduler')
+          req('processMemoryGuard' not in (ROOT/'protocol/multipath/core.go').read_text(),'runtime guard leaked into core allocation')
+          print('PASS runtime guard does not alter MP admission/scheduler semantics')
+          req('TestFlowRegressionRepeatedBoosterDisconnect' in (ROOT/'protocol/multipath/flow_fault_test.go').read_text(),'old liveness regression missing')
+          print('PASS old repeated-booster-disconnect regression preserved')
+          audit_dir=ROOT/'protocol/multipath/audit'
+          audit_prod='\n'.join(p.read_text(errors='replace') for p in audit_dir.glob('*.go') if not p.name.endswith('_test.go'))
+          req('package audit' in audit_prod,'Server Audit V2 package identity missing')
+          req('unsafe' not in audit_prod and 'go:linkname' not in audit_prod,'Server Audit V2 bypasses frozen boundary')
+          req('github.com/sagernet/sing-box/protocol/multipath/audit' not in prod,'Server Audit V2 leaked into frozen multipath runtime')
+          req('SupportOpen' in (audit_dir/'coverage.go').read_text() and 'RequiresFrozenHook: true' in (audit_dir/'coverage.go').read_text(),'OPEN frozen-hook coverage contract missing')
+          print('PASS Server Audit V2 is read-only/offline and does not enter frozen runtime control/data paths')
+          v2_expected={
+            'analyzer.go':'dcda89bfc030f9c135e1851b24e54853b8aa88006b57e1ec56712f6d9e86e4c4',
+            'audit_test.go':'64cfd5d182028abef1669221906486ac1c0607d32c01cacc25cf1eb95628906b',
+            'coverage.go':'d3385555fc774701cd0adecca0b8a5738a0d3487c172dc187053adf97ef2d1bf',
+            'event.go':'7953044aa94246846fce722e8a3b03e97897fbdc1e106d1b46dfeae4f21be4d5',
+            'event_type.go':'44c81e47484ebe7fc39e3b5a74b3de745554b41c6e57645e06e41f0aaa26dc35',
+            'parser.go':'85a55ea31c5b9902150a2d9bffc0c688669da3ca1870b34248f79ba75bc34037',
+            'schema.go':'70d88d2cbad80ab00a2c353f5bf36509baa508999bbe6a2c3397b1fbf0c387ff'}
+          for name,want in v2_expected.items(): req(sha(audit_dir/name)==want,'Server Audit V2 byte drift '+name)
+          req(not (ROOT/'cmd/multipath-audit-v3').exists(),'forbidden V3 cmd boundary exists')
+          req(not (ROOT/'protocol/multipath/auditv3').exists(),'forbidden split auditv3 package exists')
+          v3_prod='\n'.join((audit_dir/name).read_text(errors='replace') for name in ('status.go','timeline.go','aggregation.go','diagnosis.go','field_replay.go','field_acquisition.go'))
+          req('package audit' in v3_prod,'V3 did not extend existing audit package')
+          req('unsafe' not in v3_prod and 'go:linkname' not in v3_prod,'V3 bypasses frozen boundary')
+          req('LEG1_EXACT_ASSIGNMENT' in (audit_dir/'diagnosis.go').read_text(),'scheduler uncertainty guard missing')
+          status_v3=(audit_dir/'status.go').read_text()
+          timeline_v3=(audit_dir/'timeline.go').read_text()
+          aggregation_v3=(audit_dir/'aggregation.go').read_text()
+          replay_v3=(audit_dir/'field_replay.go').read_text()
+          tests_v3='\n'.join((audit_dir/name).read_text() for name in ('timeline_v3_test.go','aggregation_v3_test.go','field_replay_test.go','field_offline_closure_test.go'))
+          req('preferred_assigned_bytes' in status_v3,'frozen local preferred-capacity status evidence parser missing')
+          req('LocalPreferredAssignmentEvidence' in timeline_v3 and 'ServerPreferredAssignmentEvidence' in timeline_v3 and 'AttachServerCapacityEvidence' in timeline_v3,'directional CAP/status evidence model missing')
+          req('LocalPreferredAssignmentEvidence' not in aggregation_v3 and 'LocalPreferredAssignmentEvidence' not in replay_v3,'client-local capacity leaked into download acceptance')
+          req('CapacityEvidence' in replay_v3 and 'ValidServerEvidence' in replay_v3,'server CAP per-window provenance missing')
+          req('ValidServerInterval' in replay_v3 and 'IntervalStart' in replay_v3 and 'IntervalEnd' in replay_v3 and 'IntervalKnown' in replay_v3,'server CAP statistical-interval provenance missing')
+          req('ServerCapacityCoverageDuration' in timeline_v3 and 'ServerCapacityCoverageRatio' in timeline_v3 and 'resetServerCapacityCorrelation' in timeline_v3,'CAP duration coverage or replace-not-append binding missing')
+          req('SenderOutputEvidenceOverlapWindowRatio' in aggregation_v3 and 'DegradationEvidenceCoverageRatio' in aggregation_v3 and 'boundedServerCapacityCoverage' in aggregation_v3,'duration-bounded degradation evidence coverage missing')
+          req('ReportAFingerprint' in aggregation_v3 and 'ReportBFingerprint' in aggregation_v3,'A/B source-report binding missing')
+          req('ErrUnverifiedDemand' in aggregation_v3 and 'CompareAlgorithms' in aggregation_v3,'verified-demand or A/B comparison contract missing')
+          req('RecognizedEvents == 0' in replay_v3 and 'len(closure.Blocking) == 0' in replay_v3,'fail-closed journal/blocking acceptance contract missing')
+          acquisition_v3=(audit_dir/'field_acquisition.go').read_text()
+          req('CaptureStatusFile' in acquisition_v3 and 'defaultStatusCapturePoll' in acquisition_v3,'external status_file acquisition closure missing')
+          req('ReplayFieldRun' in replay_v3 and 'AnalyzeJournalForInstance' in replay_v3,'FIELD dual-end replay entry point missing')
+          req('WriteFieldRunReplayJSON' in replay_v3 and 'does not overlap the client status trace' in replay_v3,'FIELD replay report or cross-end time binding missing')
+          req('SequenceEpochs' in replay_v3 and 'ValidationErrors' in replay_v3,'V2 journal validation evidence retention missing')
+          req('ServerCapacityEvidence' in timeline_v3 and 'ServerCAPEvents' in timeline_v3 and 'ServerLatestCAPEvent' in timeline_v3 and 'Snapshots' in timeline_v3,'forensic timeline evidence retention missing')
+          req('UsefulTXMbps' in timeline_v3 and 'LegTXMbps' in timeline_v3,'bidirectional TCP replay missing')
+          producer=(ROOT/'protocol/multipath/status.go').read_text()
+          recovery=(ROOT/'protocol/multipath/recovery_status.go').read_text()
+          def json_fields(src,name):
+              m=re.search(r'(?ms)^type\s+'+re.escape(name)+r'\s+struct\s*\{(.*?)^\}',src)
+              req(m is not None,'missing struct '+name)
+              return set(re.findall(r'`json:"([^",]+)',m.group(1))) - {'-'}
+          for producer_name,audit_name in (
+              ('statusTraffic','Traffic'),('statusRate','Rate'),('statusPeakRate','PeakRate'),('statusFrames','Frames'),('statusActivation','ActivationStatus'),
+              ('statusParameters','ParametersStatus'),('statusPreferredCapacity','PreferredCapacityStatus'),
+              ('statusMemory','MemoryStatus'),('statusSenderDiagnostics','SenderDiagnostics'),
+              ('statusLogical','LogicalStatus'),('statusFlow','FlowStatus'),('statusLeg','LegStatus'),('statusNode','StatusNode'),
+              ('statusDocument','StatusSnapshot')):
+              req(json_fields(producer,producer_name)==json_fields(status_v3,audit_name),'frozen status producer fields not losslessly represented '+producer_name+' -> '+audit_name)
+          req(json_fields(recovery,'recoveryStatus')==json_fields(status_v3,'RecoveryStatus'),'frozen recovery producer fields not losslessly represented')
+          req(json_fields(recovery,'recoveryPathStatus')==json_fields(status_v3,'RecoveryPathStatus'),'frozen recovery path fields not losslessly represented')
+          for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation','TestOfflineClosureStatusParserPreservesFrozenProducerFields','TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots','TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState','TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation','TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence','TestOfflineClosureReportSerializesForensicEvidence','TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField','TestOfflineClosureCaptureStatusFileWritesInitialSnapshot','TestOfflineClosureLatestCAPEventPreservesInWindowStateChange','TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail','TestOfflineClosureCAPIntervalRequiresConsecutiveSequence','TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback','TestOfflineClosureRebindingClearsPreviousInstanceEvidence','TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap','TestOfflineClosureCaptureToReplayUsesProvableCAPInterval'):
+              req(test_name in tests_v3,'V3 repair regression missing '+test_name)
+          req('diagnostic closure failed' in replay_v3,'FIELD diagnostic closure gate missing')
+          print('PASS legacy V2/V3 consumer identities; server download runtime hooks are separately authorized and verified')
+          print('ARCHITECTURE_AUDIT=PASS')
+          PY
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Materialize independent repair regression outside candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$INDEPENDENT_DIR" "${{ steps.resolve.outputs.candidate_sha }}"
+          cat > "$INDEPENDENT_DIR/protocol/multipath/zz_memory_repair_independent_test.go" <<'GOEOF'
+          package multipath
+
+          import "testing"
+
+          // Independent from candidate tests: this reproduces the exact accounting
+          // shape that made rejected B accumulate detached credit across rounds.
+          func TestRepairIndependentRepeatedRoundCredit(t *testing.T) {
+            b := newMemoryBudget(512<<10, false)
+            const charge = 1536
+            for round := 0; round < 6; round++ {
+              buffers := make([][]byte, 0, 64)
+              for i := 0; i < 64; i++ {
+                buffer, wait := b.tryAcquirePrimary(charge)
+                if buffer == nil || wait != nil {
+                  t.Fatalf("round=%d allocation=%d denied used=%d", round, i, b.snapshot().UsedBytes)
+                }
+                buffers = append(buffers, buffer)
+              }
+              for _, buffer := range buffers {
+                b.release(buffer)
+              }
+              snapshot := b.snapshot()
+              if !b.boosterAllowed() {
+                t.Fatalf("round=%d booster disabled after releases: used=%d high=%d", round, snapshot.UsedBytes, snapshot.BoosterLimitBytes)
+              }
+              if snapshot.UsedBytes > b.cacheLimit {
+                t.Fatalf("round=%d released credit accumulated: used=%d cache_limit=%d", round, snapshot.UsedBytes, b.cacheLimit)
+              }
+            }
+          }
+          GOEOF
+          gofmt -w "$INDEPENDENT_DIR/protocol/multipath/zz_memory_repair_independent_test.go"
+          (
+            cd "$INDEPENDENT_DIR"
+            CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+              -run '^TestRepairIndependentRepeatedRoundCredit$' ./protocol/multipath
+          ) | tee "${EVIDENCE_DIR}/independent-repeated-round-credit.log"
+
+      - name: Upstream B9 runtime guard and cgroup contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestAutomaticRuntimeMemoryLimit|TestRuntimeMemoryGuardOwnership|TestMemoryLoggingStopsWithoutParentCancellation|TestCgroupAvailableMemory)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/b9-runtime-guard.log"
+
+      - name: F01 A accounting and staged-ACK contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^(TestF01PendingWriteSurvivesRecordPressure|TestF01CacheDropsCheckedOutReferences|TestRecordStorageSenderAccounting|TestRecordStorageGrowthChargesBothAllocations|TestRecordStorageDeniedGrowthKeepsCallerOwnership|TestRecordStoragePathEmergencyReserve|TestRecordStoragePathReceiptLifecycle|TestRecordStorageSenderStagedACKTail)$' \
+            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/f01-focused.log"
+          CGO_ENABLED=1 go test -race -count=1 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestF01RetainedCapacityAcrossIdleSessions|TestIndependentRetentionContract|TestIndependentRetentionContractStagedACK)$' \
+            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/f01-broad-once.log"
+
+      - name: Capacity V2 impacted architecture regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=10 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^TestPreferredCapacity' ./protocol/multipath \
+            2>&1 | tee "${EVIDENCE_DIR}/capacity-v2-impacted.log"
+
+      - name: Materialize privacy-safe V3 FIELD replay fixtures in runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIXTURE_DIR="protocol/multipath/audit/testdata/field"
+          test ! -e "protocol/multipath/audit/testdata"
+          mkdir -p "$FIXTURE_DIR"
+
+          cat > "$FIXTURE_DIR/field-01-mp-in-39002.log" <<'EOF'
+          multipath session established to fixture.invalid:443 on leg 0
+          multipath leg 1 joined session for fixture.invalid:443
+          multipath leg1 joined data path: side=server destination=fixture.invalid:443 reconnect=false reason=bytes current_bytes=3145728 threshold_bytes=2097152
+          EOF
+
+          cat > "$FIXTURE_DIR/field-02-mp-in-39002.log" <<'EOF'
+          multipath session established to example.invalid:443 on leg 0
+          multipath leg 1 joined session for example.invalid:443
+          multipath leg1 joined data path: side=server destination=example.invalid:443 reconnect=false reason=bytes current_bytes=4194304 threshold_bytes=2097152
+          EOF
+
+          cat > "$FIXTURE_DIR/field-03-speedtest-mp-in-39001.log" <<'EOF'
+          CAP_AUDIT schema_version=1 event_seq=1 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:00:01Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=962.20 delivery_ready=true protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=689.26 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=2 event=CAP_GATE_OPENED side=server instance="mp-in-fixture" session_id="fixture-session" destination="fixture.invalid:443" at=2026-01-01T00:00:02Z original_trigger=bytes original_trigger_satisfied=true recovery_bypass=false target_mbps=640.00 delivery_mbps=962.20 delivery_ready=true protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=689.26 degrade_windows=0 normal_booster_admitted=true current_bytes=4194304 threshold_bytes=2097152 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=3 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:00:03Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=29.65 delivery_ready=false protected_mbps=962.20 protection_valid=true protection_active=true preferred_assignment_mbps=21.35 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=2
+          EOF
+
+          cat > "$FIXTURE_DIR/field-04-video-mp-in-39001.log" <<'EOF'
+          CAP_AUDIT schema_version=1 event_seq=1 event=CAP_WINDOW side=server instance="mp-in-fixture" session_id="" destination="" at=2026-01-01T00:01:01Z original_trigger=none original_trigger_satisfied=false recovery_bypass=false target_mbps=640.00 delivery_mbps=244.17 delivery_ready=false protected_mbps=0.00 protection_valid=false protection_active=false preferred_assignment_mbps=207.36 degrade_windows=0 normal_booster_admitted=true current_bytes=0 threshold_bytes=0 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          CAP_AUDIT schema_version=1 event_seq=2 event=CAP_GATE_BLOCKED side=server instance="mp-in-fixture" session_id="fixture-session" destination="fixture.invalid:443" at=2026-01-01T00:01:02Z original_trigger=bytes original_trigger_satisfied=true recovery_bypass=false target_mbps=640.00 delivery_mbps=244.17 delivery_ready=false protected_mbps=0.00 protection_valid=false protection_active=false preferred_assignment_mbps=207.36 degrade_windows=0 normal_booster_admitted=false current_bytes=3145728 threshold_bytes=2097152 trigger_window_bytes=0 trigger_rate_mbps=0.00 trigger_threshold_mbps=0.00 backlog_bytes=0 queue_bytes=0 old_protected_mbps=0.00 new_protected_mbps=0.00 change_reason= controller_window_seq=1
+          EOF
+
+          test "$(find "$FIXTURE_DIR" -maxdepth 1 -type f -name 'field-*.log' | wc -l)" -eq 4
+          if grep -RInE '([0-9]{1,3}\.){3}[0-9]{1,3}|@[A-Za-z0-9._-]+|session_id="[0-9a-fA-F]{6,}"' "$FIXTURE_DIR"; then
+            echo 'ERROR: privacy-safe replay fixture contains forbidden raw FIELD identifier pattern' >&2
+            exit 71
+          fi
+          sha256sum "$FIXTURE_DIR"/*.log | tee "${EVIDENCE_DIR}/server-audit-v3-ci-fixture-sha256.txt"
+          echo 'PASS privacy-safe V3 FIELD-derived fixtures materialized only in runner workspace'
+
+      - name: Server Audit V2 plus V3 audit package contracts x20
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUDIT_V3_FIELD_FIXTURES=1 CGO_ENABLED=1 go test -race -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-package.log"
+
+      - name: Server Audit V2 mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import json, os, subprocess
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          temp=Path(os.environ['MUTANT_ROOT'])
+          tags=os.environ['BUILD_TAGS']
+          mutations=[
+            ('audit-01-drop-evidence','protocol/multipath/audit/parser.go',
+             'state.EvidenceComplete, err = strconv.ParseBool(value)',
+             'state.EvidenceComplete, err = true, nil; _ = value',
+             '^TestParseCapacityDropped$'),
+            ('audit-02-frozen-scheduler-claim','protocol/multipath/audit/coverage.go',
+             'Support:            SupportOpen,\n\t\t\tEvidence:           "the frozen source emits no per-decision scheduler evidence",\n\t\t\tRequiresFrozenHook: true,',
+             'Support:  SupportFull,\n\t\t\tEvidence: "MUTANT",',
+             '^TestCoverageDoesNotClaimFrozenInternals$'),
+            ('audit-03-recovery-normal-admission','protocol/multipath/audit/analyzer.go',
+             'if state.NormalBoosterAdmitted {\n\t\t\t\treturn fmt.Errorf("recovery bypass cannot be reported as normal booster admission")\n\t\t\t}',
+             'if false && state.NormalBoosterAdmitted {\n\t\t\t\treturn fmt.Errorf("recovery bypass cannot be reported as normal booster admission")\n\t\t\t}',
+             '^TestValidateCapacityRejectsSemanticDrift$'),
+          ]
+          for name,rel,old,new,test in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+              try:
+                  p=work/rel; text=p.read_text()
+                  if text.count(old)!=1: raise RuntimeError(f'{name} anchor count={text.count(old)}')
+                  p.write_text(text.replace(old,new,1))
+                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  print(run.stdout)
+                  expected=test[1:-1]
+                  ran=failed=False
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
+                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran or not failed: raise RuntimeError(f'{name}: target test did not fail correctly {test}')
+                  print('KILLED',name,'BY',test)
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 3 SERVER AUDIT V2 MUTANTS KILLED')
+          PY
+
+      - name: Server Audit V3 historical FIELD replay and integrated repair contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUDIT_V3_FIELD_FIXTURES=1 AUDIT_V3_FIELD_GATE=1 CGO_ENABLED=1 go test -race -count=20 -timeout=15m -tags "$BUILD_TAGS" \
+            -run '^(TestFieldReplayAllRecordedFixtures|TestFieldReplayDiagnosticClosureGate|TestIntegratedDiagnosticClosureSimulation|TestDiagnosticClosureRejectsEmptyReport|TestDiagnosticClosureRejectsIncompleteJournal|TestDiagnosticClosureRejectsEmptyJournalEvenWithCompleteReportAndAB|TestAlgorithmABRejectsEmptyEmbeddedJournal|TestSaturatingAggregationRequiresVerifiedDemandEvidence|TestAlgorithmABRequiresSameVerifiedWorkload|TestDiagnosticClosureRequiresAlgorithmABEvidence|TestDiagnosticClosureRejectsUnboundAlgorithmAB|TestDiagnosticClosureMustNotPassWithBlocking|TestDiagnosticClosureCanPassWithOperationalEvidenceAndBoundAB|TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence|TestDisjointEvidenceCannotCloseDegradationLayer|TestBuildTimelineRejectsMixedNodeTags|TestAttachServerCapacityEvidenceUsesServerCAPWindow|TestActiveEnvelopePreservesTrailingActiveStall|TestOfflineClosureStatusParserPreservesFrozenProducerFields|TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots|TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState|TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation|TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence|TestOfflineClosureReportSerializesForensicEvidence|TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField|TestOfflineClosureCaptureStatusFileWritesInitialSnapshot|TestOfflineClosureLatestCAPEventPreservesInWindowStateChange|TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail|TestOfflineClosureCAPIntervalRequiresConsecutiveSequence|TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback|TestOfflineClosureRebindingClearsPreviousInstanceEvidence|TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap|TestOfflineClosureCaptureToReplayUsesProvableCAPInterval)$' \
+            ./protocol/multipath/audit 2>&1 | tee "${EVIDENCE_DIR}/server-audit-v3-repair-contracts.log"
+          echo 'PASS historical FIELD journals replay and remain fail-closed without missing status/baseline/A-B inputs'
+          echo 'PASS deterministic integrated status + server CAP + verified-demand + bound A/B repair contracts'
+          echo 'PASS LOCAL/SIMULATION V3 offline data contract: outbound status_file capture + explicit server-instance journal binding + lossless frozen status schema + interval-accurate CAP/window retention'
+          echo 'NOTE integrated positive closure is LOCAL/SIMULATION evidence, not a claim that historical FIELD fixtures contain complete status traces'
+
+      - name: Server Audit V3 repair mutation controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import json, os, subprocess
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          temp=Path(os.environ['MUTANT_ROOT'])
+          tags=os.environ['BUILD_TAGS']
+          journal_old = "func journalCompleteForV3(report JournalReport) bool {\n\tif !report.Provided || report.RecognizedEvents == 0 || !report.EvidenceComplete || report.DroppedEvents != 0 || report.SequenceGaps != 0 {\n\t\treturn false\n\t}\n\tfor _, evidence := range report.CapacityEvidence {\n\t\tif evidence.ValidServerEvidence() {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}"
+          journal_new = "func journalCompleteForV3(report JournalReport) bool {\n\treturn report.Provided && report.EvidenceComplete && report.DroppedEvents == 0 && report.SequenceGaps == 0\n}"
+          mutations=[
+            ('v3-f01-local-capacity-leak','protocol/multipath/audit/aggregation.go',
+             '\t\tif window.ServerPreferredAssignmentEvidence {\n\t\t\tcoverage := boundedServerCapacityCoverage(window)',
+             '\t\tif window.LocalPreferredAssignmentEvidence {\n\t\t\tcoverage := window.Duration',
+             '^TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence$'),
+            ('v3-f02-empty-journal-pass','protocol/multipath/audit/field_replay.go',
+             journal_old, journal_new,
+             '^TestAlgorithmABRejectsEmptyEmbeddedJournal$'),
+            ('v3-f03-disjoint-window-merge','protocol/multipath/audit/aggregation.go',
+             '\t\tif window.ServerPreferredAssignmentEvidence && window.RemoteSenderEvidence {',
+             '\t\tif window.ServerPreferredAssignmentEvidence || window.RemoteSenderEvidence {',
+             '^TestDisjointEvidenceCannotCloseDegradationLayer$'),
+            ('v3-f04-unbound-ab','protocol/multipath/audit/field_replay.go',
+             '\t\tbound := comparison.Comparable && comparison.AlgorithmA != ""',
+             '\t\tbound := comparison.Comparable || comparison.AlgorithmA != ""',
+             '^TestDiagnosticClosureRejectsUnboundAlgorithmAB$'),
+            ('v3-f05-mixed-node-subtraction','protocol/multipath/audit/timeline.go',
+             '\t\tif current.Node.Tag != result.SourceNodeTag {',
+             '\t\tif false && current.Node.Tag != result.SourceNodeTag {',
+             '^TestBuildTimelineRejectsMixedNodeTags$'),
+            ('v3-offline-instance-cross-contamination','protocol/multipath/audit/field_replay.go',
+             '\t\tif strings.Contains(line, marker) || strings.Contains(line, capacityMarker) {',
+             '\t\tif strings.Contains(line, marker) || strings.Contains(line, capacityMarker) || strings.Contains(line, "other-instance") {',
+             '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
+            ('v3-offline-cap-state-loss','protocol/multipath/audit/timeline.go',
+             '\t\t\twindow.ServerTargetMbps = latestEvent.TargetMbps',
+             '\t\t\twindow.ServerTargetMbps = 0',
+             '^TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState$'),
+            ('v3-offline-cap-endpoint-full-window','protocol/multipath/audit/timeline.go',
+             '\t\t\tcoveredDuration += overlap',
+             '\t\t\tcoveredDuration = window.Duration',
+             '^TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail$'),
+            ('v3-offline-cap-sequence-gap-bridged','protocol/multipath/audit/field_replay.go',
+             '\t\tconsecutive := current.ControllerWindowSeq == previous.value.ControllerWindowSeq+1',
+             '\t\tconsecutive := true',
+             '^TestOfflineClosureCAPIntervalRequiresConsecutiveSequence$'),
+            ('v3-offline-cap-time-rollback-bridged','protocol/multipath/audit/field_replay.go',
+             '\t\tstrictlyForward := current.At.After(previous.maxObserved)',
+             '\t\tstrictlyForward := true',
+             '^TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback$'),
+            ('v3-offline-cap-rebind-retains-old','protocol/multipath/audit/timeline.go',
+             '\t\tresetServerCapacityCorrelation(&timeline.Windows[windowIndex])',
+             '\t\tif false { resetServerCapacityCorrelation(&timeline.Windows[windowIndex]) }',
+             '^TestOfflineClosureRebindingClearsPreviousInstanceEvidence$'),
+            ('v3-offline-status-sample-dup','protocol/multipath/audit/field_acquisition.go',
+             '\tif s.haveLast && identity == s.lastIdentity {',
+             '\tif false && s.haveLast && identity == s.lastIdentity {',
+             '^TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation$'),
+            ('v3-offline-cross-end-time-fail-open','protocol/multipath/audit/field_replay.go',
+             '\tif correlatedCapacityWindows == 0 {',
+             '\tif false && correlatedCapacityWindows == 0 {',
+             '^TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence$'),
+            ('v3-offline-required-status-field-drop','protocol/multipath/audit/status.go',
+             '\t\t"activation_window_ms", "chunk_size", "queue_frames", "queue_bytes", "max_reorder_frames", "max_reorder_bytes",',
+             '\t\t"chunk_size", "queue_frames", "queue_bytes", "max_reorder_frames", "max_reorder_bytes",',
+             '^TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField$'),
+            ('v3-offline-latest-cap-state-loss','protocol/multipath/audit/timeline.go',
+             '\t\t\twindow.ServerProtectedMbps = latestEvent.ProtectedMbps',
+             '\t\t\twindow.ServerProtectedMbps = latestWindow.ProtectedMbps',
+             '^TestOfflineClosureLatestCAPEventPreservesInWindowStateChange$'),
+          ]
+          for name,rel,old,new,test in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+              try:
+                  p=work/rel; text=p.read_text()
+                  if text.count(old)!=1: raise RuntimeError(f'{name} anchor count={text.count(old)}')
+                  p.write_text(text.replace(old,new,1))
+                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath/audit'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  print(run.stdout)
+                  expected=test[1:-1]
+                  ran=failed=False
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
+                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran or not failed: raise RuntimeError(f'{name}: target test did not fail correctly {test}')
+                  print('KILLED',name,'BY',test)
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 15 V3 REPAIR/OFFLINE-CLOSURE MUTANTS KILLED')
+          PY
+
+      - name: Existing repeated-booster-disconnect regression x20
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -count=20 -timeout=10m -tags "$BUILD_TAGS" \
+            -run '^TestFlowRegressionRepeatedBoosterDisconnect$' ./protocol/multipath \
+            2>&1 | tee "${EVIDENCE_DIR}/repeated-booster-disconnect-x20.log"
+
+      - name: Mutation controls for rejected B and upstream guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os, shutil, subprocess
+          root=Path(os.environ['GITHUB_WORKSPACE'])
+          candidate=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+          temp=Path(os.environ['MUTANT_ROOT'])
+          tags=os.environ['BUILD_TAGS']
+          mutations=[
+            ('06-observer-memory-side-effect','protocol/multipath/download_audit.go',
+             'm, _ := downloadMemory(a.memory)',
+             'a.memory.snapshot(); m, _ := downloadMemory(a.memory)',
+             '^TestDownloadObserverCannotAdvanceMemoryControl$','native'),
+            ('05-staged-tail-retention','protocol/multipath/stream/records.go',
+             'if *charged > 0 && live+spare <= len(fixed) {',
+             'if false && *charged > 0 && live+spare <= len(fixed) {',
+             '^TestIndependentRetentionContractStagedACK$','native'),
+            ('01-accumulate-released-credit','protocol/multipath/memory.go',
+             '\t\tb.used -= int64(size)\n\t\tif b.used < 0 {',
+             '\t\t// MUTANT: released backing remains charged.\n\t\tif b.used < 0 {',
+             '^TestRepairIndependentRepeatedRoundCredit$','independent'),
+            ('02-runtime-guard-no-restore','protocol/multipath/memory_runtime.go',
+             '\t\tdebug.SetMemoryLimit(g.previous)\n',
+             '\t\t// MUTANT: leak process runtime memory limit.\n',
+             '^TestRuntimeMemoryGuardOwnership$','native'),
+            ('03-ignore-gomemlimit','protocol/multipath/memory_runtime.go',
+             '\t\tif explicit || current != math.MaxInt64 {\n',
+             '\t\tif (explicit && false) || current != math.MaxInt64 {\n',
+             '^TestRuntimeMemoryGuardOwnership$','native'),
+            ('04-break-cgroup-parent-walk','protocol/multipath/memory_available_linux.go',
+             '\t\t\t\tif dir == mount {\n',
+             '\t\t\t\tif true {\n',
+             '^TestCgroupAvailableMemory$','native'),
+          ]
+          for name,rel,old,new,test,kind in mutations:
+              work=temp/name
+              subprocess.check_call(['git','worktree','add','--detach',str(work),candidate],cwd=root,stdout=subprocess.DEVNULL)
+              try:
+                  p=work/rel; s=p.read_text()
+                  if s.count(old)!=1: raise RuntimeError(f'{name} anchor count={s.count(old)}')
+                  p.write_text(s.replace(old,new,1))
+                  if kind=='independent':
+                      src=Path(os.environ['INDEPENDENT_DIR'])/'protocol/multipath/zz_memory_repair_independent_test.go'
+                      shutil.copyfile(src,work/'protocol/multipath/zz_memory_repair_independent_test.go')
+                  compile=subprocess.run(['go','test','-count=1','-timeout=10m','-tags',tags,'-run','^$','./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  if compile.returncode!=0: raise RuntimeError(f'{name}: invalid mutant compile failed\n{compile.stdout}')
+                  run=subprocess.run(['go','test','-json','-count=1','-timeout=10m','-tags',tags,'-run',test,'./protocol/multipath'],cwd=work,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  print(run.stdout)
+                  expected_test=test[1:-1]
+                  ran=failed=False
+                  import json
+                  for line in run.stdout.splitlines():
+                      try: event=json.loads(line)
+                      except json.JSONDecodeError: continue
+                      if event.get('Test') != expected_test: continue
+                      if event.get('Action') == 'run': ran=True
+                      elif event.get('Action') == 'fail': failed=True
+                  if run.returncode==0: raise RuntimeError(f'{name}: mutant survived {test}')
+                  if not ran: raise RuntimeError(f'{name}: invalid result; target test did not run {test}')
+                  if not failed: raise RuntimeError(f'{name}: invalid result; nonzero exit without target test failure {test}')
+                  print('KILLED',name,'BY',test)
+              finally:
+                  subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          print('ALL 6 REPAIR MUTANTS KILLED')
+          PY
+
+      - name: Server download producer and independent rejection contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/download-boundary.log"
+          CGO_ENABLED=1 go test -race -count=10 -timeout=5m -tags "$BUILD_TAGS" \
+            -run '^(TestDownload|TestServerDownload)' ./protocol/multipath/... \
+            2>&1 | tee "${EVIDENCE_DIR}/download-contracts.log"
+          export DOWNLOAD_AUDIT_EVIDENCE_DIR="${EVIDENCE_DIR}/download-collector"
+          export DOWNLOAD_AUDIT_OFFLINE_BIN="${RUNNER_TEMP}/multipath-download-audit"
+          go test -count=1 -timeout=60s -tags "$BUILD_TAGS" -run '^TestDownloadProducerToOffline$' ./protocol/multipath
+          go build -trimpath -o "$DOWNLOAD_AUDIT_OFFLINE_BIN" ./cmd/multipath-download-audit
+          python3 -B tools/test-download-collector.py 2>&1 | tee "${EVIDENCE_DIR}/download-collector-local.log"
+          # Real runtime producer + mocked systemd pipe is LOCAL integration.
+          # It MUST NOT be labelled target-VPS FIELD acceptance.
+
+      - name: Check formatting of exact repair write-set
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            cmd/multipath-download-audit/main.go
+            option/multipath.go
+            protocol/multipath/audit/server_download.go
+            protocol/multipath/audit/server_download_bundle.go
+            protocol/multipath/audit/server_download_test.go
+            protocol/multipath/core.go
+            protocol/multipath/download_audit.go
+            protocol/multipath/download_audit_test.go
+            protocol/multipath/downloadevidence/schema.go
+            protocol/multipath/f01_staged_ack_test.go
+            protocol/multipath/inbound.go
+            protocol/multipath/scheduler.go
+            protocol/multipath/transport.go
+            protocol/multipath/types.go
+
+            protocol/multipath/budget_stream.go protocol/multipath/capacity.go protocol/multipath/core.go
+            protocol/multipath/inbound.go protocol/multipath/memory.go protocol/multipath/memory_available_linux.go
+            protocol/multipath/outbound.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go
+            protocol/multipath/stream/send.go protocol/multipath/transport.go protocol/multipath/types.go
+            protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go
+            protocol/multipath/f01_staged_ack_test.go protocol/multipath/memory_available_linux_test.go
+            protocol/multipath/memory_runtime.go protocol/multipath/memory_runtime_test.go
+            protocol/multipath/stream/records.go protocol/multipath/stream/records_test.go
+            protocol/multipath/audit/analyzer.go protocol/multipath/audit/audit_test.go
+            protocol/multipath/audit/coverage.go protocol/multipath/audit/event.go
+            protocol/multipath/audit/event_type.go protocol/multipath/audit/parser.go protocol/multipath/audit/schema.go
+            protocol/multipath/audit/aggregation.go protocol/multipath/audit/aggregation_v3_test.go
+            protocol/multipath/audit/diagnosis.go protocol/multipath/audit/field_replay.go protocol/multipath/audit/field_replay_test.go
+            protocol/multipath/audit/status.go protocol/multipath/audit/status_v3_test.go
+            protocol/multipath/audit/timeline.go protocol/multipath/audit/timeline_v3_test.go protocol/multipath/audit/v3_test_helpers_test.go
+          )
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
+
+      - name: Go vet impacted packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet -tags "$BUILD_TAGS" ./protocol/multipath/...
+
+      - name: Compile all repository packages without running tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -count=1 -timeout=20m -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./...
+
+      - name: Full impacted multipath regression with race detector once
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -count=1 -timeout=20m -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/multipath-full-race.log"
+
+      - name: Golden vs repaired zero-field performance differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
+          mkdir -p "$LOG_DIR"
+          run_perf() {
+            local tree="$1"
+            local label="$2"
+            local run_id="$3"
+            local log="$LOG_DIR/${label}-${run_id}.log"
+            set +e
+            (
+              cd "$tree"
+              CGO_ENABLED=1 go test \
+                -race \
+                -count=1 \
+                -timeout=5m \
+                -v \
+                -tags "$BUILD_TAGS" \
+                -run '^TestPerformanceHealthyLinks$' \
+                ./protocol/multipath
+            ) 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            echo "${label}_run_${run_id}_go_test_rc=${rc}"
+          }
+          run_perf "$PARENT_DIR" golden 1
+          run_perf "$GITHUB_WORKSPACE" repaired 1
+          run_perf "$PARENT_DIR" golden 2
+          run_perf "$GITHUB_WORKSPACE" repaired 2
+          python3 - "$LOG_DIR" <<'PY'
+          from pathlib import Path
+          import re, statistics, sys
+          d=Path(sys.argv[1])
+          expected=['1_160+600Mbps_65+110ms','8_160+600Mbps_65+110ms','32_160+600Mbps_65+110ms',
+                    '1_40+50Mbps_65+110ms','8_40+50Mbps_65+110ms','1_160+600Mbps_65+400ms',
+                    '8_160+600Mbps_65+400ms','1_160+600Mbps_110+65ms','1_160+600Mbps_5+10ms',
+                    '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms']
+          run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
+          rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
+          forbidden=(
+              'healthy reliable legs triggered replay','unused window credit caused memory pressure',
+              'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
+          )
+          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
+          def parse(p):
+              text=p.read_text(encoding='utf-8',errors='replace')
+              for x in forbidden:
+                  if x in text: raise SystemExit(f'FAIL {p.name}: unsafe fixture result: {x}')
+              cur=None; values={}
+              for line in text.splitlines():
+                  d=diagnostic_re.search(line)
+                  if d:
+                      msg=d.group(1)
+                      if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
+                          raise SystemExit(f'FAIL {p.name}: unexpected performance diagnostic: {msg}')
+                  m=run_re.search(line)
+                  if m: cur=m.group(1); continue
+                  m=rate_re.search(line)
+                  if m and cur: values[cur]=float(m.group(1))
+              missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
+              if missing or extra: raise SystemExit(f'FAIL {p.name}: missing={missing} extra={extra}')
+              return values
+          samples={k:[parse(d/f'{k}-1.log'),parse(d/f'{k}-2.log')] for k in ('golden','repaired')}
+          failed=False
+          for case in expected:
+              gv=[x[case] for x in samples['golden']]; rv=[x[case] for x in samples['repaired']]
+              ratio=statistics.median(rv)/statistics.median(gv)
+              print(f'{case}: golden={gv} repaired={rv} ratio={ratio:.4f}')
+              failed |= ratio < 0.98
+          if failed: raise SystemExit('FAIL repaired zero-field performance below 98% Golden')
+          print('PASS repaired retains >=98% Golden performance for all fixtures')
+          PY
+
+      - name: Remove runner-only V3 FIELD replay fixtures
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf protocol/multipath/audit/testdata
+
+      - name: Verify workspace remained pristine
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: memory-repair-audit-evidence
+          path: ${{ runner.temp }}/memory-repair-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup audit worktrees
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git worktree remove --force "${GOLDEN_DIR:-}" >/dev/null 2>&1 || true
+          git worktree remove --force "${INDEPENDENT_DIR:-}" >/dev/null 2>&1 || true
+          git worktree prune || true
+
+  build_targets:
+    name: Build ${{ matrix.label }}
+    needs: audit_test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Intel amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-darwin-amd64
+          - label: Windows amd64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-windows-amd64.exe
+          - label: Linux amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            binary: sing-box-1.14.0-multipath-beta6-linux-amd64
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout exact audited commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.audit_test.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup exact Go toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify exact audited source and native runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.audit_test.outputs.candidate_sha }}"
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          test "$(go env GOHOSTARCH)" = "amd64"
+          test "$(go env GOHOSTOS)" = "${{ matrix.goos }}"
+          echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+          echo "go=$(go version)"
+          echo "audited_commit=$(git rev-parse HEAD)"
+
+      - name: Set build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TAGS="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(tr -d '\r\n' < release/LDFLAGS)"
+          test -n "$BUILD_TAGS"
+          echo "BUILD_TAGS=$BUILD_TAGS" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$LDFLAGS_SHARED" >> "$GITHUB_ENV"
+
+      - name: Native impacted multipath regression Linux/macOS
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=20m -skip '^TestPerformanceHealthyLinks$' \
+            -tags "$BUILD_TAGS" ./protocol/multipath/...
+
+      - name: Native impacted multipath regression Windows
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=20m -skip '^(TestPerformanceHealthyLinks|TestCoreSenderStatusAndRTTProbe)$' \
+            -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" ./protocol/multipath/...
+
+      - name: Build standalone core
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -v -trimpath -tags "$BUILD_TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o "dist/${{ matrix.binary }}" ./cmd/sing-box
+
+      - name: Smoke-test built binary and embedded version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="dist/${{ matrix.binary }}"
+          if [[ "${{ matrix.goos }}" != "windows" ]]; then chmod +x "$BIN"; fi
+          test -s "$BIN"
+          ACTUAL_VERSION="$("./$BIN" version -n | tr -d '\r\n')"
+          test "$ACTUAL_VERSION" = "$VERSION"
+          VERSION_OUTPUT="$("./$BIN" version)"
+          printf '%s\n' "$VERSION_OUTPUT"
+          grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$VERSION_OUTPUT"
+          grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
+
+      - name: Build server download offline tool and collector
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          OFFLINE="dist/multipath-download-audit-${GOOS}-${GOARCH}"
+          if [[ "$GOOS" == "windows" ]]; then OFFLINE="${OFFLINE}.exe"; fi
+          go build -trimpath -ldflags '-s -w -buildid=' -o "$OFFLINE" ./cmd/multipath-download-audit
+          "$OFFLINE" -h
+          cp tools/collect-multipath-download.py dist/
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$OFFLINE" dist/collect-multipath-download.py > dist/download-tools.sha256
+          else
+            sha256sum "$OFFLINE" dist/collect-multipath-download.py > dist/download-tools.sha256
+          fi
+
+      - name: Produce checksum and build provenance
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          BIN="dist/${{ matrix.binary }}"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then shasum -a 256 "$BIN" > "${BIN}.sha256"; else sha256sum "$BIN" > "${BIN}.sha256"; fi
+          {
+            echo "version=${VERSION}"
+            echo "source_ref=${SOURCE_REF}"
+            echo "commit=${{ needs.audit_test.outputs.candidate_sha }}"
+            echo "golden_commit=${{ needs.audit_test.outputs.parent_sha }}"
+            echo "golden_tree=${FROZEN_GOLDEN_TREE}"
+            echo "b9_upstream_commit=${B9_UPSTREAM_COMMIT}"
+            echo "go_version=$(go env GOVERSION)"
+            echo "target=${{ matrix.goos }}/${{ matrix.goarch }}"
+            echo "cgo=0"
+            echo "build_tags=${BUILD_TAGS}"
+            echo "binary=${{ matrix.binary }}"
+          } > "${BIN}.buildinfo.txt"
+          cat "${BIN}.sha256"
+          cat "${BIN}.buildinfo.txt"
+
+      - name: Upload verified binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/${{ matrix.binary }}.sha256
+            dist/${{ matrix.binary }}.buildinfo.txt
+            dist/multipath-download-audit-*
+            dist/collect-multipath-download.py
+            dist/download-tools.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
