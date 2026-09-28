@@ -80,19 +80,19 @@ jobs:
           expected={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
-            'protocol/multipath/inbound.go':'1173018cd6735f7e0b6e728450108a0c8f1139e276da7404d3c9a53bf08bb5a1',
+            'protocol/multipath/core.go':'6c01d7804020ef099317c88bdeece572c23cf74712f9d9aac8c313effdd6884d',
+            'protocol/multipath/inbound.go':'e9cb8056dce6b6a48718c5862e8f4d2a52b76200ecdf7aa5d39be78eba3b01a9',
             'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
             'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
             'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
-            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
+            'protocol/multipath/scheduler.go':'f90e1fee0196dee2d20cb829832f2739846a6292394252008fe64a7cdb31ac16',
             'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
             'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
-            'protocol/multipath/transport.go':'141a760282dca81dbe516a2d8054ca0ec0bb05a00d6a6d4bed774336b2c10b57',
-            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c',
+            'protocol/multipath/transport.go':'6f950ab8b6df2c3fd988d6ff2423bb10ab5a8baed3c87d4d2b6aa28127d6aa8c',
+            'protocol/multipath/types.go':'61c2ec25359a21f269f3e0fcfb14f247d1d66dc92fab5bd397ae488e61408255',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
-            'protocol/multipath/f01_staged_ack_test.go':'775af226cdf2dd06f637504d2e846df8344e8291ee9e101a37b9ae8375038547',
+            'protocol/multipath/f01_staged_ack_test.go':'6afeef726bad4179002866cebaf0556f4e6a30775de20f31b288d75ec22b9b5d',
             'protocol/multipath/memory_available_linux_test.go':'6e6f444997734b18f85a4f76302b7ece7b46c983ac90b7e2e251f4230659d291',
             'protocol/multipath/memory_runtime.go':'70a2a22f367b9f70ed22bc466aa48b8724eafd4853d62d3ecdfa8ce3693297dd',
             'protocol/multipath/memory_runtime_test.go':'e021dc2188f9c00242091608c54392d58bc97bb5c5131a99492959b1604dfb22',
@@ -117,6 +117,18 @@ jobs:
             'protocol/multipath/audit/timeline.go':'10705a37d05989c3ab727f6c8614e300a42866713c99cd8b01b0db6776f91049',
             'protocol/multipath/audit/timeline_v3_test.go':'27ab05035e1fde95bc0900d850890724ee42e9e9d4d01c9bfb7eb3d0c3e7556d',
             'protocol/multipath/audit/v3_test_helpers_test.go':'c21e170281b9ed254c5398f26468de5db0fdca2cd57511a0e67ff71b443f4390',
+            'option/multipath.go':'769b02deee965dc443cabdb35de9b9fc3f93e1506330ad11a7c4ef918fa98d65',
+            'cmd/multipath-download-audit/main.go':'f5f7c39f3627b3a0029739cae02a6c0345226420519c0112c0cf1d509f59af4d',
+            'protocol/multipath/audit/server_download.go':'60384ea2ab120224ffc0d51b6d4c83c6dd514489043ae6253bf9d1db7161b7e1',
+            'protocol/multipath/audit/server_download_bundle.go':'3cd2168a8787ae2150a310a3045c8f3e966e7b1704db28146c5df34aaac83b56',
+            'protocol/multipath/audit/server_download_test.go':'b89eacabaaa1a523f7161ea949a4400d93129826d4dfa47b4d5d8a2ce24655b0',
+            'protocol/multipath/download_audit.go':'b18c89f6a53117ab46863115d5aa7a9faf94bc7f14062eddf4cae5e2a2d473e2',
+            'protocol/multipath/download_audit_test.go':'5202fceb4096c5bfe5c35ba40238b78859566bfdec4ff75f5218356eb655f0c3',
+            'protocol/multipath/downloadevidence/schema.go':'3dbc1fcbef06a11afa8bc0d2e21723558936c7d76356477311255c492be0b852',
+            'tools/collect-multipath-download.py':'3221c6bbfa0771a33652f9ce835a0412adcd04392e518fb5451325111caa4f72',
+            'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
+            'tools/test-download-collector.py':'a775e172b30f29becbf555af8c697fc0b4bcdb9eea1c97f0955df3878a6d51b2',
+            'tools/verify-download-boundary.py':'957c742b1592941ed5254e808f81ce9aa79715dce5567cb322b49b9699866ae7',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -163,11 +175,24 @@ jobs:
           ROOT=Path(os.environ['GITHUB_WORKSPACE'])
           GOLDEN=Path(os.environ['GOLDEN_DIR'])
           MOD={
+            'option/multipath.go',
             'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
             'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
             'protocol/multipath/outbound.go','protocol/multipath/scheduler.go','protocol/multipath/stream/path.go',
             'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go'}
           ADD={
+            'cmd/multipath-download-audit/main.go',
+            'protocol/multipath/audit/server_download.go',
+            'protocol/multipath/audit/server_download_bundle.go',
+            'protocol/multipath/audit/server_download_test.go',
+            'protocol/multipath/download_audit.go',
+            'protocol/multipath/download_audit_test.go',
+            'protocol/multipath/downloadevidence/schema.go',
+            'tools/collect-multipath-download.py',
+            'tools/download-observation.patch',
+            'tools/test-download-collector.py',
+            'tools/verify-download-boundary.py',
+
             'protocol/multipath/f01_memory_test.go','protocol/multipath/f01_retention_contract_test.go',
             'protocol/multipath/f01_staged_ack_test.go','protocol/multipath/memory_available_linux_test.go',
             'protocol/multipath/memory_runtime.go','protocol/multipath/memory_runtime_test.go',
@@ -199,7 +224,10 @@ jobs:
                      'prepareRelease','NewManagedBuffer','debug.FreeOSMemory')
           def req(v,m):
               if not v: raise RuntimeError(m)
-          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          import runpy
+          normalized=runpy.run_path(str(ROOT/'tools/verify-download-boundary.py'))['normalized_sources'](ROOT)
+          def source(rel): return normalized[rel] if rel in normalized else (ROOT/rel).read_bytes()
+          def sha(p): return hashlib.sha256(source(str(p.relative_to(ROOT)))).hexdigest()
           def tracked(root):
               raw=subprocess.check_output(['git','-C',str(root),'ls-files','-s','-z'])
               out={}
@@ -230,19 +258,19 @@ jobs:
           gt,rt=tracked(GOLDEN),tracked(ROOT)
           mod={p for p in gt.keys()&rt.keys() if gt[p]!=rt[p]}; add=set(rt)-set(gt); dele=set(gt)-set(rt)
           req(mod==MOD and add==ADD and not dele,f'write-set M={sorted(mod)} A={sorted(add)} D={sorted(dele)}')
-          print('PASS exact Golden delta 12M/27A/0D including modes/gitlinks')
+          print(f'PASS exact Golden delta {len(MOD)}M/{len(ADD)}A/0D including modes/gitlinks')
           for rel,(mode,oid) in gt.items():
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
           print('PASS complete-tree freeze outside authorized paths')
           for rel,want in F01.items(): req(sha(ROOT/rel)==want,'F01 byte drift '+rel)
-          print('PASS exact work-area F01/A bytes retained')
+          print('PASS F01/A identity after reversing approved download observation patch')
           for rel in ('protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/activation.go',
                       'protocol/multipath/telemetry.go','option/multipath.go','go.mod','go.sum',
                       'protocol/multipath/flow_fault_test.go','protocol/multipath/memory_test.go',
                       'protocol/multipath/recovery_packet.go','protocol/multipath/stream/receive.go',
                       'protocol/multipath/stream/stream_test.go'):
-              req((ROOT/rel).read_bytes()==(GOLDEN/rel).read_bytes(),'critical Golden drift '+rel)
+              req(source(rel)==(GOLDEN/rel).read_bytes(),'critical Golden drift '+rel)
           print('PASS frozen critical files and restored B-touched files exact Golden')
           prod='\n'.join(p.read_text(errors='replace') for p in (ROOT/'protocol/multipath').rglob('*.go') if not p.name.endswith('_test.go'))
           for token in FORBIDDEN: req(token not in prod,'rejected B token remains '+token)
@@ -255,14 +283,17 @@ jobs:
           req((ROOT/'protocol/multipath/outbound.go').read_text().count('o.cfg.Memory.stopLogging()')==1,'outbound close guard release')
           print('PASS B9 runtime/cgroup guard integration bounded to logging lifecycle')
           for rel,line in (('protocol/multipath/inbound.go','\ti.cfg.Memory.stopLogging()\n'),('protocol/multipath/outbound.go','\to.cfg.Memory.stopLogging()\n')):
-              current=(ROOT/rel).read_text()
+              current=source(rel).decode()
               req(current.count(line)==1,'compatibility hook count '+rel)
               req(current.replace(line,'').encode()==(GOLDEN/rel).read_bytes(),'non-hook drift '+rel)
           print('PASS inbound/outbound compatibility delta is exactly one upstream stopLogging hook each')
           for rel,name in (('protocol/multipath/scheduler.go','choosePathLocked'),('protocol/multipath/scheduler.go','pumpLoop'),
                            ('protocol/multipath/memory.go','boosterAllowed'),('protocol/multipath/memory.go','updatePressureLocked')):
-              req(function((ROOT/rel).read_text(),name)==function((GOLDEN/rel).read_text(),name),'frozen function drift '+rel+':'+name)
-          print('PASS Frozen scheduler/pressure function bodies unchanged')
+              req(function(source(rel).decode(),name)==function((GOLDEN/rel).read_text(),name),'frozen function drift '+rel+':'+name)
+          print('PASS normalized Frozen scheduler/pressure bodies; actual observed choice tested independently')
+          oracle=(ROOT/'protocol/multipath/download_audit_test.go').read_text()
+          req(function(oracle,'frozenDownloadChoiceLocked').replace('frozenDownloadChoiceLocked','choosePathLocked',1)==function(source('protocol/multipath/scheduler.go').decode(),'choosePathLocked'),'independent choice oracle drift')
+          req(function(oracle,'frozenDownloadSubmitChoiceLocked').replace('frozenDownloadSubmitChoiceLocked','choosePathForSubmitLocked',1).replace('frozenDownloadChoiceLocked','choosePathLocked')==function(source('protocol/multipath/scheduler.go').decode(),'choosePathForSubmitLocked'),'independent Capacity oracle drift')
           req('processMemoryGuard' not in (ROOT/'protocol/multipath/scheduler.go').read_text(),'runtime guard leaked into scheduler')
           req('processMemoryGuard' not in (ROOT/'protocol/multipath/core.go').read_text(),'runtime guard leaked into core allocation')
           print('PASS runtime guard does not alter MP admission/scheduler semantics')
@@ -330,7 +361,7 @@ jobs:
           for test_name in ('TestBuildTimelineRejectsMixedNodeTags','TestLocalPreferredAssignmentDoesNotSatisfyServerDownloadEvidence','TestDisjointEvidenceCannotCloseDegradationLayer','TestDiagnosticClosureRejectsUnboundAlgorithmAB','TestDiagnosticClosureMustNotPassWithBlocking','TestIntegratedDiagnosticClosureSimulation','TestOfflineClosureStatusParserPreservesFrozenProducerFields','TestOfflineClosureTimelinePreservesBothDirectionsAndSnapshots','TestOfflineClosureExplicitInstanceBindingPreservesExactCAPState','TestOfflineClosureStatusCaptureDeduplicatesAndRejectsIdentityMutation','TestOfflineClosureReplayRejectsNonOverlappingCAPEvidence','TestOfflineClosureReportSerializesForensicEvidence','TestOfflineClosureParseStatusRejectsMissingFrozenRequiredField','TestOfflineClosureCaptureStatusFileWritesInitialSnapshot','TestOfflineClosureLatestCAPEventPreservesInWindowStateChange','TestCAPStatisticalIntervalDoesNotFillUncoveredClientTail','TestOfflineClosureCAPIntervalRequiresConsecutiveSequence','TestOfflineClosureCAPIntervalDoesNotBridgeTimeRollback','TestOfflineClosureRebindingClearsPreviousInstanceEvidence','TestOfflineClosureCAPIntervalUsesDurationWeightedOverlap','TestOfflineClosureCaptureToReplayUsesProvableCAPInterval'):
               req(test_name in tests_v3,'V3 repair regression missing '+test_name)
           req('diagnostic closure failed' in replay_v3,'FIELD diagnostic closure gate missing')
-          print('PASS V3 extends the existing audit package only; V2 bytes and frozen runtime remain untouched')
+          print('PASS legacy V2/V3 consumer identities; server download runtime hooks are separately authorized and verified')
           print('ARCHITECTURE_AUDIT=PASS')
           PY
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
@@ -637,6 +668,14 @@ jobs:
           temp=Path(os.environ['MUTANT_ROOT'])
           tags=os.environ['BUILD_TAGS']
           mutations=[
+            ('06-observer-memory-side-effect','protocol/multipath/download_audit.go',
+             'm, _ := downloadMemory(a.memory)',
+             'a.memory.snapshot(); m, _ := downloadMemory(a.memory)',
+             '^TestDownloadObserverCannotAdvanceMemoryControl$','native'),
+            ('05-staged-tail-retention','protocol/multipath/stream/records.go',
+             'if *charged > 0 && live+spare <= len(fixed) {',
+             'if false && *charged > 0 && live+spare <= len(fixed) {',
+             '^TestIndependentRetentionContractStagedACK$','native'),
             ('01-accumulate-released-credit','protocol/multipath/memory.go',
              '\t\tb.used -= int64(size)\n\t\tif b.used < 0 {',
              '\t\t// MUTANT: released backing remains charged.\n\t\tif b.used < 0 {',
@@ -683,14 +722,45 @@ jobs:
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 4 REPAIR MUTANTS KILLED')
+          print('ALL 6 REPAIR MUTANTS KILLED')
           PY
+
+      - name: Server download producer and independent rejection contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/download-boundary.log"
+          CGO_ENABLED=1 go test -race -count=10 -timeout=5m -tags "$BUILD_TAGS" \
+            -run '^(TestDownload|TestServerDownload)' ./protocol/multipath/... \
+            2>&1 | tee "${EVIDENCE_DIR}/download-contracts.log"
+          export DOWNLOAD_AUDIT_EVIDENCE_DIR="${EVIDENCE_DIR}/download-collector"
+          export DOWNLOAD_AUDIT_OFFLINE_BIN="${RUNNER_TEMP}/multipath-download-audit"
+          go test -count=1 -timeout=60s -tags "$BUILD_TAGS" -run '^TestDownloadProducerToOffline$' ./protocol/multipath
+          go build -trimpath -o "$DOWNLOAD_AUDIT_OFFLINE_BIN" ./cmd/multipath-download-audit
+          python3 -B tools/test-download-collector.py 2>&1 | tee "${EVIDENCE_DIR}/download-collector-local.log"
+          # Real runtime producer + mocked systemd pipe is LOCAL integration.
+          # It MUST NOT be labelled target-VPS FIELD acceptance.
 
       - name: Check formatting of exact repair write-set
         shell: bash
         run: |
           set -euo pipefail
           files=(
+            cmd/multipath-download-audit/main.go
+            option/multipath.go
+            protocol/multipath/audit/server_download.go
+            protocol/multipath/audit/server_download_bundle.go
+            protocol/multipath/audit/server_download_test.go
+            protocol/multipath/core.go
+            protocol/multipath/download_audit.go
+            protocol/multipath/download_audit_test.go
+            protocol/multipath/downloadevidence/schema.go
+            protocol/multipath/f01_staged_ack_test.go
+            protocol/multipath/inbound.go
+            protocol/multipath/scheduler.go
+            protocol/multipath/transport.go
+            protocol/multipath/types.go
+
             protocol/multipath/budget_stream.go protocol/multipath/capacity.go protocol/multipath/core.go
             protocol/multipath/inbound.go protocol/multipath/memory.go protocol/multipath/memory_available_linux.go
             protocol/multipath/outbound.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go
@@ -945,6 +1015,25 @@ jobs:
           grep -F "Environment: go${GO_VERSION} ${{ matrix.goos }}/${{ matrix.goarch }}" <<< "$VERSION_OUTPUT"
           grep -F 'CGO: disabled' <<< "$VERSION_OUTPUT"
 
+      - name: Build server download offline tool and collector
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          OFFLINE="dist/multipath-download-audit-${GOOS}-${GOARCH}"
+          if [[ "$GOOS" == "windows" ]]; then OFFLINE="${OFFLINE}.exe"; fi
+          go build -trimpath -ldflags '-s -w -buildid=' -o "$OFFLINE" ./cmd/multipath-download-audit
+          "$OFFLINE" -h
+          cp tools/collect-multipath-download.py dist/
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$OFFLINE" dist/collect-multipath-download.py > dist/download-tools.sha256
+          else
+            sha256sum "$OFFLINE" dist/collect-multipath-download.py > dist/download-tools.sha256
+          fi
+
       - name: Produce checksum and build provenance
         shell: bash
         env:
@@ -977,6 +1066,9 @@ jobs:
             dist/${{ matrix.binary }}
             dist/${{ matrix.binary }}.sha256
             dist/${{ matrix.binary }}.buildinfo.txt
+            dist/multipath-download-audit-*
+            dist/collect-multipath-download.py
+            dist/download-tools.sha256
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
