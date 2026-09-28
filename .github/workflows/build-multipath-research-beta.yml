@@ -1,4 +1,4 @@
-name: Build Multipath Capacity Server Audit V3
+name: Build Multipath Research Beta
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       source_ref:
         description: Repaired source branch/tag/commit to audit and build
         required: true
-        default: feature/multipath-capacity-v2-beta6
+        default: feature/multipath-research-beta
         type: string
 
 permissions:
