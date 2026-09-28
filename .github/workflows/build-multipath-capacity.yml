@@ -127,7 +127,7 @@ jobs:
             'protocol/multipath/downloadevidence/schema.go':'3dbc1fcbef06a11afa8bc0d2e21723558936c7d76356477311255c492be0b852',
             'tools/collect-multipath-download.py':'d8ddba126dcc7f708dc28aa12dd3cd20de54c64725d7acc0939554d9b6cf5dfe',
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
-            'tools/test-download-collector.py':'a775e172b30f29becbf555af8c697fc0b4bcdb9eea1c97f0955df3878a6d51b2',
+            'tools/test-download-collector.py':'d915f11c3a157e1ad3bf01dde8382f9f47081271d4f6e55fa25614a35d276301',
             'tools/verify-download-boundary.py':'957c742b1592941ed5254e808f81ce9aa79715dce5567cb322b49b9699866ae7',
           }
           for rel,want in expected.items():
