@@ -125,7 +125,7 @@ jobs:
             'protocol/multipath/download_audit.go':'b18c89f6a53117ab46863115d5aa7a9faf94bc7f14062eddf4cae5e2a2d473e2',
             'protocol/multipath/download_audit_test.go':'5202fceb4096c5bfe5c35ba40238b78859566bfdec4ff75f5218356eb655f0c3',
             'protocol/multipath/downloadevidence/schema.go':'3dbc1fcbef06a11afa8bc0d2e21723558936c7d76356477311255c492be0b852',
-            'tools/collect-multipath-download.py':'3221c6bbfa0771a33652f9ce835a0412adcd04392e518fb5451325111caa4f72',
+            'tools/collect-multipath-download.py':'d8ddba126dcc7f708dc28aa12dd3cd20de54c64725d7acc0939554d9b6cf5dfe',
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'a775e172b30f29becbf555af8c697fc0b4bcdb9eea1c97f0955df3878a6d51b2',
             'tools/verify-download-boundary.py':'957c742b1592941ed5254e808f81ce9aa79715dce5567cb322b49b9699866ae7',
