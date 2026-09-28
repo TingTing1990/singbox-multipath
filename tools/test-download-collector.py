@@ -26,7 +26,7 @@ IDENTITY = dict(pid=123, invocation='invocation', process_start='100', binary_pa
 
 
 class PipeJournal:
-    def __init__(self, lines):
+    def __init__(self, lines, byte_array_messages=False):
         r, w = os.pipe()
         self.stdout = os.fdopen(r, 'rb', buffering=0)
         self.returncode = None
@@ -34,7 +34,8 @@ class PipeJournal:
             try:
                 with os.fdopen(w, 'wb') as f:
                     for i, message in enumerate(lines):
-                        f.write(json.dumps(dict(MESSAGE=message, __CURSOR='cursor-%d' % i,
+                        journal_message = list(message.encode('utf-8')) if byte_array_messages else message
+                        f.write(json.dumps(dict(MESSAGE=journal_message, __CURSOR='cursor-%d' % i,
                                                 _SYSTEMD_INVOCATION_ID='invocation', _BOOT_ID='boot')).encode() + b'\n')
                     f.flush()
             except BrokenPipeError:
@@ -53,10 +54,10 @@ class PipeJournal:
 
 
 class CollectorTests(unittest.TestCase):
-    def collect(self, root, identity_change=False):
+    def collect(self, root, identity_change=False, byte_array_messages=False):
         lines = FIXTURE.read_text().splitlines()
         handlers = {}
-        process = PipeJournal(lines)
+        process = PipeJournal(lines, byte_array_messages=byte_array_messages)
         def printed(*args, **kwargs):
             if args and str(args[0]).startswith('READY:'):
                 handlers[signal.SIGINT]()
@@ -85,6 +86,18 @@ class CollectorTests(unittest.TestCase):
                 (root / 'manifest.json').write_text(json.dumps(altered))
                 result = subprocess.run(command, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, field)
+
+            byte_root = Path(d) / 'capture-byte-message'
+            self.assertEqual(self.collect(byte_root, byte_array_messages=True), 0)
+            normalized = [json.loads(line) for line in (byte_root / 'server-runtime.jsonl').read_text().splitlines()]
+            self.assertTrue(normalized)
+            self.assertTrue(all(isinstance(entry.get('MESSAGE'), str) for entry in normalized))
+            byte_command = [OFFLINE, '-journal', str(byte_root / 'server-runtime.jsonl'), '-manifest', str(byte_root / 'manifest.json'), '-instance', 'mp-in']
+            byte_run = subprocess.run(byte_command, capture_output=True, text=True)
+            self.assertEqual(byte_run.returncode, 0, byte_run.stderr)
+            byte_report = json.loads(byte_run.stdout)
+            self.assertTrue(byte_report['Complete'])
+            self.assertEqual(sum(w['Delta']['ConfirmedLogical'] for w in byte_report['Windows']), 32768)
 
     @unittest.skipUnless(os.name == 'posix', 'terminal process groups require POSIX')
     def test_terminal_ctrl_c_preserves_closing_window(self):
