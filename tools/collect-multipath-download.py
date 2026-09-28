@@ -89,11 +89,18 @@ def main():
                     while b'\n' in pending:
                         line, pending = pending.split(b'\n', 1)
                         entry = json.loads(line)
+                        message = entry.get('MESSAGE', '')
+                        if isinstance(message, list):
+                            try:
+                                message = bytes(message).decode('utf-8')
+                            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                                raise RuntimeError('journal MESSAGE byte array is not valid UTF-8') from exc
+                            entry['MESSAGE'] = message
+                            line = json.dumps(entry, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
                         output.write(line + b'\n')
                         if output.tell() > a.max_bytes:
                             raise RuntimeError('capture size limit reached')
                         manifest['end_cursor'] = entry['__CURSOR']
-                        message = entry.get('MESSAGE', '')
                         if not isinstance(message, str) or 'MP_DOWNLOAD_AUDIT ' not in message:
                             continue
                         event = json.loads(message.split('MP_DOWNLOAD_AUDIT ', 1)[1])
