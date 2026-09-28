@@ -34,6 +34,7 @@ type ServerDownloadWindow struct {
 	AssignedNormalMbps, AssignedRepairMbps [2]float64
 	WrittenMbps, ConfirmedPathMbps         [2]float64
 	UsefulConfirmedMbps                    float64
+	TotalsComplete, TraceComplete          bool
 	Memory                                 D.Memory
 	Config                                 D.Config
 }
@@ -77,12 +78,23 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 	var lastNS int64
 	var last *D.Snapshot
 	var lastSnapshotNS int64
+	var lastSnapshotDropped uint64
+	var lastDropped uint64
+	var intervalMaxDropped uint64
+	var intervalSequenceIssues []string
+	var intervalDroppedRollback bool
 	var checked D.Totals
 	var selectedEpoch string
 	issue := func(s string) {
-		if len(report.Issues) < 64 {
-			report.Issues = append(report.Issues, s)
-		}
+		report.Issues = append(report.Issues, s)
+	}
+	resetIntervalEvidence := func(snapshotDropped uint64) {
+		lastSnapshotDropped = snapshotDropped
+		lastDropped = snapshotDropped
+		intervalMaxDropped = snapshotDropped
+		intervalSequenceIssues = nil
+		intervalDroppedRollback = false
+		checked = D.Totals{}
 	}
 	for scanner.Scan() {
 		raw := scanner.Text()
@@ -133,20 +145,25 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 			issue("multiple epochs: select one explicitly")
 			continue
 		}
-		if lastSeq != 0 && e.Seq != lastSeq+1 {
-			issue("event sequence gap, duplicate or reset")
+		if last != nil {
+			if lastSeq != 0 && e.Seq != lastSeq+1 {
+				if e.Seq > lastSeq+1 {
+					intervalSequenceIssues = append(intervalSequenceIssues, fmt.Sprintf("prev=%d next=%d missing=%d", lastSeq, e.Seq, e.Seq-lastSeq-1))
+				} else {
+					intervalSequenceIssues = append(intervalSequenceIssues, fmt.Sprintf("prev=%d next=%d duplicate_or_reset", lastSeq, e.Seq))
+				}
+			}
+			if e.Dropped < lastDropped {
+				intervalDroppedRollback = true
+			} else if e.Dropped > intervalMaxDropped {
+				intervalMaxDropped = e.Dropped
+			}
+			lastDropped = e.Dropped
 		}
 		if lastSeq != 0 && e.MonoNS < lastNS {
 			issue("monotonic timestamp rollback")
 		}
-		if e.Dropped != 0 {
-			issue("runtime observation dropped events")
-		}
 		lastSeq, lastNS = e.Seq, e.MonoNS
-		if len(report.Events) >= 250000 {
-			issue("offline event limit exceeded; split capture")
-			break
-		}
 		report.Events = append(report.Events, e)
 		switch e.Kind {
 		case "START", "WINDOW", "STOP":
@@ -168,11 +185,28 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 					last = nil
 					continue
 				}
+				totalsComplete := true
 				if s.Config != last.Config {
 					issue("effective configuration changed within epoch")
+					totalsComplete = false
+				}
+				traceComplete := true
+				if len(intervalSequenceIssues) != 0 {
+					for _, detail := range intervalSequenceIssues {
+						issue(fmt.Sprintf("event sequence gap within window %d-%d: %s", lastSnapshotNS, e.MonoNS, detail))
+					}
+					traceComplete = false
+				}
+				if intervalDroppedRollback {
+					issue(fmt.Sprintf("runtime observation dropped counter rollback within window %d-%d", lastSnapshotNS, e.MonoNS))
+					traceComplete = false
+				} else if intervalMaxDropped > lastSnapshotDropped {
+					issue(fmt.Sprintf("runtime observation dropped events within window %d-%d: delta=%d baseline=%d end=%d", lastSnapshotNS, e.MonoNS, intervalMaxDropped-lastSnapshotDropped, lastSnapshotDropped, intervalMaxDropped))
+					traceComplete = false
 				}
 				if delta != checked {
-					issue("window totals disagree with observed runtime events")
+					issue(fmt.Sprintf("window totals disagree with observed runtime events within window %d-%d", lastSnapshotNS, e.MonoNS))
+					traceComplete = false
 				}
 				if e.MonoNS < lastSnapshotNS {
 					issue("invalid cumulative window")
@@ -188,11 +222,11 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 					copy := s
 					last = &copy
 					lastSnapshotNS = e.MonoNS
-					checked = D.Totals{}
+					resetIntervalEvidence(e.Dropped)
 					continue
 				}
 				seconds := float64(e.MonoNS-lastSnapshotNS) / 1e9
-				w := ServerDownloadWindow{StartNS: lastSnapshotNS, EndNS: e.MonoNS, Delta: delta, Config: s.Config, Memory: s.Memory}
+				w := ServerDownloadWindow{StartNS: lastSnapshotNS, EndNS: e.MonoNS, Delta: delta, Config: s.Config, Memory: s.Memory, TotalsComplete: totalsComplete, TraceComplete: traceComplete}
 				rate := func(n uint64) float64 { return float64(n) * 8 / seconds / 1e6 }
 				for i := 0; i < 2; i++ {
 					w.AssignedNormalMbps[i] = rate(delta.AssignedNormal[i])
@@ -210,7 +244,7 @@ func AnalyzeServerDownload(reader io.Reader, instance, epoch string) (ServerDown
 			copy := s
 			last = &copy
 			lastSnapshotNS = e.MonoNS
-			checked = D.Totals{}
+			resetIntervalEvidence(e.Dropped)
 		case "DECISION", "WAIT":
 			var d D.Decision
 			if err := decodeDownloadPayload(e.Data, &d); err != nil {

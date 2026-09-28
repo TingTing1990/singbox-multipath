@@ -48,6 +48,58 @@ func TestServerDownloadIndependentCountersAndFaults(t *testing.T) {
 	if w.UsefulConfirmedMbps != 0.0001 || w.WrittenMbps != [2]float64{0.00012, 0.00004} || w.Delta.AssignedRepair[1] != 10 {
 		t.Fatalf("counter meaning changed: %+v", w)
 	}
+	if !w.TotalsComplete || !w.TraceComplete {
+		t.Fatalf("complete window classified incomplete: %+v", w)
+	}
+	historical := make([]string, len(good))
+	for i, line := range good {
+		historical[i] = strings.Replace(line, `"dropped":0`, `"dropped":597`, 1)
+	}
+	historicalReport, historicalErr := AnalyzeServerDownload(strings.NewReader(strings.Join(historical, "\n")), "mp-in", "")
+	if historicalErr != nil || !historicalReport.Complete || len(historicalReport.Windows) != 1 || !historicalReport.Windows[0].TraceComplete {
+		t.Fatalf("historical dropped baseline polluted clean interval: report=%+v err=%v", historicalReport, historicalErr)
+	}
+	gapped := append([]string{}, good[:2]...)
+	gapped = append(gapped, good[3:]...)
+	gapReport, gapErr := AnalyzeServerDownload(strings.NewReader(strings.Join(gapped, "\n")), "mp-in", "")
+	if gapErr == nil || gapReport.Complete || len(gapReport.Windows) != 1 {
+		t.Fatalf("gapped trace not rejected with aggregate window retained: report=%+v err=%v", gapReport, gapErr)
+	}
+	if !gapReport.Windows[0].TotalsComplete || gapReport.Windows[0].TraceComplete || gapReport.Windows[0].Delta.AssignedRepair[1] != 10 {
+		t.Fatalf("aggregate/trace completeness not separated: %+v", gapReport.Windows[0])
+	}
+	// Privacy-safe compact replay of the first real FIELD loss shape:
+	// dropped 597 -> 703 and seq 36333 -> 36440, i.e. 106 missing records.
+	fieldShape := []struct {
+		seq     uint64
+		dropped uint64
+		kind    string
+		data    any
+	}{
+		{1, 597, "WINDOW", D.Snapshot{Memory: D.Memory{Limit: 1000}, Config: D.Config{ChunkSize: 100}}},
+		{2, 597, "WAIT", D.Decision{Outcome: "waiting", Reason: "field-shape"}},
+		{109, 703, "WAIT", D.Decision{Outcome: "waiting", Reason: "field-shape"}},
+		{110, 703, "WINDOW", D.Snapshot{Memory: D.Memory{Limit: 1000}, Config: D.Config{ChunkSize: 100}, Totals: D.Totals{Waits: 108}}},
+	}
+	fieldLines := make([]string, 0, len(fieldShape))
+	for i, item := range fieldShape {
+		h := D.Header{Schema: 1, Epoch: "field", Instance: "mp-in", Side: "server", Direction: "download", Seq: item.seq, Dropped: item.dropped, At: time.Unix(2000, int64(i)), MonoNS: int64(i) * int64(time.Second), Kind: item.kind, Session: "session"}
+		encoded, encodeErr := D.Encode(h, item.data)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		fieldLines = append(fieldLines, D.Marker+string(encoded))
+	}
+	fieldReport, fieldErr := AnalyzeServerDownload(strings.NewReader(strings.Join(fieldLines, "\n")), "mp-in", "field")
+	if fieldErr == nil || fieldReport.Complete || len(fieldReport.Windows) != 1 || fieldReport.Windows[0].TraceComplete || !fieldReport.Windows[0].TotalsComplete {
+		t.Fatalf("FIELD-derived loss shape misclassified: report=%+v err=%v", fieldReport, fieldErr)
+	}
+	joinedIssues := strings.Join(fieldReport.Issues, "\n")
+	for _, want := range []string{"missing=106", "delta=106 baseline=597 end=703", "window totals disagree"} {
+		if !strings.Contains(joinedIssues, want) {
+			t.Fatalf("FIELD-derived issue detail missing %q: %v", want, fieldReport.Issues)
+		}
+	}
 	for _, mode := range []string{"gap", "duplicate", "epoch", "drop", "counter", "direction", "rollback", "empty", "truncated", "missing_payload", "missing_drop", "short_paths"} {
 		t.Run(mode, func(t *testing.T) {
 			lines := append([]string{}, good...)
