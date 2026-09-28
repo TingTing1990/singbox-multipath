@@ -1,0 +1,470 @@
+--- a/option/multipath.go
++++ b/option/multipath.go
+@@ -40,6 +40,7 @@
+ }
+ 
+ type MultipathInboundOptions struct {
++	DownloadAudit bool `json:"download_audit,omitempty"`
+ 	ListenOptions
+ 	PreferredCapacityMbps       uint32                   `json:"preferred_capacity_mbps,omitempty"`
+ 	AggregationEnabled          *bool                    `json:"aggregation_enabled,omitempty"`
+--- a/protocol/multipath/core.go
++++ b/protocol/multipath/core.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net"
+ 	"time"
+@@ -70,6 +71,11 @@
+ 	c.txReserve <- budget.takeReservedBuffer(cfg.ChunkSize)
+ 	app.onClose = c.closeApplication
+ 	app.onCloseRead = func() error { c.localReadClosed.Store(true); return app.readConn.Close() }
++	if cfg.DownloadAudit != nil {
++		r := c.downloadRecord("SESSION_OPEN")
++		r.session.Config = downloadConfig(cfg)
++		cfg.DownloadAudit.record(r)
++	}
+ 	c.startWorkers(c.txLoop, c.rxLoop, c.pumpLoop, c.activationLoop)
+ 	return c, app, nil
+ }
+@@ -108,6 +114,11 @@
+ func (c *mpCore) releaseAfterShutdown(legs []*mpLeg, err error) {
+ 	closeLegsAfterDrain(legs, err)
+ 	c.workerGroup.Wait()
++	if c.cfg.DownloadAudit != nil {
++		r := c.downloadRecord("SESSION_CLOSE")
++		r.session.Reason = err.Error()
++		c.cfg.DownloadAudit.record(r)
++	}
+ 	c.stateMu.Lock()
+ 	for _, leg := range legs {
+ 		leg.path.Close()
+@@ -181,6 +192,11 @@
+ 		return nil, errCoreClosed
+ 	}
+ 	c.legCounters[id].joins.Add(1)
++	if c.cfg.DownloadAudit != nil {
++		r := c.downloadRecord("PATH_ATTACHED")
++		r.session.Reason = fmt.Sprintf("leg=%d generation=%d", id, leg.path.Generation)
++		c.cfg.DownloadAudit.record(r)
++	}
+ 	c.legsMu.Unlock()
+ 	c.stateMu.Unlock()
+ 	wakeFlow(c.pumpWake)
+--- a/protocol/multipath/inbound.go
++++ b/protocol/multipath/inbound.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"encoding/hex"
+ 	"errors"
+ 	"io"
+ 	"net"
+@@ -147,6 +148,13 @@
+ 			Memory:                         memory,
+ 		},
+ 	}
++	if options.DownloadAudit {
++		var err error
++		i.cfg.DownloadAudit, err = newDownloadAudit(tag, i.cfg, func(line string) { i.logger.InfoContext(i.ctx, line) })
++		if err != nil {
++			return nil, E.Cause(err, "create download audit identity")
++		}
++	}
+ 	i.listener = listener.New(listener.Options{
+ 		Context:           ctx,
+ 		Logger:            logger,
+@@ -162,7 +170,9 @@
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+ 	}
++	i.cfg.DownloadAudit.start()
+ 	if err := i.listener.Start(); err != nil {
++		i.cfg.DownloadAudit.close()
+ 		return err
+ 	}
+ 	if controller := i.cfg.PreferredCapacity; controller != nil {
+@@ -203,6 +213,14 @@
+ 	i.access.Unlock()
+ 	for _, session := range sessions {
+ 		session.core.Close()
++	}
++	if audit := i.cfg.DownloadAudit; audit != nil {
++		go func() {
++			for _, session := range sessions {
++				<-session.core.released
++			}
++			audit.close()
++		}()
+ 	}
+ 	return listenerErr
+ }
+@@ -297,6 +315,9 @@
+ 	}
+ 	cfg.ChunkSize = int(hello.ChunkSize)
+ 	cfg.QueueBytes = int64(cfg.ChunkSize) * int64(cfg.QueueFrames)
++	if cfg.DownloadAudit != nil {
++		cfg.DownloadSession = hex.EncodeToString(hello.Session[:])
++	}
+ 	cfg.CapacityAuditSessionID = statusSessionID(hello.Session)
+ 	cfg.CapacityAuditDestination = destination.String()
+ 	cfg.OnProtocolError = func(err error) {
+@@ -307,6 +328,14 @@
+ 		cfg.SendStatus = true
+ 	}
+ 	cfg.OnLeg1Active = func(info activationInfo, reconnect bool) {
++		if cfg.DownloadAudit != nil {
++			r := downloadRecord{}
++			r.header.Kind = "ACTIVATION"
++			r.header.Session = cfg.DownloadSession
++			r.header.Destination = cfg.CapacityAuditDestination
++			r.session.Reason = activationInfoString(info)
++			cfg.DownloadAudit.record(r)
++		}
+ 		i.logger.InfoContext(
+ 			ctx,
+ 			"multipath leg1 joined data path: side=server destination=", destination,
+@@ -373,6 +402,11 @@
+ 	metadata.Inbound = i.Tag()
+ 	metadata.InboundType = i.Type()
+ 	metadata.Destination = destination
++	if cfg.DownloadAudit != nil {
++		r := core.downloadRecord("SESSION_ESTABLISHED")
++		r.session.Reason = "handshake_complete"
++		cfg.DownloadAudit.record(r)
++	}
+ 	i.logger.InfoContext(ctx, "multipath session established to ", destination, " on leg ", hello.LegID)
+ 	logicalOnClose := N.OnceClose(func(closeErr error) {
+ 		// The router can report a target dial/early-write failure before it
+--- a/protocol/multipath/scheduler.go
++++ b/protocol/multipath/scheduler.go
+@@ -5,6 +5,7 @@
+ 	"math"
+ 	"time"
+ 
++	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
+ 	"github.com/sagernet/sing-box/protocol/multipath/stream"
+ )
+ 
+@@ -75,14 +76,36 @@
+ 			}
+ 			segment, ok := c.tx.NextRange(c.cfg.ChunkSize)
+ 			if !ok {
++				if c.tx.Next < c.tx.WriteNext {
++					c.auditWait("connection_window")
++				} else {
++					c.auditWait("no_pending_data")
++				}
+ 				break
+ 			}
+ 			selection := c.choosePathForSubmitLocked(segment.Length, now)
+ 			if selection.leg == nil {
++				if c.cfg.DownloadAudit != nil {
++					r := c.downloadRecord("WAIT")
++					r.decision = *selection.trace
++					r.decision.Reason = "no_eligible_path"
++					r.decision.Outcome = "waiting"
++					c.cfg.DownloadAudit.record(r)
++				}
+ 				break
+ 			}
+ 			pumpErr = c.submitLocked(selection.leg, segment, false, now)
+ 			selection.finish(pumpErr)
++			if c.cfg.DownloadAudit != nil {
++				r := c.downloadRecord("DECISION")
++				r.decision = *selection.trace
++				r.decision.LogicalSeq = segment.Seq
++				r.decision.Outcome = "submitted"
++				if pumpErr != nil {
++					r.decision.Outcome = "failed"
++				}
++				c.cfg.DownloadAudit.record(r)
++			}
+ 			if pumpErr != nil {
+ 				break
+ 			}
+@@ -142,14 +165,27 @@
+ func (c *mpCore) handleWindow(message flowMessage) error {
+ 	c.stateMu.Lock()
+ 	defer c.stateMu.Unlock()
++	beforeACK := min(c.tx.Una, c.tx.WriteNext)
+ 	if err := c.tx.Acknowledge(message.Next, message.Limit); err != nil {
+ 		return err
++	}
++	if c.cfg.DownloadAudit != nil {
++		r := c.downloadRecord("FEEDBACK")
++		r.feedback.LogicalBytes = min(c.tx.Una, c.tx.WriteNext) - beforeACK
++		c.cfg.DownloadAudit.record(r)
+ 	}
+ 	c.peerPressure = message.Flags&flowFlagPressure != 0
+ 	now := time.Now()
+ 	for _, leg := range c.availableLegs() {
++		beforeReceipt := leg.path.Received
+ 		if err := leg.path.Feedback(message.Paths[leg.id], now); err != nil {
+ 			return err
++		}
++		if c.cfg.DownloadAudit != nil && leg.path.Received > beforeReceipt {
++			r := c.downloadRecord("FEEDBACK")
++			r.feedback.PathBytes[leg.id] = leg.path.Received - beforeReceipt
++			r.feedback.Generation[leg.id] = leg.path.Generation
++			c.cfg.DownloadAudit.record(r)
+ 		}
+ 		if leg.id == 0 && c.cfg.PreferredCapacity != nil {
+ 			if delivered := leg.confirmPreferredCapacityDelivery(leg.path.Received); delivered > 0 {
+@@ -172,7 +208,9 @@
+ 	return nil
+ }
+ 
+-func (c *mpCore) choosePathLocked(length int) *mpLeg {
++func (c *mpCore) choosePathLocked(length int) *mpLeg { return c.choosePathObservedLocked(length, nil) }
++
++func (c *mpCore) choosePathObservedLocked(length int, trace *D.Decision) *mpLeg {
+ 	legs := c.availableLegs()
+ 	provisionalRate := float64(0)
+ 	for _, leg := range legs {
+@@ -181,17 +219,32 @@
+ 	var chosen *mpLeg
+ 	score := math.Inf(1)
+ 	for _, leg := range legs {
++		if trace != nil {
++			trace.Paths[leg.id].Evaluated = true
++		}
+ 		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "recovery"
++			}
+ 			continue
+ 		}
+ 		if leg.path.Stale || leg.busy {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "stale_or_busy"
++			}
+ 			continue
+ 		}
+ 		emergency := c.cfg.Recovery != nil && c.controlLeg() == leg && leg.id == 1
+ 		if (!c.active.Load() && leg.id == 0) || emergency {
++			if trace != nil {
++				trace.Reason = "preferred_only_or_recovery"
++			}
+ 			return leg
+ 		}
+ 		if leg.id == 1 && (!c.active.Load() || !leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "activation_ready_peer_or_memory"
++			}
+ 			continue
+ 		}
+ 		// Startup sampling is bounded. Thereafter the connection-level byte
+@@ -199,9 +252,16 @@
+ 		initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
+ 		pipeline := leg.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
+ 		if leg.path.Outstanding()+uint64(length) > pipeline {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "pipeline_full"
++			}
+ 			continue
+ 		}
+ 		next := leg.path.DrainTime(provisionalRate)
++		if trace != nil {
++			trace.Paths[leg.id].DrainSeconds = next
++			trace.Reason = "minimum_drain_time"
++		}
+ 		if next < score {
+ 			chosen, score = leg, next
+ 		}
+@@ -212,6 +272,7 @@
+ type pathSelection struct {
+ 	leg         *mpLeg
+ 	reservation *preferredCapacityReservation
++	trace       *D.Decision
+ }
+ 
+ func (s pathSelection) finish(err error) {
+@@ -231,8 +292,26 @@
+ // preferred rate (never merely caps/targets the configured threshold). It never
+ // waits solely to repay preferred credit: if preferred is busy/full/unavailable,
+ // the original candidate remains usable so booster can carry excess demand.
+-func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) pathSelection {
+-	chosen := c.choosePathLocked(length)
++func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pathSelection) {
++	var trace *D.Decision
++	var observation *D.Decision
++	if c.cfg.DownloadAudit != nil {
++		snapshot := c.downloadDecision(length)
++		trace = &snapshot
++		observation = trace
++	}
++	chosen := c.choosePathObservedLocked(length, observation)
++	if observation != nil {
++		if chosen != nil {
++			trace.Candidate = int(chosen.id)
++		}
++		defer func() {
++			if result.leg != nil {
++				trace.Selected = int(result.leg.id)
++			}
++			result.trace = trace
++		}()
++	}
+ 	controller := c.cfg.PreferredCapacity
+ 	if controller == nil || chosen == nil {
+ 		return pathSelection{leg: chosen}
+@@ -270,6 +349,9 @@
+ 
+ 	force, reservation := controller.reserveAssignment(now, length, false, true)
+ 	if force {
++		if observation != nil {
++			trace.Reason = "capacity_preferred_override"
++		}
+ 		return pathSelection{leg: preferred, reservation: reservation}
+ 	}
+ 	return pathSelection{leg: chosen}
+@@ -380,7 +462,31 @@
+ 		if !ok {
+ 			continue
+ 		}
+-		if err := c.submitLocked(target, segment, true, now); err != nil {
++		var repairRecord downloadRecord
++		if c.cfg.DownloadAudit != nil {
++			repairRecord = c.downloadRecord("DECISION")
++			repairRecord.decision = c.downloadDecision(segment.Length)
++			repairRecord.decision.LogicalSeq = segment.Seq
++			repairRecord.decision.Selected = int(target.id)
++			repairRecord.decision.Candidate = int(target.id)
++			repairRecord.decision.Repair = true
++			repairRecord.decision.Reason = "repair_pruned"
++			if stale {
++				repairRecord.decision.Reason = "repair_stale"
++			}
++			if lost {
++				repairRecord.decision.Reason = "repair_lost"
++			}
++		}
++		err := c.submitLocked(target, segment, true, now)
++		if c.cfg.DownloadAudit != nil {
++			repairRecord.decision.Outcome = "submitted"
++			if err != nil {
++				repairRecord.decision.Outcome = "failed"
++			}
++			c.cfg.DownloadAudit.record(repairRecord)
++		}
++		if err != nil {
+ 			return false, err
+ 		}
+ 		mapping.path, mapping.generation = target.id, target.path.Generation
+--- a/protocol/multipath/transport.go
++++ b/protocol/multipath/transport.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"math"
+ 	"time"
+@@ -98,6 +99,19 @@
+ 			frame.buffer.Release()
+ 			leg.busy = false
+ 			c.stateMu.Unlock()
++			if c.cfg.DownloadAudit != nil {
++				r := c.downloadRecord("WRITE")
++				r.transfer.Leg = int(leg.id)
++				r.transfer.Generation = frame.generation
++				r.transfer.LogicalSeq = frame.seq
++				r.transfer.Repair = frame.replay
++				r.transfer.Outcome = "failed"
++				if err == nil {
++					r.transfer.Bytes = uint64(length)
++					r.transfer.Outcome = "written"
++				}
++				c.cfg.DownloadAudit.record(r)
++			}
+ 			if err != nil {
+ 				c.legFailed(leg, legFailureWriteData, err)
+ 				return
+@@ -244,6 +258,11 @@
+ 	delete(c.legs, leg.id)
+ 	c.retiring[leg.id] = leg
+ 	c.legsMu.Unlock()
++	if c.cfg.DownloadAudit != nil {
++		r := c.downloadRecord("PATH_FAILED")
++		r.session.Reason = fmt.Sprintf("leg=%d generation=%d stage=%s error=%v", leg.id, leg.path.Generation, stage, err)
++		c.cfg.DownloadAudit.record(r)
++	}
+ 	c.stateMu.Lock()
+ 	leg.path.Close()
+ 	leg.closePreferredCapacityRanges()
+--- a/protocol/multipath/types.go
++++ b/protocol/multipath/types.go
+@@ -11,6 +11,8 @@
+ )
+ 
+ type coreConfig struct {
++	DownloadAudit                  *downloadAudit
++	DownloadSession                string
+ 	Recovery                       *recoveryPolicy
+ 	PreferredCapacity              *preferredCapacityController
+ 	AggregationEnabled             bool
+@@ -182,31 +184,33 @@
+ }
+ 
+ type mpCore struct {
+-	finPath      *mpLeg // stateMu; retransmit FIN after a control path change
+-	peerPressure bool   // stateMu; suppress speculative secondary assignments
+-	cfg          coreConfig
+-	ctx          context.Context
+-	cancel       context.CancelFunc
+-	appConn      *logicalConn
+-	txPipe       net.Conn
+-	rxPipe       net.Conn
+-	legsMu       sync.RWMutex
+-	legs         map[uint8]*mpLeg
+-	reserved     map[uint8]bool
+-	retiring     map[uint8]*mpLeg
+-	done         chan struct{}
+-	released     chan struct{}
+-	closeOne     sync.Once
+-	txSeq        atomic.Uint64
+-	ingressBytes atomic.Uint64
+-	egressBytes  atomic.Uint64
+-	legCounters  [2]mpLegCounters
+-	active       atomic.Bool
+-	activeCh     chan struct{}
+-	activateOnce sync.Once
+-	activationMu sync.Mutex
+-	activation   activationInfo
+-	activationAt time.Time
++	downloadWaitReason string    // stateMu
++	downloadWaitAt     time.Time // stateMu
++	finPath            *mpLeg    // stateMu; retransmit FIN after a control path change
++	peerPressure       bool      // stateMu; suppress speculative secondary assignments
++	cfg                coreConfig
++	ctx                context.Context
++	cancel             context.CancelFunc
++	appConn            *logicalConn
++	txPipe             net.Conn
++	rxPipe             net.Conn
++	legsMu             sync.RWMutex
++	legs               map[uint8]*mpLeg
++	reserved           map[uint8]bool
++	retiring           map[uint8]*mpLeg
++	done               chan struct{}
++	released           chan struct{}
++	closeOne           sync.Once
++	txSeq              atomic.Uint64
++	ingressBytes       atomic.Uint64
++	egressBytes        atomic.Uint64
++	legCounters        [2]mpLegCounters
++	active             atomic.Bool
++	activeCh           chan struct{}
++	activateOnce       sync.Once
++	activationMu       sync.Mutex
++	activation         activationInfo
++	activationAt       time.Time
+ 	// activationLoop is the sole writer. These fields rate-limit server audit
+ 	// evidence to at most one blocked event per trigger/controller window.
+ 	capacityAuditBlockedSeen   [3]bool
