@@ -87,6 +87,15 @@ func readFlow(conn net.Conn) (flowMessage, error) {
 	return message, nil
 }
 
+// Byte-for-byte Beta10 DATA header encoder. Wire format remains unchanged.
+func putDataHeader(header []byte, frame wireFrame) {
+	header[0] = frame.typ
+	binary.BigEndian.PutUint64(header[1:9], frame.seq)
+	binary.BigEndian.PutUint64(header[9:17], frame.pathSeq)
+	binary.BigEndian.PutUint64(header[17:25], frame.generation)
+	binary.BigEndian.PutUint32(header[25:29], uint32(len(frame.data)))
+}
+
 func writeWireFrame(conn net.Conn, frame wireFrame) error {
 	if initial, ok := conn.(initialFrameWriter); ok {
 		if handled, err := initial.writeInitialFrame(frame); handled {
@@ -104,12 +113,16 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {
 			return errors.New("invalid multipath payload size")
 		}
+		if frame.buffer != nil {
+			if contiguous, ok := frame.buffer.TakeHeadroom(frame.data, dataFrameHeaderSize); ok {
+				putDataHeader(contiguous[:dataFrameHeaderSize], frame)
+				err := writeAll(conn, contiguous)
+				frame.buffer.ReturnHeadroom()
+				return err
+			}
+		}
 		var header [dataFrameHeaderSize]byte
-		header[0] = frame.typ
-		binary.BigEndian.PutUint64(header[1:9], frame.seq)
-		binary.BigEndian.PutUint64(header[9:17], frame.pathSeq)
-		binary.BigEndian.PutUint64(header[17:25], frame.generation)
-		binary.BigEndian.PutUint32(header[25:29], uint32(len(frame.data)))
+		putDataHeader(header[:], frame)
 		buffers := net.Buffers{header[:], frame.data}
 		_, err := buffers.WriteTo(conn)
 		return err

@@ -36,6 +36,7 @@ type coreConfig struct {
 	OnStatusEvent                  func()
 	OnProtocolError                func(error)
 	SendStatus                     bool
+	ServerDownload                 bool // research D2-A: only server inbound sets this
 }
 
 type legFailureStage string
@@ -240,44 +241,47 @@ type mpCore struct {
 	replayTO                   atomic.Uint64
 	backpressE                 atomic.Uint64
 	backpressNS                atomic.Uint64
-	legFailureMu               sync.Mutex
-	legFailures                [2]uint64
-	lastFailLeg                uint8
-	lastFailStage              legFailureStage
-	failureMu                  sync.Mutex
-	failure                    string
-	failureAt                  time.Time
-	memory                     *memoryBudget
-	sessionBytes               int64
-	txReserve                  chan []byte
-	peerStatusMu               sync.Mutex
-	peerStatus                 peerSenderStatus
-	statusMu                   sync.Mutex
-	statusSeq                  uint64
-	lastStatus                 senderStatus
-	lastStatusAt               time.Time
-	probeMu                    sync.Mutex
-	probeNext                  uint64
-	probePending               [2]pendingProbe
-	probeLast                  [2]time.Time
-	probeRTT                   [2]legRTTSnapshot
-	workerMu                   sync.Mutex
-	workerGroup                sync.WaitGroup
-	workerClosed               bool
-	stateMu                    sync.Mutex
-	tx                         *stream.Sender
-	rx                         *stream.Receiver
-	headPages                  int
-	nextGeneration             uint64
-	pumpWake                   chan struct{}
-	rxWake                     chan struct{}
-	txWake                     chan struct{}
-	startedAt                  time.Time
-	mappings                   []dataMapping
-	mappingHead                int
-	mappingBytes               int64
-	mappingReserve             [stream.RecordReserve]dataMapping
-	feedbackDirty              bool
+	// B10 writer-backlog hint fed by the existing Golden txLoop waitTXSpace.
+	writerWaiting    atomic.Bool
+	writerReleasedAt atomic.Int64
+	legFailureMu     sync.Mutex
+	legFailures      [2]uint64
+	lastFailLeg      uint8
+	lastFailStage    legFailureStage
+	failureMu        sync.Mutex
+	failure          string
+	failureAt        time.Time
+	memory           *memoryBudget
+	sessionBytes     int64
+	txReserve        chan []byte
+	peerStatusMu     sync.Mutex
+	peerStatus       peerSenderStatus
+	statusMu         sync.Mutex
+	statusSeq        uint64
+	lastStatus       senderStatus
+	lastStatusAt     time.Time
+	probeMu          sync.Mutex
+	probeNext        uint64
+	probePending     [2]pendingProbe
+	probeLast        [2]time.Time
+	probeRTT         [2]legRTTSnapshot
+	workerMu         sync.Mutex
+	workerGroup      sync.WaitGroup
+	workerClosed     bool
+	stateMu          sync.Mutex
+	tx               *stream.Sender
+	rx               *stream.Receiver
+	headPages        int
+	nextGeneration   uint64
+	pumpWake         chan struct{}
+	rxWake           chan struct{}
+	txWake           chan struct{}
+	startedAt        time.Time
+	mappings         []dataMapping
+	mappingHead      int
+	mappingBytes     int64
+	mappingReserve   [stream.RecordReserve]dataMapping
+	feedbackDirty    bool
 }
 
 type dataMapping struct {

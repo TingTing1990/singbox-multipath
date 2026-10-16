@@ -221,6 +221,11 @@ func (c *mpCore) addLegWithReadPreamble(id uint8, conn net.Conn, onClose func(er
 	return leg, err
 }
 
+// Upstream Beta10's 32-byte headroom fits within Golden's already charged
+// 512 extra bytes for normal and compact TX allocations. Reserved fallback
+// remains a Golden NewBuffer without headroom and retains its original charge.
+const s1TXHeadroom = 32
+
 func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 	for {
 		if c.isDone() {
@@ -230,6 +235,9 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		// cannot create an unbounded list of uncharged send records.
 		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
 		if buffer != nil {
+			if c.cfg.ServerDownload {
+				return stream.NewBufferWithHeadroom(buffer, s1TXHeadroom, c.cfg.ChunkSize, func() { c.memory.release(buffer) }), nil
+			}
 			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
 		}
 		select {
@@ -246,6 +254,10 @@ func (c *mpCore) waitTXSpace() bool {
 	var blocked time.Time
 	defer func() {
 		if !blocked.IsZero() {
+			if c.cfg.ServerDownload {
+				c.writerReleasedAt.Store(time.Now().UnixNano())
+				c.writerWaiting.Store(false)
+			}
 			c.backpressNS.Add(uint64(time.Since(blocked)))
 		}
 	}()
@@ -260,6 +272,9 @@ func (c *mpCore) waitTXSpace() bool {
 		if blocked.IsZero() {
 			blocked = time.Now()
 			c.backpressE.Add(1)
+			if c.cfg.ServerDownload {
+				c.writerWaiting.Store(true)
+			}
 		}
 		select {
 		case <-c.done:
@@ -286,9 +301,15 @@ func (c *mpCore) txLoop() {
 			}
 			compact, _ := c.memory.tryAcquirePrimary(size + 512)
 			if compact != nil {
-				copy(compact, buffer.Data[:n])
-				buffer.Release()
-				buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
+				if c.cfg.ServerDownload {
+					copy(compact[s1TXHeadroom:s1TXHeadroom+n], buffer.Data[:n])
+					buffer.Release()
+					buffer = stream.NewBufferWithHeadroom(compact, s1TXHeadroom, n, func() { c.memory.release(compact) })
+				} else {
+					copy(compact, buffer.Data[:n])
+					buffer.Release()
+					buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
+				}
 			}
 		}
 		c.stateMu.Lock()

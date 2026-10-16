@@ -88,7 +88,13 @@ func (c *mpCore) pumpLoop() {
 				if c.cfg.DownloadAudit != nil {
 					r := c.downloadRecord("WAIT")
 					r.decision = *selection.trace
-					r.decision.Reason = "no_eligible_path"
+					// Retain beta10 rejection identity in the existing journal;
+					// Golden WAIT events keep their original reason unchanged.
+					switch r.decision.Reason {
+					case "b10_blest_window_wait", "b10_rtt_skew_wait", "b10_tail_wait":
+					default:
+						r.decision.Reason = "no_eligible_path"
+					}
 					r.decision.Outcome = "waiting"
 					c.cfg.DownloadAudit.record(r)
 				}
@@ -300,7 +306,14 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pa
 		trace = &snapshot
 		observation = trace
 	}
-	chosen := c.choosePathObservedLocked(length, observation)
+	// Research-only server normal-DATA B10 selector; the Golden Capacity V2
+	// wrapper below is still the only reservation/commit/refund owner.
+	var chosen *mpLeg
+	if c.cfg.ServerDownload && c.active.Load() && (c.cfg.Recovery == nil || (c.cfg.Recovery.allows(0) && c.cfg.Recovery.allows(1))) {
+		chosen = c.chooseB10ECFLocked(length, now, observation)
+	} else {
+		chosen = c.choosePathObservedLocked(length, observation)
+	}
 	if observation != nil {
 		if chosen != nil {
 			trace.Candidate = int(chosen.id)

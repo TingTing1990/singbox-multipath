@@ -310,6 +310,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	}
 
 	cfg := i.cfg
+	cfg.ServerDownload = true // scoped to server TCP downloads; client upload unchanged
 	if group != nil {
 		cfg.Recovery = &group.policy
 	}
