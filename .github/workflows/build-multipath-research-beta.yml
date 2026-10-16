@@ -80,16 +80,16 @@ jobs:
           expected={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'6c01d7804020ef099317c88bdeece572c23cf74712f9d9aac8c313effdd6884d',
-            'protocol/multipath/inbound.go':'e9cb8056dce6b6a48718c5862e8f4d2a52b76200ecdf7aa5d39be78eba3b01a9',
+            'protocol/multipath/core.go':'2b55f59ccc64e9b7036164b75d72c7aebaf1dda1eb2f59e8ac2f6f94887410aa',
+            'protocol/multipath/inbound.go':'8d12ee25055bd1011e90ec2aa715f9dc245ee8c31bdb75f55e365470db499e02',
             'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
             'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
             'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
-            'protocol/multipath/scheduler.go':'f90e1fee0196dee2d20cb829832f2739846a6292394252008fe64a7cdb31ac16',
-            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
-            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/scheduler.go':'909b8dfb00bf0318ec4da95cfb9685da0c5d3d8fa43f2d78648e4dc5f910f533',
+            'protocol/multipath/stream/path.go':'5206cd82bb3202afe95624a1fa1beb4d4d28ebc38ce646b08dc71d0e315e7129',
+            'protocol/multipath/stream/send.go':'55319d5d10544446c5c9dde2fca689df87e8a69ccfb3568d6b3786ca4bca0f5b',
             'protocol/multipath/transport.go':'6f950ab8b6df2c3fd988d6ff2423bb10ab5a8baed3c87d4d2b6aa28127d6aa8c',
-            'protocol/multipath/types.go':'61c2ec25359a21f269f3e0fcfb14f247d1d66dc92fab5bd397ae488e61408255',
+            'protocol/multipath/types.go':'2a8ff47c153e0072f63a4caae7ba21ca3ab908e58d0671c32bdd735e73ed4aa5',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
             'protocol/multipath/f01_staged_ack_test.go':'6afeef726bad4179002866cebaf0556f4e6a30775de20f31b288d75ec22b9b5d',
@@ -128,7 +128,12 @@ jobs:
             'tools/collect-multipath-download.py':'4c1976f9819e614b91f56dfb445b76f998c806e4af7e0bd26c1c5ac1e5e97e98',
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
-            'tools/verify-download-boundary.py':'957c742b1592941ed5254e808f81ce9aa79715dce5567cb322b49b9699866ae7',
+            'protocol/multipath/wire.go':'83001bd9eee88537fcec3714338585123cc35622bd8c6497f96d695c566929f9',
+            'protocol/multipath/d2_ecf.go':'795377d61b163b9cba922d044229fc8456f987d06f4afb873b20d72851dcf810',
+            'protocol/multipath/d2_ecf_test.go':'5a8f2472c9f21f13a9a2807dc694de1a11242d2a41c052916094901e2cf00839',
+            'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
+            'tools/research-b10-s1-d2.patch':'7d6a07ead4bfe91aaa252522c3a6498a725715dbaa343c788c35a8545b4380f8',
+            'tools/verify-download-boundary.py':'bdb12886ef12535eca1c077366777c43578625b881e304db28b279852a2c0c80',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -179,7 +184,8 @@ jobs:
             'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
             'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
             'protocol/multipath/outbound.go','protocol/multipath/scheduler.go','protocol/multipath/stream/path.go',
-            'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go'}
+             'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go',
+             'protocol/multipath/wire.go'}
           ADD={
             'cmd/multipath-download-audit/main.go',
             'protocol/multipath/audit/server_download.go',
@@ -206,7 +212,10 @@ jobs:
             'protocol/multipath/audit/field_acquisition.go','protocol/multipath/audit/field_offline_closure_test.go',
             'protocol/multipath/audit/status.go','protocol/multipath/audit/status_v3_test.go',
             'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
-            'protocol/multipath/audit/v3_test_helpers_test.go'}
+             'protocol/multipath/audit/v3_test_helpers_test.go',
+             'protocol/multipath/d2_ecf.go','protocol/multipath/d2_ecf_test.go',
+             'protocol/multipath/stream/headroom_s1_test.go',
+             'tools/research-b10-s1-d2.patch'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
@@ -741,6 +750,15 @@ jobs:
           # Real runtime producer + mocked systemd pipe is LOCAL integration.
           # It MUST NOT be labelled target-VPS FIELD acceptance.
 
+      - name: Candidate reversible S1 and D2 integration contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/research-candidate-reversal.log"
+          CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" \
+            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestD2ECF)' \
+            ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/research-S1-D2-race-x10.log"
+
       - name: Check formatting of exact repair write-set
         shell: bash
         run: |
@@ -765,6 +783,8 @@ jobs:
             protocol/multipath/inbound.go protocol/multipath/memory.go protocol/multipath/memory_available_linux.go
             protocol/multipath/outbound.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go
             protocol/multipath/stream/send.go protocol/multipath/transport.go protocol/multipath/types.go
+            protocol/multipath/d2_ecf.go protocol/multipath/d2_ecf_test.go
+            protocol/multipath/stream/headroom_s1_test.go protocol/multipath/wire.go
             protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go
             protocol/multipath/f01_staged_ack_test.go protocol/multipath/memory_available_linux_test.go
             protocol/multipath/memory_runtime.go protocol/multipath/memory_runtime_test.go
