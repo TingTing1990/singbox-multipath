@@ -1,0 +1,688 @@
+diff --git a/protocol/multipath/core.go b/protocol/multipath/core.go
+index 711cfbd..0df4db0 100644
+--- a/protocol/multipath/core.go
++++ b/protocol/multipath/core.go
+@@ -221,6 +221,11 @@ func (c *mpCore) addLegWithReadPreamble(id uint8, conn net.Conn, onClose func(er
+ 	return leg, err
+ }
+ 
++// Upstream Beta10's 32-byte headroom fits within Golden's already charged
++// 512 extra bytes for normal and compact TX allocations. Reserved fallback
++// remains a Golden NewBuffer without headroom and retains its original charge.
++const s1TXHeadroom = 32
++
+ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
+ 	for {
+ 		if c.isDone() {
+@@ -230,6 +235,9 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
+ 		// cannot create an unbounded list of uncharged send records.
+ 		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
+ 		if buffer != nil {
++			if c.cfg.ServerDownload {
++				return stream.NewBufferWithHeadroom(buffer, s1TXHeadroom, c.cfg.ChunkSize, func() { c.memory.release(buffer) }), nil
++			}
+ 			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
+ 		}
+ 		select {
+@@ -246,6 +254,10 @@ func (c *mpCore) waitTXSpace() bool {
+ 	var blocked time.Time
+ 	defer func() {
+ 		if !blocked.IsZero() {
++			if c.cfg.ServerDownload {
++				c.writerReleasedAt.Store(time.Now().UnixNano())
++				c.writerWaiting.Store(false)
++			}
+ 			c.backpressNS.Add(uint64(time.Since(blocked)))
+ 		}
+ 	}()
+@@ -260,6 +272,9 @@ func (c *mpCore) waitTXSpace() bool {
+ 		if blocked.IsZero() {
+ 			blocked = time.Now()
+ 			c.backpressE.Add(1)
++			if c.cfg.ServerDownload {
++				c.writerWaiting.Store(true)
++			}
+ 		}
+ 		select {
+ 		case <-c.done:
+@@ -286,9 +301,15 @@ func (c *mpCore) txLoop() {
+ 			}
+ 			compact, _ := c.memory.tryAcquirePrimary(size + 512)
+ 			if compact != nil {
+-				copy(compact, buffer.Data[:n])
+-				buffer.Release()
+-				buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
++				if c.cfg.ServerDownload {
++					copy(compact[s1TXHeadroom:s1TXHeadroom+n], buffer.Data[:n])
++					buffer.Release()
++					buffer = stream.NewBufferWithHeadroom(compact, s1TXHeadroom, n, func() { c.memory.release(compact) })
++				} else {
++					copy(compact, buffer.Data[:n])
++					buffer.Release()
++					buffer = stream.NewBuffer(compact[:n], func() { c.memory.release(compact) })
++				}
+ 			}
+ 		}
+ 		c.stateMu.Lock()
+diff --git a/protocol/multipath/d2_ecf.go b/protocol/multipath/d2_ecf.go
+new file mode 100644
+index 0000000..4fab8f4
+--- /dev/null
++++ b/protocol/multipath/d2_ecf.go
+@@ -0,0 +1,137 @@
++package multipath
++
++import (
++	"math"
++	"time"
++
++	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
++)
++
++// B10's ECF/BLEST normal-DATA selector, scoped by the caller to active
++// server-download only. The B10 scheduling thresholds and best/chosen order
++// are preserved; original Golden eligibility (Recovery, memory, peer pressure,
++// Pipeline, leg readiness) continues to be enforced before any assignment.
++//
++// The Golden sender has an unshrinking WindowEnd and its writer waits in
++// txLoop/net.Pipe, rather than B10's direct application writer. The latter
++// is observed by waitTXSpace without changing the Golden send queue. These
++// differences require independent A/B and FIELD validation before promotion.
++const beta10MaxSkewRTTs = 8
++const beta10WriterBacklogHold = 10 * time.Millisecond
++
++func (c *mpCore) beta10ProvisionalLocked() (rate float64, delay time.Duration) {
++	for _, leg := range c.availableLegs() {
++		rate = max(rate, leg.path.Rate)
++		if leg.path.MinimumRTT > 0 {
++			delay = max(delay, leg.path.MinimumRTT)
++		} else {
++			delay = max(delay, leg.path.SRTT)
++		}
++	}
++	return
++}
++
++func (c *mpCore) beta10WriterBacklogged(now time.Time) bool {
++	return c.writerWaiting.Load() || now.UnixNano()-c.writerReleasedAt.Load() < int64(beta10WriterBacklogHold)
++}
++
++// selectPath: only one physical writer on each path; busy paths are included
++// in theoretical earliest completion but can NEVER be selected for submit.
++func (c *mpCore) chooseB10ECFLocked(length int, now time.Time, trace *D.Decision) *mpLeg {
++	legs := c.availableLegs()
++	provisionalRate, provisionalDelay := c.beta10ProvisionalLocked()
++	var chosen, best *mpLeg
++	chosenTime, bestTime := math.Inf(1), math.Inf(1)
++	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
++	for _, leg := range legs {
++		if trace != nil {
++			trace.Paths[leg.id].Evaluated = true
++		}
++		if c.cfg.Recovery != nil && !c.cfg.Recovery.allows(leg.id) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "recovery"
++			}
++			continue
++		}
++		if leg.path.Stale {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "stale"
++			}
++			continue
++		}
++		if leg.id == 1 && (!leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "activation_ready_peer_or_memory"
++			}
++			continue
++		}
++		completion := leg.path.CompletionTime(length, provisionalRate, provisionalDelay, now)
++		if completion < bestTime {
++			best, bestTime = leg, completion
++		}
++		if leg.busy {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "busy"
++			}
++			continue
++		}
++		if leg.path.Outstanding()+uint64(length) > leg.path.Pipeline(initial, uint64(c.cfg.ReplayBytes)) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "pipeline_full"
++			}
++			continue
++		}
++		if completion < chosenTime {
++			chosen, chosenTime = leg, completion
++		}
++	}
++	if chosen == nil || chosen == best || best == nil {
++		if trace != nil {
++			trace.Reason = "b10_earliest_completion"
++		}
++		return chosen
++	}
++	bestRate := best.path.Rate
++	if bestRate <= 0 {
++		bestRate = provisionalRate
++	}
++	// Original beta10 receiver-window BLEST check. Never underflow when
++	// Golden's window right edge equals/below Next (or uint64 is saturated).
++	futureNext := c.tx.Next + uint64(length)
++	if futureNext < c.tx.Next {
++		futureNext = math.MaxUint64
++	}
++	room := c.tx.WindowEnd - min(c.tx.WindowEnd, futureNext)
++	if bestRate*(chosenTime-bestTime) > float64(room) {
++		if trace != nil {
++			trace.Reason = "b10_blest_window_wait"
++		}
++		return nil
++	}
++	rtt := chosen.path.MinimumRTT
++	if rtt == 0 {
++		rtt = max(chosen.path.SRTT, provisionalDelay)
++	}
++	if chosenTime-bestTime > beta10MaxSkewRTTs*rtt.Seconds() {
++		if trace != nil {
++			trace.Reason = "b10_rtt_skew_wait"
++		}
++		return nil
++	}
++	pending := c.tx.WriteNext - min(c.tx.Next, c.tx.WriteNext)
++	limit := uint64(max(c.cfg.QueueBytes, int64(c.cfg.ChunkSize)))
++	backlogged := c.beta10WriterBacklogged(now) || pending+uint64(c.cfg.ChunkSize) > limit
++	if c.tx.HasFIN || !backlogged {
++		drain := bestTime + float64(pending-min(pending, uint64(length)))/max(bestRate, 1)
++		if chosenTime > drain+0.002 {
++			if trace != nil {
++				trace.Reason = "b10_tail_wait"
++			}
++			return nil
++		}
++	}
++	if trace != nil {
++		trace.Reason = "b10_healthy_parallel"
++	}
++	return chosen
++}
+diff --git a/protocol/multipath/d2_ecf_test.go b/protocol/multipath/d2_ecf_test.go
+new file mode 100644
+index 0000000..288168c
+--- /dev/null
++++ b/protocol/multipath/d2_ecf_test.go
+@@ -0,0 +1,95 @@
++package multipath
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/protocol/multipath/stream"
++)
++
++// Exercise the actual Golden Capacity submission wrapper, with only the
++// server-side research scope switched on. No stubbed path-selection function.
++func d2ECFTestCore() (*mpCore, *mpLeg, *mpLeg) {
++	c, p, b := capacitySchedulerCore(nil)
++	c.cfg.ServerDownload = true
++	c.tx = stream.NewSender(8 << 20)
++	c.writerWaiting.Store(true)
++	p.path.MinimumRTT = 20 * time.Millisecond
++	b.path.MinimumRTT = 100 * time.Millisecond
++	return c, p, b
++}
++
++func TestD2ECFWeakBusyPreferredReject(t *testing.T) {
++	c, p, b := d2ECFTestCore()
++	p.busy = true
++	p.path.Rate = 100_000_000
++	b.path.Rate = 100_000
++	p.path.Sent, b.path.Sent = 500_000, 0
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != nil {
++		t.Fatal("weak booster displaced faster temporarily busy preferred")
++	}
++}
++
++func TestD2ECFHealthyBoosterRemainsEligible(t *testing.T) {
++	c, p, b := d2ECFTestCore()
++	p.busy = true
++	p.path.Rate = 20_000_000 // 160 Mbps preferred
++	b.path.Rate = 75_000_000 // 600 Mbps booster
++	p.path.MinimumRTT = 65 * time.Millisecond
++	b.path.MinimumRTT = 110 * time.Millisecond
++	p.path.Sent = 1 << 20
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != b {
++		t.Fatal("healthy 160+600 booster starved")
++	}
++}
++
++func TestD2ECFLegacyUploadAndInactive(t *testing.T) {
++	c, p, b := d2ECFTestCore()
++	p.busy = true
++	p.path.Rate = 100_000_000
++	b.path.Rate = 100_000
++	c.cfg.ServerDownload = false
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != b {
++		t.Fatal("upload did not retain Golden choice")
++	}
++	c.cfg.ServerDownload = true
++	c.active.Store(false)
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != nil {
++		t.Fatal("inactive was allowed to use secondary")
++	}
++}
++
++func TestD2ECFBLESTWindowWait(t *testing.T) {
++	c, p, b := d2ECFTestCore()
++	p.busy = true
++	p.path.Rate = 100_000_000
++	b.path.Rate = 10_000_000
++	p.path.Sent = 4 << 20
++	// Enough outstanding to keep preferred theoretically best, even as its
++	// physical writer is busy; a minimal window must block slower new DATA.
++	c.tx.WindowEnd = uint64(c.cfg.ChunkSize)
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != nil {
++		t.Fatal("BLEST receiver-window rejection missing")
++	}
++}
++
++// A healthy server Recovery group is not a failover state; its explicit
++// two-path mask must retain normal beta10 aggregate selection. If a path is
++// disallowed, the Golden recovery semantics continue to own selection.
++func TestD2ECFHealthyRecoveryGroupUsesAggregateSelection(t *testing.T) {
++	c, preferred, booster := d2ECFTestCore()
++	policy := new(recoveryPolicy)
++	policy.mask.Store(3)
++	c.cfg.Recovery = policy
++	preferred.busy = true
++	preferred.path.Rate = 100_000_000
++	booster.path.Rate = 100_000
++	preferred.path.Sent = 500_000
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != nil {
++		t.Fatal("weak booster was assigned despite healthy two-path recovery group")
++	}
++	policy.mask.Store(2)
++	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != booster {
++		t.Fatal("single-path recovery must retain Golden emergency selection")
++	}
++}
+diff --git a/protocol/multipath/inbound.go b/protocol/multipath/inbound.go
+index 74a533d..c0efe4f 100644
+--- a/protocol/multipath/inbound.go
++++ b/protocol/multipath/inbound.go
+@@ -310,6 +310,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 	}
+ 
+ 	cfg := i.cfg
++	cfg.ServerDownload = true // scoped to server TCP downloads; client upload unchanged
+ 	if group != nil {
+ 		cfg.Recovery = &group.policy
+ 	}
+diff --git a/protocol/multipath/scheduler.go b/protocol/multipath/scheduler.go
+index 8480c19..bcf375c 100644
+--- a/protocol/multipath/scheduler.go
++++ b/protocol/multipath/scheduler.go
+@@ -88,7 +88,13 @@ func (c *mpCore) pumpLoop() {
+ 				if c.cfg.DownloadAudit != nil {
+ 					r := c.downloadRecord("WAIT")
+ 					r.decision = *selection.trace
+-					r.decision.Reason = "no_eligible_path"
++					// Retain beta10 rejection identity in the existing journal;
++					// Golden WAIT events keep their original reason unchanged.
++					switch r.decision.Reason {
++					case "b10_blest_window_wait", "b10_rtt_skew_wait", "b10_tail_wait":
++					default:
++						r.decision.Reason = "no_eligible_path"
++					}
+ 					r.decision.Outcome = "waiting"
+ 					c.cfg.DownloadAudit.record(r)
+ 				}
+@@ -300,7 +306,14 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pa
+ 		trace = &snapshot
+ 		observation = trace
+ 	}
+-	chosen := c.choosePathObservedLocked(length, observation)
++	// Research-only server normal-DATA B10 selector; the Golden Capacity V2
++	// wrapper below is still the only reservation/commit/refund owner.
++	var chosen *mpLeg
++	if c.cfg.ServerDownload && c.active.Load() && (c.cfg.Recovery == nil || (c.cfg.Recovery.allows(0) && c.cfg.Recovery.allows(1))) {
++		chosen = c.chooseB10ECFLocked(length, now, observation)
++	} else {
++		chosen = c.choosePathObservedLocked(length, observation)
++	}
+ 	if observation != nil {
+ 		if chosen != nil {
+ 			trace.Candidate = int(chosen.id)
+diff --git a/protocol/multipath/stream/headroom_s1_test.go b/protocol/multipath/stream/headroom_s1_test.go
+new file mode 100644
+index 0000000..6ec4189
+--- /dev/null
++++ b/protocol/multipath/stream/headroom_s1_test.go
+@@ -0,0 +1,82 @@
++package stream
++
++import (
++	"bytes"
++	"sync"
++	"testing"
++)
++
++func TestS1HeadroomOriginalPayloadAndFallback(t *testing.T) {
++	raw := make([]byte, 2048)
++	for i := 0; i < 1500; i++ {
++		raw[32+i] = byte(i % 251)
++	}
++	buf := NewBufferWithHeadroom(raw, 32, 1500, nil)
++	golden := append([]byte(nil), buf.Data...)
++	header, ok := buf.TakeHeadroom(buf.Data, 29)
++	if !ok || len(header) != 1529 {
++		t.Fatal("full frame fast path should be eligible")
++	}
++	if _, other := buf.TakeHeadroom(buf.Data, 29); other {
++		t.Fatal("concurrent writer must fall back")
++	}
++	if _, partial := buf.TakeHeadroom(buf.Data[1:], 29); partial {
++		t.Fatal("partial/repair range must fall back")
++	}
++	copy(header[:29], bytes.Repeat([]byte{0xb7}, 29))
++	if !bytes.Equal(buf.Data, golden) {
++		t.Fatal("header write touched payload")
++	}
++	buf.ReturnHeadroom()
++	if _, ok := buf.TakeHeadroom(buf.Data, 29); !ok {
++		t.Fatal("reuse after write must work")
++	}
++	buf.ReturnHeadroom()
++}
++
++func TestS1BufferRetainAndReleaseLifecycle(t *testing.T) {
++	raw := make([]byte, 2048)
++	var mu sync.Mutex
++	released := 0
++	buf := NewBufferWithHeadroom(raw, 32, 1024, func() { mu.Lock(); defer mu.Unlock(); released++ })
++	buf.Retain()
++	buf.Retain()
++	buf.Release()
++	buf.Release()
++	if released != 0 {
++		t.Fatal("released while writer still owns payload")
++	}
++	buf.Release()
++	if released != 1 {
++		t.Fatalf("release count %d != 1", released)
++	}
++}
++
++func TestS1HeadroomConcurrentSingleBorrow(t *testing.T) {
++	raw := make([]byte, 2048)
++	buf := NewBufferWithHeadroom(raw, 32, 1024, nil)
++	first, ok := buf.TakeHeadroom(buf.Data, 29)
++	if !ok || len(first) != 1053 {
++		t.Fatal("initial borrow failed")
++	}
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 5000; i++ {
++			if _, ok := buf.TakeHeadroom(buf.Data, 29); ok {
++				t.Error("double borrow")
++			}
++		}
++	}()
++	wg.Wait()
++	buf.ReturnHeadroom()
++}
++
++func TestS1ReservedFallbackUnchanged(t *testing.T) {
++	reserved := make([]byte, 1024)
++	buf := NewBuffer(reserved, nil)
++	if _, ok := buf.TakeHeadroom(buf.Data, 29); ok {
++		t.Fatal("reserved Golden fallback cannot use headroom")
++	}
++}
+diff --git a/protocol/multipath/stream/path.go b/protocol/multipath/stream/path.go
+index f29cd76..1501850 100644
+--- a/protocol/multipath/stream/path.go
++++ b/protocol/multipath/stream/path.go
+@@ -33,6 +33,7 @@ type Path struct {
+ 	SRTT          time.Duration
+ 	RTTVar        time.Duration
+ 	MinimumRTT    time.Duration
++	recentRTT     time.Duration // B10 completion-delay observation; does not change Golden Rate/RTO
+ 	LastProgress  time.Time
+ 	Stale         bool
+ 	ReleaseFlight func(prepaid bool)
+@@ -121,7 +122,9 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
+ 		rtt := now.Sub(sent)
+ 		if p.SRTT == 0 {
+ 			p.SRTT, p.RTTVar, p.MinimumRTT = rtt, rtt/2, rtt
++			p.recentRTT = rtt
+ 		} else {
++			p.recentRTT = (p.recentRTT + rtt) / 2
+ 			delta := rtt - p.SRTT
+ 			if delta < 0 {
+ 				delta = -delta
+@@ -186,3 +189,31 @@ func (p *Path) DrainTime(provisionalRate float64) float64 {
+ 	}
+ 	return float64(p.Outstanding()) / rate
+ }
++
++// CompletionTime is ported from WuSiYu multipath-beta10 stream/path.go.
++// The legacy Golden receipt estimator and minimum-RTT lifecycle remain intact.
++// recentRTT observes only real peer path receipts; no local write completion is ACK.
++func (p *Path) CompletionTime(length int, provisionalRate float64, provisionalDelay time.Duration, now time.Time) float64 {
++	rate := p.Rate
++	if rate <= 0 {
++		rate = provisionalRate
++	}
++	delay := p.MinimumRTT
++	if delay == 0 {
++		delay = p.SRTT
++	}
++	if delay == 0 {
++		delay = provisionalDelay
++	}
++	if p.Outstanding() == 0 && !p.LastProgress.IsZero() && now.Sub(p.LastProgress) >= max(2*p.SRTT, 100*time.Millisecond) {
++		rate = max(rate, provisionalRate)
++	}
++	if rate <= 0 {
++		rate = 1
++	}
++	estimate := (float64(p.Outstanding())+float64(length))/rate + delay.Seconds()/2
++	if p.Outstanding() > 0 && p.recentRTT > 0 {
++		estimate = max(estimate, max(0, (p.recentRTT-p.MinimumRTT/2).Seconds()))
++	}
++	return estimate
++}
+diff --git a/protocol/multipath/stream/send.go b/protocol/multipath/stream/send.go
+index 017a578..32dcfb0 100644
+--- a/protocol/multipath/stream/send.go
++++ b/protocol/multipath/stream/send.go
+@@ -1,6 +1,9 @@
+ package stream
+ 
+-import "math"
++import (
++	"math"
++	"sync/atomic"
++)
+ 
+ // Buffer ownership is shared only by the connection send queue and active
+ // writers. ACK processing must not recycle bytes referenced by a blocked Write.
+@@ -8,12 +11,33 @@ type Buffer struct {
+ 	Data    []byte
+ 	refs    int
+ 	release func()
++
++	// Beta10 headroom: the header immediately precedes Data in the
++	// same charged backing buffer. Only one child writer may borrow it.
++	raw      []byte
++	headroom int
++	headBusy atomic.Bool
+ }
+ 
+ func NewBuffer(data []byte, release func()) *Buffer {
+ 	return &Buffer{Data: data, refs: 1, release: release}
+ }
+ 
++// These three functions are copied from upstream Beta10's Buffer API.
++// Golden Sender/RecordAllocator/Retain/Release remain unchanged.
++func NewBufferWithHeadroom(raw []byte, headroom, length int, release func()) *Buffer {
++	return &Buffer{Data: raw[headroom : headroom+length], refs: 1, release: release, raw: raw, headroom: headroom}
++}
++
++func (b *Buffer) TakeHeadroom(data []byte, header int) ([]byte, bool) {
++	if header > b.headroom || len(data) == 0 || len(b.Data) == 0 || &data[0] != &b.Data[0] || !b.headBusy.CompareAndSwap(false, true) {
++		return nil, false
++	}
++	return b.raw[b.headroom-header : b.headroom+len(data)], true
++}
++
++func (b *Buffer) ReturnHeadroom() { b.headBusy.Store(false) }
++
+ func (b *Buffer) Retain() {
+ 	if b.refs <= 0 {
+ 		panic("multipath: retaining released buffer")
+diff --git a/protocol/multipath/types.go b/protocol/multipath/types.go
+index a8cc9a6..f70cb58 100644
+--- a/protocol/multipath/types.go
++++ b/protocol/multipath/types.go
+@@ -36,6 +36,7 @@ type coreConfig struct {
+ 	OnStatusEvent                  func()
+ 	OnProtocolError                func(error)
+ 	SendStatus                     bool
++	ServerDownload                 bool // research D2-A: only server inbound sets this
+ }
+ 
+ type legFailureStage string
+@@ -240,44 +241,47 @@ type mpCore struct {
+ 	replayTO                   atomic.Uint64
+ 	backpressE                 atomic.Uint64
+ 	backpressNS                atomic.Uint64
+-	legFailureMu               sync.Mutex
+-	legFailures                [2]uint64
+-	lastFailLeg                uint8
+-	lastFailStage              legFailureStage
+-	failureMu                  sync.Mutex
+-	failure                    string
+-	failureAt                  time.Time
+-	memory                     *memoryBudget
+-	sessionBytes               int64
+-	txReserve                  chan []byte
+-	peerStatusMu               sync.Mutex
+-	peerStatus                 peerSenderStatus
+-	statusMu                   sync.Mutex
+-	statusSeq                  uint64
+-	lastStatus                 senderStatus
+-	lastStatusAt               time.Time
+-	probeMu                    sync.Mutex
+-	probeNext                  uint64
+-	probePending               [2]pendingProbe
+-	probeLast                  [2]time.Time
+-	probeRTT                   [2]legRTTSnapshot
+-	workerMu                   sync.Mutex
+-	workerGroup                sync.WaitGroup
+-	workerClosed               bool
+-	stateMu                    sync.Mutex
+-	tx                         *stream.Sender
+-	rx                         *stream.Receiver
+-	headPages                  int
+-	nextGeneration             uint64
+-	pumpWake                   chan struct{}
+-	rxWake                     chan struct{}
+-	txWake                     chan struct{}
+-	startedAt                  time.Time
+-	mappings                   []dataMapping
+-	mappingHead                int
+-	mappingBytes               int64
+-	mappingReserve             [stream.RecordReserve]dataMapping
+-	feedbackDirty              bool
++	// B10 writer-backlog hint fed by the existing Golden txLoop waitTXSpace.
++	writerWaiting    atomic.Bool
++	writerReleasedAt atomic.Int64
++	legFailureMu     sync.Mutex
++	legFailures      [2]uint64
++	lastFailLeg      uint8
++	lastFailStage    legFailureStage
++	failureMu        sync.Mutex
++	failure          string
++	failureAt        time.Time
++	memory           *memoryBudget
++	sessionBytes     int64
++	txReserve        chan []byte
++	peerStatusMu     sync.Mutex
++	peerStatus       peerSenderStatus
++	statusMu         sync.Mutex
++	statusSeq        uint64
++	lastStatus       senderStatus
++	lastStatusAt     time.Time
++	probeMu          sync.Mutex
++	probeNext        uint64
++	probePending     [2]pendingProbe
++	probeLast        [2]time.Time
++	probeRTT         [2]legRTTSnapshot
++	workerMu         sync.Mutex
++	workerGroup      sync.WaitGroup
++	workerClosed     bool
++	stateMu          sync.Mutex
++	tx               *stream.Sender
++	rx               *stream.Receiver
++	headPages        int
++	nextGeneration   uint64
++	pumpWake         chan struct{}
++	rxWake           chan struct{}
++	txWake           chan struct{}
++	startedAt        time.Time
++	mappings         []dataMapping
++	mappingHead      int
++	mappingBytes     int64
++	mappingReserve   [stream.RecordReserve]dataMapping
++	feedbackDirty    bool
+ }
+ 
+ type dataMapping struct {
+diff --git a/protocol/multipath/wire.go b/protocol/multipath/wire.go
+index b6081bb..eb8fcd0 100644
+--- a/protocol/multipath/wire.go
++++ b/protocol/multipath/wire.go
+@@ -87,6 +87,15 @@ func readFlow(conn net.Conn) (flowMessage, error) {
+ 	return message, nil
+ }
+ 
++// Byte-for-byte Beta10 DATA header encoder. Wire format remains unchanged.
++func putDataHeader(header []byte, frame wireFrame) {
++	header[0] = frame.typ
++	binary.BigEndian.PutUint64(header[1:9], frame.seq)
++	binary.BigEndian.PutUint64(header[9:17], frame.pathSeq)
++	binary.BigEndian.PutUint64(header[17:25], frame.generation)
++	binary.BigEndian.PutUint32(header[25:29], uint32(len(frame.data)))
++}
++
+ func writeWireFrame(conn net.Conn, frame wireFrame) error {
+ 	if initial, ok := conn.(initialFrameWriter); ok {
+ 		if handled, err := initial.writeInitialFrame(frame); handled {
+@@ -104,12 +113,16 @@ func writeWireFrame(conn net.Conn, frame wireFrame) error {
+ 		if len(frame.data) == 0 || len(frame.data) > maxFramePayload {
+ 			return errors.New("invalid multipath payload size")
+ 		}
++		if frame.buffer != nil {
++			if contiguous, ok := frame.buffer.TakeHeadroom(frame.data, dataFrameHeaderSize); ok {
++				putDataHeader(contiguous[:dataFrameHeaderSize], frame)
++				err := writeAll(conn, contiguous)
++				frame.buffer.ReturnHeadroom()
++				return err
++			}
++		}
+ 		var header [dataFrameHeaderSize]byte
+-		header[0] = frame.typ
+-		binary.BigEndian.PutUint64(header[1:9], frame.seq)
+-		binary.BigEndian.PutUint64(header[9:17], frame.pathSeq)
+-		binary.BigEndian.PutUint64(header[17:25], frame.generation)
+-		binary.BigEndian.PutUint32(header[25:29], uint32(len(frame.data)))
++		putDataHeader(header[:], frame)
+ 		buffers := net.Buffers{header[:], frame.data}
+ 		_, err := buffers.WriteTo(conn)
+ 		return err
