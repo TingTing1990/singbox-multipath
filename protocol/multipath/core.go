@@ -235,7 +235,7 @@ func (c *mpCore) nextTXBuffer() (*stream.Buffer, error) {
 		// cannot create an unbounded list of uncharged send records.
 		buffer, changed := c.memory.tryAcquirePrimary(c.cfg.ChunkSize + 512)
 		if buffer != nil {
-			if c.cfg.ServerDownload {
+			if c.cfg.ServerDownload && !c.active.Load() {
 				return stream.NewBufferWithHeadroom(buffer, s1TXHeadroom, c.cfg.ChunkSize, func() { c.memory.release(buffer) }), nil
 			}
 			return stream.NewBuffer(buffer[:c.cfg.ChunkSize], func() { c.memory.release(buffer) }), nil
@@ -301,7 +301,7 @@ func (c *mpCore) txLoop() {
 			}
 			compact, _ := c.memory.tryAcquirePrimary(size + 512)
 			if compact != nil {
-				if c.cfg.ServerDownload {
+				if c.cfg.ServerDownload && !c.active.Load() {
 					copy(compact[s1TXHeadroom:s1TXHeadroom+n], buffer.Data[:n])
 					buffer.Release()
 					buffer = stream.NewBufferWithHeadroom(compact, s1TXHeadroom, n, func() { c.memory.release(compact) })

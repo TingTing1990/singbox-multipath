@@ -91,6 +91,18 @@ func (c *mpCore) chooseB10ECFLocked(length int, now time.Time, trace *D.Decision
 		}
 		return chosen
 	}
+	// Compatibility guard for Golden's unshrinking receiver window and
+	// net.Pipe-backed application writer. Do not turn an immediately eligible
+	// preferred assignment into WAIT solely because the theoretical faster
+	// booster is currently owned by its single child writer. That WAIT would
+	// bypass Golden's natural preferred Capacity V2 reservation and could
+	// starve an otherwise usable leg0. Busy is still never bypassed for submit.
+	if chosen.id == 0 && best.id == 1 && best.busy {
+		if trace != nil {
+			trace.Reason = "b10_preferred_available"
+		}
+		return chosen
+	}
 	bestRate := best.path.Rate
 	if bestRate <= 0 {
 		bestRate = provisionalRate

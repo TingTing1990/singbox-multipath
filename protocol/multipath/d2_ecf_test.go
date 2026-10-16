@@ -1,6 +1,9 @@
 package multipath
 
 import (
+	"bytes"
+	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -92,4 +95,149 @@ func TestD2ECFHealthyRecoveryGroupUsesAggregateSelection(t *testing.T) {
 	if sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now()); sel.leg != booster {
 		t.Fatal("single-path recovery must retain Golden emergency selection")
 	}
+}
+
+// Regression for the previously untested B10 tail case: leg0 is actually
+// eligible, while the theoretical fastest booster cannot accept a frame.
+// Golden can keep sending preferred; a WAIT here would bypass Capacity V2.
+func TestD2ECFReadyPreferredNotBlockedByBusyBooster(t *testing.T) {
+	c, preferred, booster := d2ECFTestCore()
+	c.writerWaiting.Store(false)
+	preferred.path.Rate = 20_000_000
+	preferred.path.MinimumRTT = 100 * time.Millisecond
+	booster.path.Rate = 75_000_000
+	booster.path.MinimumRTT = 10 * time.Millisecond
+	booster.busy = true
+	selection := c.choosePathForSubmitLocked(c.cfg.ChunkSize, time.Now())
+	if selection.leg != preferred {
+		t.Fatalf("eligible preferred was held by busy booster: leg=%v", legIDForCapacityTest(selection.leg))
+	}
+	selection.finish(nil)
+}
+
+// The same bug must not bypass the shared controller's natural preferred
+// assignment accounting. Both sessions use the real Capacity V2 controller.
+func TestD2ECFPreferredCapacityReservationOnBusyBooster(t *testing.T) {
+	ctrl := newPreferredCapacityController(60, time.Second, 64<<10)
+	now := time.Now()
+	primePreferredProtection(t, ctrl, now.Add(-2*time.Second), 90_000_000/8)
+	cores := make([]*mpCore, 2)
+	for i := range cores {
+		c, preferred, booster := d2ECFTestCore()
+		c.cfg.PreferredCapacity = ctrl
+		c.writerWaiting.Store(false)
+		preferred.path.Rate, preferred.path.MinimumRTT = 20_000_000, 100*time.Millisecond
+		booster.path.Rate, booster.path.MinimumRTT = 75_000_000, 10*time.Millisecond
+		booster.busy = true
+		cores[i] = c
+	}
+	before := ctrl.snapshot().AssignedBytes
+	for _, c := range cores {
+		sel := c.choosePathForSubmitLocked(c.cfg.ChunkSize, now)
+		if sel.leg == nil || sel.leg.id != 0 || sel.reservation == nil {
+			t.Fatalf("natural preferred Capacity reservation lost: selected=%v reservation=%v", legIDForCapacityTest(sel.leg), sel.reservation)
+		}
+		sel.finish(nil)
+	}
+	after := ctrl.snapshot().AssignedBytes
+	if after-before != 2*uint64(cores[0].cfg.ChunkSize) {
+		t.Fatalf("shared Capacity commit mismatch: before=%d after=%d", before, after)
+	}
+	// Refund must never count a failed assignment as peer delivery or commit.
+	sel := cores[0].choosePathForSubmitLocked(cores[0].cfg.ChunkSize, now.Add(time.Millisecond))
+	if sel.reservation == nil {
+		t.Fatal("missing failure-path reservation")
+	}
+	sel.finish(errMemoryLimit)
+	if ctrl.snapshot().AssignedBytes != after {
+		t.Fatal("failed submit was committed")
+	}
+}
+
+// Exercise the actual DATA writer rather than only stream.Buffer's borrow API.
+// This covers full-frame headroom, sliced/reinjected fallback, header identity,
+// child write errors and headroom-release on failure.
+func TestS1WireFrameBytesAndFallback(t *testing.T) {
+	for _, offset := range []int{0, 1} {
+		raw := make([]byte, 256)
+		for i := 0; i < 100; i++ {
+			raw[32+i] = byte((i * 7) % 251)
+		}
+		buffer := stream.NewBufferWithHeadroom(raw, 32, 100, nil)
+		data := buffer.Data[offset:]
+		golden := append([]byte(nil), data...)
+		a, b := net.Pipe()
+		gotCh := make(chan wireFrame, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			frame, err := readFrame(b, make([]byte, 1024))
+			gotCh <- frame
+			errCh <- err
+		}()
+		want := wireFrame{typ: frameTypeData, seq: 0x10203, pathSeq: 0x40506, generation: 7, data: data, buffer: buffer}
+		if err := writeWireFrame(a, want); err != nil {
+			t.Fatalf("offset=%d write: %v", offset, err)
+		}
+		got := <-gotCh
+		if err := <-errCh; err != nil {
+			t.Fatalf("offset=%d read: %v", offset, err)
+		}
+		a.Close()
+		b.Close()
+		if got.seq != want.seq || got.pathSeq != want.pathSeq || got.generation != want.generation || !bytes.Equal(got.data, golden) {
+			t.Fatalf("offset=%d DATA wire bytes diverged", offset)
+		}
+		buffer.Release()
+	}
+}
+
+type s1FailingWriter struct{ net.Conn }
+
+func (*s1FailingWriter) Write(p []byte) (int, error) { return min(len(p), 1), io.ErrUnexpectedEOF }
+func TestS1WireFrameHeadroomReturnedOnChildError(t *testing.T) {
+	raw := make([]byte, 256)
+	buffer := stream.NewBufferWithHeadroom(raw, 32, 100, nil)
+	frame := wireFrame{typ: frameTypeData, seq: 1, pathSeq: 1, generation: 1, data: buffer.Data, buffer: buffer}
+	if err := writeWireFrame(&s1FailingWriter{}, frame); err == nil {
+		t.Fatal("child failure swallowed")
+	}
+	if _, ok := buffer.TakeHeadroom(buffer.Data, dataFrameHeaderSize); !ok {
+		t.Fatal("headroom held after child failure")
+	}
+	buffer.ReturnHeadroom()
+	buffer.Release()
+}
+
+// Golden's single-leg staging research is scoped to inactive server TCP
+// downloads. Active aggregate traffic and upload must not allocate S1 headroom.
+func TestS1InactiveServerHeadroomScope(t *testing.T) {
+	c := &mpCore{cfg: coreConfig{ServerDownload: true, ChunkSize: 4096}, memory: newMemoryBudget(32<<20, false), done: make(chan struct{}), txReserve: make(chan []byte, 1)}
+	buf, err := c.nextTXBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := buf.TakeHeadroom(buf.Data, dataFrameHeaderSize); !ok {
+		t.Fatal("inactive server did not get S1 headroom")
+	}
+	buf.ReturnHeadroom()
+	buf.Release()
+	c.active.Store(true)
+	buf, err = c.nextTXBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := buf.TakeHeadroom(buf.Data, dataFrameHeaderSize); ok {
+		t.Fatal("active dual-leg frame received unauthorized S1 headroom")
+	}
+	buf.Release()
+	c.active.Store(false)
+	c.cfg.ServerDownload = false
+	buf, err = c.nextTXBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := buf.TakeHeadroom(buf.Data, dataFrameHeaderSize); ok {
+		t.Fatal("client-upload frame received unauthorized S1 headroom")
+	}
+	buf.Release()
 }
