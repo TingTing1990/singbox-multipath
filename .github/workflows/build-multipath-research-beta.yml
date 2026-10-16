@@ -80,7 +80,7 @@ jobs:
           expected={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'2b55f59ccc64e9b7036164b75d72c7aebaf1dda1eb2f59e8ac2f6f94887410aa',
+            'protocol/multipath/core.go':'ed7a1681314c757cd69a714279d47fded4d5fc8f84243f0f55fe1fffe7fe2b56',
             'protocol/multipath/inbound.go':'8d12ee25055bd1011e90ec2aa715f9dc245ee8c31bdb75f55e365470db499e02',
             'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
             'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
@@ -129,11 +129,12 @@ jobs:
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
             'protocol/multipath/wire.go':'83001bd9eee88537fcec3714338585123cc35622bd8c6497f96d695c566929f9',
-            'protocol/multipath/d2_ecf.go':'795377d61b163b9cba922d044229fc8456f987d06f4afb873b20d72851dcf810',
-            'protocol/multipath/d2_ecf_test.go':'5a8f2472c9f21f13a9a2807dc694de1a11242d2a41c052916094901e2cf00839',
+            'protocol/multipath/d2_ecf.go':'42498c30dd469f18b2225a46ed30d32ca12325cf9bb7429627e2515fbb49b946',
+            'protocol/multipath/d2_ecf_test.go':'5353f4ff8f4418de65f3b37a35e1898b85aec419b0988df4920cae03d4be838b',
+            'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'tools/research-b10-s1-d2.patch':'7d6a07ead4bfe91aaa252522c3a6498a725715dbaa343c788c35a8545b4380f8',
-            'tools/verify-download-boundary.py':'bdb12886ef12535eca1c077366777c43578625b881e304db28b279852a2c0c80',
+            'tools/research-b10-s1-d2.patch':'3331486a545d592b3b513ce140d65116fc2ee712bf305f4babf02ee9539a9738',
+            'tools/verify-download-boundary.py':'91aa962e3a9345172faf967ae9cf50be7ec745ad121b5d2378acb18e21c11065',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -214,12 +215,13 @@ jobs:
             'protocol/multipath/audit/timeline.go','protocol/multipath/audit/timeline_v3_test.go',
              'protocol/multipath/audit/v3_test_helpers_test.go',
              'protocol/multipath/d2_ecf.go','protocol/multipath/d2_ecf_test.go',
+             'protocol/multipath/research_b10_performance_test.go',
              'protocol/multipath/stream/headroom_s1_test.go',
              'tools/research-b10-s1-d2.patch'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
+            'protocol/multipath/core.go':'ed7a1681314c757cd69a714279d47fded4d5fc8f84243f0f55fe1fffe7fe2b56',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
             'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
@@ -756,8 +758,20 @@ jobs:
           set -euo pipefail
           python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/research-candidate-reversal.log"
           CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestD2ECF)' \
+            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF)' \
             ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/research-S1-D2-race-x10.log"
+
+      - name: Research B10 actual server scope and Capacity V2 A/B performance
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Uses the unchanged original paced-link protocol fixture with
+          # ServerDownload enabled, active two-leg paths and a REAL shared
+          # PreferredCapacity controller (also includes preferred-only S1).
+          # The candidate/control ratio remains >=98%; never relax this gate.
+          CGO_ENABLED=1 go test -count=1 -timeout=20m -tags "$BUILD_TAGS" \
+            -run '^TestResearchB10(ServerDownloadCapacityHealthyAB|SingleLegServerHeadroomAB|WeakBoosterAB)$' \
+            ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/research-scoped-S1-D2-performance.log"
 
       - name: Check formatting of exact repair write-set
         shell: bash
@@ -785,6 +799,7 @@ jobs:
             protocol/multipath/stream/send.go protocol/multipath/transport.go protocol/multipath/types.go
             protocol/multipath/d2_ecf.go protocol/multipath/d2_ecf_test.go
             protocol/multipath/stream/headroom_s1_test.go protocol/multipath/wire.go
+            protocol/multipath/research_b10_performance_test.go
             protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go
             protocol/multipath/f01_staged_ack_test.go protocol/multipath/memory_available_linux_test.go
             protocol/multipath/memory_runtime.go protocol/multipath/memory_runtime_test.go
