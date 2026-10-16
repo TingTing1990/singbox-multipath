@@ -33,6 +33,7 @@ type Path struct {
 	SRTT          time.Duration
 	RTTVar        time.Duration
 	MinimumRTT    time.Duration
+	recentRTT     time.Duration // B10 completion-delay observation; does not change Golden Rate/RTO
 	LastProgress  time.Time
 	Stale         bool
 	ReleaseFlight func(prepaid bool)
@@ -121,7 +122,9 @@ func (p *Path) Feedback(receipt Receipt, now time.Time) error {
 		rtt := now.Sub(sent)
 		if p.SRTT == 0 {
 			p.SRTT, p.RTTVar, p.MinimumRTT = rtt, rtt/2, rtt
+			p.recentRTT = rtt
 		} else {
+			p.recentRTT = (p.recentRTT + rtt) / 2
 			delta := rtt - p.SRTT
 			if delta < 0 {
 				delta = -delta
@@ -185,4 +188,32 @@ func (p *Path) DrainTime(provisionalRate float64) float64 {
 		rate = 1
 	}
 	return float64(p.Outstanding()) / rate
+}
+
+// CompletionTime is ported from WuSiYu multipath-beta10 stream/path.go.
+// The legacy Golden receipt estimator and minimum-RTT lifecycle remain intact.
+// recentRTT observes only real peer path receipts; no local write completion is ACK.
+func (p *Path) CompletionTime(length int, provisionalRate float64, provisionalDelay time.Duration, now time.Time) float64 {
+	rate := p.Rate
+	if rate <= 0 {
+		rate = provisionalRate
+	}
+	delay := p.MinimumRTT
+	if delay == 0 {
+		delay = p.SRTT
+	}
+	if delay == 0 {
+		delay = provisionalDelay
+	}
+	if p.Outstanding() == 0 && !p.LastProgress.IsZero() && now.Sub(p.LastProgress) >= max(2*p.SRTT, 100*time.Millisecond) {
+		rate = max(rate, provisionalRate)
+	}
+	if rate <= 0 {
+		rate = 1
+	}
+	estimate := (float64(p.Outstanding())+float64(length))/rate + delay.Seconds()/2
+	if p.Outstanding() > 0 && p.recentRTT > 0 {
+		estimate = max(estimate, max(0, (p.recentRTT-p.MinimumRTT/2).Seconds()))
+	}
+	return estimate
 }

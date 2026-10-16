@@ -1,6 +1,9 @@
 package stream
 
-import "math"
+import (
+	"math"
+	"sync/atomic"
+)
 
 // Buffer ownership is shared only by the connection send queue and active
 // writers. ACK processing must not recycle bytes referenced by a blocked Write.
@@ -8,11 +11,32 @@ type Buffer struct {
 	Data    []byte
 	refs    int
 	release func()
+
+	// Beta10 headroom: the header immediately precedes Data in the
+	// same charged backing buffer. Only one child writer may borrow it.
+	raw      []byte
+	headroom int
+	headBusy atomic.Bool
 }
 
 func NewBuffer(data []byte, release func()) *Buffer {
 	return &Buffer{Data: data, refs: 1, release: release}
 }
+
+// These three functions are copied from upstream Beta10's Buffer API.
+// Golden Sender/RecordAllocator/Retain/Release remain unchanged.
+func NewBufferWithHeadroom(raw []byte, headroom, length int, release func()) *Buffer {
+	return &Buffer{Data: raw[headroom : headroom+length], refs: 1, release: release, raw: raw, headroom: headroom}
+}
+
+func (b *Buffer) TakeHeadroom(data []byte, header int) ([]byte, bool) {
+	if header > b.headroom || len(data) == 0 || len(b.Data) == 0 || &data[0] != &b.Data[0] || !b.headBusy.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	return b.raw[b.headroom-header : b.headroom+len(data)], true
+}
+
+func (b *Buffer) ReturnHeadroom() { b.headBusy.Store(false) }
 
 func (b *Buffer) Retain() {
 	if b.refs <= 0 {
