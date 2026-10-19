@@ -66,10 +66,10 @@ index 711cfbd..a3250c6 100644
  		c.stateMu.Lock()
 diff --git a/protocol/multipath/d2_ecf.go b/protocol/multipath/d2_ecf.go
 new file mode 100644
-index 0000000..ecdba1f
+index 0000000..32a6a3d
 --- /dev/null
 +++ b/protocol/multipath/d2_ecf.go
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,156 @@
 +package multipath
 +
 +import (
@@ -169,9 +169,16 @@ index 0000000..ecdba1f
 +	// booster is currently owned by its single child writer. That WAIT would
 +	// bypass Golden's natural preferred Capacity V2 reservation and could
 +	// starve an otherwise usable leg0. Busy is still never bypassed for submit.
-+	if chosen.id == 0 && best.id == 1 && best.busy {
++	bestPipeline := best.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
++	bestOutstanding := best.path.Outstanding()
++	bestPipelineFull := bestOutstanding > bestPipeline || uint64(length) > bestPipeline-bestOutstanding
++	if chosen.id == 0 && best.id == 1 && (best.busy || bestPipelineFull) {
 +		if trace != nil {
-+			trace.Reason = "b10_preferred_available"
++			if best.busy {
++				trace.Reason = "b10_preferred_available_busy_booster"
++			} else {
++				trace.Reason = "b10_preferred_available_pipeline_full_booster"
++			}
 +		}
 +		return chosen
 +	}
@@ -221,10 +228,10 @@ index 0000000..ecdba1f
 +}
 diff --git a/protocol/multipath/d2_ecf_test.go b/protocol/multipath/d2_ecf_test.go
 new file mode 100644
-index 0000000..c3a6ccb
+index 0000000..c9875bc
 --- /dev/null
 +++ b/protocol/multipath/d2_ecf_test.go
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,283 @@
 +package multipath
 +
 +import (
@@ -378,6 +385,46 @@ index 0000000..c3a6ccb
 +	sel.finish(errMemoryLimit)
 +	if ctrl.snapshot().AssignedBytes != after {
 +		t.Fatal("failed submit was committed")
++	}
++}
++
++// A theoretically faster booster must not make the currently eligible
++// preferred leg wait when the booster cannot accept this frame because its
++// original startup pipeline is full. This uses the actual Path.Pipeline and
++// the shared Capacity V2 controller; it is not a mocked eligibility result.
++func TestD2ECFReadyPreferredNotBlockedByFullBooster(t *testing.T) {
++	ctrl := newPreferredCapacityController(60, time.Second, 64<<10)
++	now := time.Now()
++	primePreferredProtection(t, ctrl, now.Add(-2*time.Second), 90_000_000/8)
++	c, preferred, booster := d2ECFTestCore()
++	c.cfg.PreferredCapacity = ctrl
++	c.writerWaiting.Store(false)
++	preferred.path.Rate = 1_000_000
++	preferred.path.SRTT = 400 * time.Millisecond
++	preferred.path.MinimumRTT = 400 * time.Millisecond
++	preferred.path.Sent, preferred.path.Received = 0, 0
++	booster.path.Rate = 100_000_000
++	booster.path.SRTT = 0 // keeps the real Path in its startup pipeline
++	booster.path.MinimumRTT = 0
++	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
++	booster.path.Sent, booster.path.Received = initial, 0
++	c.tx.WindowEnd = 8 << 20
++	if booster.path.Outstanding()+uint64(c.cfg.ChunkSize) <= booster.path.Pipeline(initial, uint64(c.cfg.ReplayBytes)) {
++		t.Fatal("test precondition invalid: booster must be pipeline-full")
++	}
++	preferredCost := preferred.path.CompletionTime(c.cfg.ChunkSize, 100_000_000, 400*time.Millisecond, now)
++	boosterCost := booster.path.CompletionTime(c.cfg.ChunkSize, 100_000_000, 400*time.Millisecond, now)
++	if boosterCost >= preferredCost {
++		t.Fatalf("test precondition invalid: booster must be theoretically faster: preferred=%v booster=%v", preferredCost, boosterCost)
++	}
++	before := ctrl.snapshot().AssignedBytes
++	selection := c.choosePathForSubmitLocked(c.cfg.ChunkSize, now)
++	if selection.leg != preferred || selection.reservation == nil {
++		t.Fatalf("pipeline-full booster blocked preferred/Capacity: leg=%v reservation=%v", legIDForCapacityTest(selection.leg), selection.reservation)
++	}
++	selection.finish(nil)
++	if got := ctrl.snapshot().AssignedBytes - before; got != uint64(c.cfg.ChunkSize) {
++		t.Fatalf("preferred Capacity commit mismatch: got=%d want=%d", got, c.cfg.ChunkSize)
 +	}
 +}
 +

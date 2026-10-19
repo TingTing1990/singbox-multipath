@@ -25,8 +25,8 @@ RESEARCH_CHANGED = {
     'protocol/multipath/wire.go': '369bc1d5d02530185763e987d3d52cc65976e41f888bbc5c3288058389a8613c',
 }
 RESEARCH_ADDED = {
-    'protocol/multipath/d2_ecf.go': '42498c30dd469f18b2225a46ed30d32ca12325cf9bb7429627e2515fbb49b946',
-    'protocol/multipath/d2_ecf_test.go': '5353f4ff8f4418de65f3b37a35e1898b85aec419b0988df4920cae03d4be838b',
+    'protocol/multipath/d2_ecf.go': '78b6d7f6770a0ed032b57a8ceabd13b5a03f5dcdd48f00b67dc1c45668d4dcd3',
+    'protocol/multipath/d2_ecf_test.go': 'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
     'protocol/multipath/research_b10_performance_test.go': '72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
     'protocol/multipath/stream/headroom_s1_test.go': 'd6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
 }
