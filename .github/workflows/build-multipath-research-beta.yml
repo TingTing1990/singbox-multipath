@@ -129,12 +129,12 @@ jobs:
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
             'protocol/multipath/wire.go':'83001bd9eee88537fcec3714338585123cc35622bd8c6497f96d695c566929f9',
-            'protocol/multipath/d2_ecf.go':'42498c30dd469f18b2225a46ed30d32ca12325cf9bb7429627e2515fbb49b946',
-            'protocol/multipath/d2_ecf_test.go':'5353f4ff8f4418de65f3b37a35e1898b85aec419b0988df4920cae03d4be838b',
+            'protocol/multipath/d2_ecf.go':'78b6d7f6770a0ed032b57a8ceabd13b5a03f5dcdd48f00b67dc1c45668d4dcd3',
+            'protocol/multipath/d2_ecf_test.go':'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
             'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'tools/research-b10-s1-d2.patch':'3331486a545d592b3b513ce140d65116fc2ee712bf305f4babf02ee9539a9738',
-            'tools/verify-download-boundary.py':'91aa962e3a9345172faf967ae9cf50be7ec745ad121b5d2378acb18e21c11065',
+            'tools/research-b10-s1-d2.patch':'0a195fef4d08c5c6bcf0e120bbd1d15f8483a6641501622d20689d99ca7c5209',
+            'tools/verify-download-boundary.py':'9d756d52e5b13f70664e8284a57d6d1dfed73cc96eaacf5492ac9827ea2da3b5',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -221,7 +221,7 @@ jobs:
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'ed7a1681314c757cd69a714279d47fded4d5fc8f84243f0f55fe1fffe7fe2b56',
+            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
             'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
@@ -860,6 +860,10 @@ jobs:
             local rc=${PIPESTATUS[0]}
             set -e
             echo "${label}_run_${run_id}_go_test_rc=${rc}"
+            if (( rc != 0 )); then
+              echo "FAIL ${label} run ${run_id}: go test exited ${rc}" >&2
+              return "$rc"
+            fi
           }
           run_perf "$PARENT_DIR" golden 1
           run_perf "$GITHUB_WORKSPACE" repaired 1
