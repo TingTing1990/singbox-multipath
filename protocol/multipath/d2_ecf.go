@@ -97,9 +97,16 @@ func (c *mpCore) chooseB10ECFLocked(length int, now time.Time, trace *D.Decision
 	// booster is currently owned by its single child writer. That WAIT would
 	// bypass Golden's natural preferred Capacity V2 reservation and could
 	// starve an otherwise usable leg0. Busy is still never bypassed for submit.
-	if chosen.id == 0 && best.id == 1 && best.busy {
+	bestPipeline := best.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
+	bestOutstanding := best.path.Outstanding()
+	bestPipelineFull := bestOutstanding > bestPipeline || uint64(length) > bestPipeline-bestOutstanding
+	if chosen.id == 0 && best.id == 1 && (best.busy || bestPipelineFull) {
 		if trace != nil {
-			trace.Reason = "b10_preferred_available"
+			if best.busy {
+				trace.Reason = "b10_preferred_available_busy_booster"
+			} else {
+				trace.Reason = "b10_preferred_available_pipeline_full_booster"
+			}
 		}
 		return chosen
 	}

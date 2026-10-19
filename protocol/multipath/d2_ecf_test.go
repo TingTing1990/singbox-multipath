@@ -154,6 +154,46 @@ func TestD2ECFPreferredCapacityReservationOnBusyBooster(t *testing.T) {
 	}
 }
 
+// A theoretically faster booster must not make the currently eligible
+// preferred leg wait when the booster cannot accept this frame because its
+// original startup pipeline is full. This uses the actual Path.Pipeline and
+// the shared Capacity V2 controller; it is not a mocked eligibility result.
+func TestD2ECFReadyPreferredNotBlockedByFullBooster(t *testing.T) {
+	ctrl := newPreferredCapacityController(60, time.Second, 64<<10)
+	now := time.Now()
+	primePreferredProtection(t, ctrl, now.Add(-2*time.Second), 90_000_000/8)
+	c, preferred, booster := d2ECFTestCore()
+	c.cfg.PreferredCapacity = ctrl
+	c.writerWaiting.Store(false)
+	preferred.path.Rate = 1_000_000
+	preferred.path.SRTT = 400 * time.Millisecond
+	preferred.path.MinimumRTT = 400 * time.Millisecond
+	preferred.path.Sent, preferred.path.Received = 0, 0
+	booster.path.Rate = 100_000_000
+	booster.path.SRTT = 0 // keeps the real Path in its startup pipeline
+	booster.path.MinimumRTT = 0
+	initial := min(uint64(c.cfg.QueueBytes), uint64(c.cfg.ChunkSize)*4)
+	booster.path.Sent, booster.path.Received = initial, 0
+	c.tx.WindowEnd = 8 << 20
+	if booster.path.Outstanding()+uint64(c.cfg.ChunkSize) <= booster.path.Pipeline(initial, uint64(c.cfg.ReplayBytes)) {
+		t.Fatal("test precondition invalid: booster must be pipeline-full")
+	}
+	preferredCost := preferred.path.CompletionTime(c.cfg.ChunkSize, 100_000_000, 400*time.Millisecond, now)
+	boosterCost := booster.path.CompletionTime(c.cfg.ChunkSize, 100_000_000, 400*time.Millisecond, now)
+	if boosterCost >= preferredCost {
+		t.Fatalf("test precondition invalid: booster must be theoretically faster: preferred=%v booster=%v", preferredCost, boosterCost)
+	}
+	before := ctrl.snapshot().AssignedBytes
+	selection := c.choosePathForSubmitLocked(c.cfg.ChunkSize, now)
+	if selection.leg != preferred || selection.reservation == nil {
+		t.Fatalf("pipeline-full booster blocked preferred/Capacity: leg=%v reservation=%v", legIDForCapacityTest(selection.leg), selection.reservation)
+	}
+	selection.finish(nil)
+	if got := ctrl.snapshot().AssignedBytes - before; got != uint64(c.cfg.ChunkSize) {
+		t.Fatalf("preferred Capacity commit mismatch: got=%d want=%d", got, c.cfg.ChunkSize)
+	}
+}
+
 // Exercise the actual DATA writer rather than only stream.Buffer's borrow API.
 // This covers full-frame headroom, sliced/reinjected fallback, header identity,
 // child write errors and headroom-release on failure.
