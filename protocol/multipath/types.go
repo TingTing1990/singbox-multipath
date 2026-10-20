@@ -173,6 +173,7 @@ type mpLeg struct {
 	startupFeedback               *wireFrame
 	path                          stream.Path
 	busy                          bool
+	penaltyUntil                  time.Time // D2-B server normal-DATA penalty following early repair; stateMu
 	received                      stream.Receipt
 	inflight                      atomic.Int64
 	prepaidFlights                int

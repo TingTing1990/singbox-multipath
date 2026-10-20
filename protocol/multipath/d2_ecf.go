@@ -59,6 +59,15 @@ func (c *mpCore) chooseB10ECFLocked(length int, now time.Time, trace *D.Decision
 			}
 			continue
 		}
+		// Beta10 opportunistic repair stops only NEW normal booster DATA for
+		// one path RTT. It never blocks existing flights, emergency recovery,
+		// or original repair, and is not active on upload/inactive cores.
+		if leg.id == 1 && leg.penaltyUntil.After(now) {
+			if trace != nil {
+				trace.Paths[leg.id].Excluded = "d2_opportunistic_repair_penalty"
+			}
+			continue
+		}
 		if leg.id == 1 && (!leg.ready.Load() || c.peerPressure || !c.memory.boosterAllowed()) {
 			if trace != nil {
 				trace.Paths[leg.id].Excluded = "activation_ready_peer_or_memory"

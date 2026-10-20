@@ -65,10 +65,23 @@ func (c *mpCore) pumpLoop() {
 			if leg.path.Outstanding() != 0 {
 				wait = min(wait, 50*time.Millisecond)
 			}
+			if c.cfg.ServerDownload && c.active.Load() && leg.penaltyUntil.After(now) {
+				wait = min(wait, leg.penaltyUntil.Sub(now))
+			}
 		}
 		var pumpErr error
 		for attempts := 0; attempts < 2; attempts++ {
 			if sent, err := c.reinjectLocked(now); err != nil {
+				pumpErr = err
+				break
+			} else if sent {
+				continue
+			}
+			// After all Golden due repairs, Beta10 may resend a genuinely
+			// blocked connection head BEFORE its booster becomes RTO-stale.
+			// Research scope is server active download only; original
+			// recovery/repair remains the first and only due-repair owner.
+			if sent, err := c.d2OpportunisticLocked(now); err != nil {
 				pumpErr = err
 				break
 			} else if sent {

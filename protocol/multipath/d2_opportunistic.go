@@ -1,0 +1,103 @@
+package multipath
+
+import (
+	"time"
+)
+
+// d2OpportunisticLocked is scoped to activated server normal downloads.
+// It adapts multipath-beta10 scheduler.opportunisticLocked without changing
+// Golden's authoritative stale/lost/pruned repair, sender ACK, framing or
+// original Capacity reservation. Caller holds stateMu; at most one repair is
+// submitted per invocation and the original mapping remains on leg1.
+//
+// Only genuinely blocked connection heads may be repaired early. This does
+// not treat a path receipt as a logical ACK and does not reclaim a buffer.
+func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
+	if !c.cfg.ServerDownload || !c.active.Load() || c.mappingHead >= len(c.mappings) {
+		return false, nil
+	}
+	if c.cfg.Recovery != nil && (!c.cfg.Recovery.allows(0) || !c.cfg.Recovery.allows(1)) {
+		return false, nil
+	}
+	chunk := uint64(c.cfg.ChunkSize)
+	if chunk == 0 {
+		return false, nil
+	}
+	windowBlocked := c.tx.WriteNext > c.tx.Next && c.tx.Next >= c.tx.WindowEnd
+	historyLimit := uint64(max(c.cfg.ReplayBytes, int64(c.cfg.ChunkSize)))
+	historyBlocked := c.tx.Buffered() >= historyLimit || chunk > historyLimit-c.tx.Buffered()
+	head := &c.mappings[c.mappingHead]
+	if head.path != 1 || head.seq > c.tx.Una || head.end <= c.tx.Una {
+		return false, nil
+	}
+	slow, fast := c.getLeg(1), c.getLeg(0)
+	if slow == nil || fast == nil || slow.path.Generation != head.generation || head.pathEnd <= slow.path.Received {
+		return false, nil
+	}
+	// Beta10's opportunistic repair uses a measured-RTT cooldown, not a
+	// permanent ban after the first physical copy. A missing Data ACK may
+	// otherwise strand the connection head even after that copy is lost.
+	if !head.repairedAt.IsZero() && now.Sub(head.repairedAt) < fast.path.SRTT {
+		return false, nil
+	}
+	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 {
+		return false, nil
+	}
+	// Golden's receiver WindowEnd never shrinks: the original Beta10
+	// window/history-only trigger can remain false throughout an R2 HOL
+	// episode. A head whose logical ACK has not advanced for a full
+	// measured RTT is also blocked, but still needs the independent
+	// delivery-time comparison below (no RTT-only repair).
+	headBlocked := head.seq <= c.tx.Una && now.Sub(head.sentAt) >= max(slow.path.SRTT, fast.path.SRTT)
+	if !windowBlocked && !historyBlocked && !headBlocked {
+		return false, nil
+	}
+	// A blocked receive window alone does not justify replaying a newly
+	// dispatched healthy booster DATA frame. Wait at least a measured RTT
+	// before using the upstream ECF/remaining-delivery comparison.
+	if now.Sub(head.sentAt) < max(slow.path.SRTT, fast.path.SRTT) {
+		return false, nil
+	}
+	length := head.end - max(head.seq, c.tx.Una)
+	if length == 0 || length > chunk {
+		return false, nil
+	}
+	initial := min(uint64(c.cfg.QueueBytes), chunk*4)
+	pipeline := fast.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
+	outstanding := fast.path.Outstanding()
+	if outstanding > pipeline || length > pipeline-outstanding {
+		return false, nil
+	}
+	// As in Beta10, distinguish ordinary RTT skew from a head which
+	// has made no physical progress for a full RTT. A fresh send is not
+	// repaired solely because it was placed on the slower path.
+	stuck := now.Sub(slow.path.LastProgress) >= max(slow.path.SRTT, 2*fast.path.SRTT)
+	provisionalRate, provisionalDelay := c.beta10ProvisionalLocked()
+	fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
+	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
+	// Even after a missing progress sample, do not replay a head for
+	// which its original physical path has the earlier delivery estimate.
+	if !(fastArrival+0.002 < slowArrival) {
+		return false, nil
+	}
+	segment, ok := c.tx.Range(max(head.seq, c.tx.Una), int(length))
+	if !ok {
+		return false, nil
+	}
+	// This is original submitLocked repair ownership, never a new logical
+	// first transmission. A failing submit remains a normal fatal error.
+	if err := c.submitLocked(fast, segment, true, now); err != nil {
+		return false, err
+	}
+	head.repairedAt = now
+	// Beta10's RTT-based penalty follows EARLY repair rather than waiting
+	// for the RTO/stale event (where the old D2-R1 penalty was ineffective).
+	penalty := slow.path.SRTT
+	if !stuck && slow.path.MinimumRTT > 0 {
+		penalty = slow.path.MinimumRTT
+	}
+	slow.penaltyUntil = now.Add(penalty)
+	c.fallbackB.Add(uint64(segment.Length))
+	c.fallbackF.Add(1)
+	return true, nil
+}
