@@ -66,10 +66,10 @@ index 711cfbd..a3250c6 100644
  		c.stateMu.Lock()
 diff --git a/protocol/multipath/d2_ecf.go b/protocol/multipath/d2_ecf.go
 new file mode 100644
-index 0000000..32a6a3d
+index 0000000..c82e783
 --- /dev/null
 +++ b/protocol/multipath/d2_ecf.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,165 @@
 +package multipath
 +
 +import (
@@ -128,6 +128,15 @@ index 0000000..32a6a3d
 +		if leg.path.Stale {
 +			if trace != nil {
 +				trace.Paths[leg.id].Excluded = "stale"
++			}
++			continue
++		}
++		// Beta10 opportunistic repair stops only NEW normal booster DATA for
++		// one path RTT. It never blocks existing flights, emergency recovery,
++		// or original repair, and is not active on upload/inactive cores.
++		if leg.id == 1 && leg.penaltyUntil.After(now) {
++			if trace != nil {
++				trace.Paths[leg.id].Excluded = "d2_opportunistic_repair_penalty"
 +			}
 +			continue
 +		}
@@ -515,6 +524,301 @@ index 0000000..c9875bc
 +	}
 +	buf.Release()
 +}
+diff --git a/protocol/multipath/d2_opportunistic.go b/protocol/multipath/d2_opportunistic.go
+new file mode 100644
+index 0000000..04e5a05
+--- /dev/null
++++ b/protocol/multipath/d2_opportunistic.go
+@@ -0,0 +1,103 @@
++package multipath
++
++import (
++	"time"
++)
++
++// d2OpportunisticLocked is scoped to activated server normal downloads.
++// It adapts multipath-beta10 scheduler.opportunisticLocked without changing
++// Golden's authoritative stale/lost/pruned repair, sender ACK, framing or
++// original Capacity reservation. Caller holds stateMu; at most one repair is
++// submitted per invocation and the original mapping remains on leg1.
++//
++// Only genuinely blocked connection heads may be repaired early. This does
++// not treat a path receipt as a logical ACK and does not reclaim a buffer.
++func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
++	if !c.cfg.ServerDownload || !c.active.Load() || c.mappingHead >= len(c.mappings) {
++		return false, nil
++	}
++	if c.cfg.Recovery != nil && (!c.cfg.Recovery.allows(0) || !c.cfg.Recovery.allows(1)) {
++		return false, nil
++	}
++	chunk := uint64(c.cfg.ChunkSize)
++	if chunk == 0 {
++		return false, nil
++	}
++	windowBlocked := c.tx.WriteNext > c.tx.Next && c.tx.Next >= c.tx.WindowEnd
++	historyLimit := uint64(max(c.cfg.ReplayBytes, int64(c.cfg.ChunkSize)))
++	historyBlocked := c.tx.Buffered() >= historyLimit || chunk > historyLimit-c.tx.Buffered()
++	head := &c.mappings[c.mappingHead]
++	if head.path != 1 || head.seq > c.tx.Una || head.end <= c.tx.Una {
++		return false, nil
++	}
++	slow, fast := c.getLeg(1), c.getLeg(0)
++	if slow == nil || fast == nil || slow.path.Generation != head.generation || head.pathEnd <= slow.path.Received {
++		return false, nil
++	}
++	// Beta10's opportunistic repair uses a measured-RTT cooldown, not a
++	// permanent ban after the first physical copy. A missing Data ACK may
++	// otherwise strand the connection head even after that copy is lost.
++	if !head.repairedAt.IsZero() && now.Sub(head.repairedAt) < fast.path.SRTT {
++		return false, nil
++	}
++	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 {
++		return false, nil
++	}
++	// Golden's receiver WindowEnd never shrinks: the original Beta10
++	// window/history-only trigger can remain false throughout an R2 HOL
++	// episode. A head whose logical ACK has not advanced for a full
++	// measured RTT is also blocked, but still needs the independent
++	// delivery-time comparison below (no RTT-only repair).
++	headBlocked := head.seq <= c.tx.Una && now.Sub(head.sentAt) >= max(slow.path.SRTT, fast.path.SRTT)
++	if !windowBlocked && !historyBlocked && !headBlocked {
++		return false, nil
++	}
++	// A blocked receive window alone does not justify replaying a newly
++	// dispatched healthy booster DATA frame. Wait at least a measured RTT
++	// before using the upstream ECF/remaining-delivery comparison.
++	if now.Sub(head.sentAt) < max(slow.path.SRTT, fast.path.SRTT) {
++		return false, nil
++	}
++	length := head.end - max(head.seq, c.tx.Una)
++	if length == 0 || length > chunk {
++		return false, nil
++	}
++	initial := min(uint64(c.cfg.QueueBytes), chunk*4)
++	pipeline := fast.path.Pipeline(initial, uint64(c.cfg.ReplayBytes))
++	outstanding := fast.path.Outstanding()
++	if outstanding > pipeline || length > pipeline-outstanding {
++		return false, nil
++	}
++	// As in Beta10, distinguish ordinary RTT skew from a head which
++	// has made no physical progress for a full RTT. A fresh send is not
++	// repaired solely because it was placed on the slower path.
++	stuck := now.Sub(slow.path.LastProgress) >= max(slow.path.SRTT, 2*fast.path.SRTT)
++	provisionalRate, provisionalDelay := c.beta10ProvisionalLocked()
++	fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
++	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
++	// Even after a missing progress sample, do not replay a head for
++	// which its original physical path has the earlier delivery estimate.
++	if !(fastArrival+0.002 < slowArrival) {
++		return false, nil
++	}
++	segment, ok := c.tx.Range(max(head.seq, c.tx.Una), int(length))
++	if !ok {
++		return false, nil
++	}
++	// This is original submitLocked repair ownership, never a new logical
++	// first transmission. A failing submit remains a normal fatal error.
++	if err := c.submitLocked(fast, segment, true, now); err != nil {
++		return false, err
++	}
++	head.repairedAt = now
++	// Beta10's RTT-based penalty follows EARLY repair rather than waiting
++	// for the RTO/stale event (where the old D2-R1 penalty was ineffective).
++	penalty := slow.path.SRTT
++	if !stuck && slow.path.MinimumRTT > 0 {
++		penalty = slow.path.MinimumRTT
++	}
++	slow.penaltyUntil = now.Add(penalty)
++	c.fallbackB.Add(uint64(segment.Length))
++	c.fallbackF.Add(1)
++	return true, nil
++}
+diff --git a/protocol/multipath/d2_opportunistic_test.go b/protocol/multipath/d2_opportunistic_test.go
+new file mode 100644
+index 0000000..2e0ec52
+--- /dev/null
++++ b/protocol/multipath/d2_opportunistic_test.go
+@@ -0,0 +1,180 @@
++package multipath
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/protocol/multipath/stream"
++)
++
++// The original R2 pattern was a leg1 first transmission which continued to
++// make intermittent physical progress, postponing RTO-stale repair while
++// delaying the connection head. Compare the pre-repair Golden branch (not
++// stale) and the actual new core function on the same live sender/Path state.
++func d2EarlyRepairFixture(t *testing.T, now time.Time, preferredRate, boosterRate float64, sentAge time.Duration) (*mpCore, *mpLeg, *mpLeg) {
++	t.Helper()
++	c, preferred, booster := d2ECFTestCore()
++	c.cfg.ServerDownload = true
++	c.tx = stream.NewSender(uint64(c.cfg.ChunkSize))
++	chunk := c.cfg.ChunkSize
++	for i := 0; i < 2; i++ {
++		if err := c.tx.Append(stream.NewBuffer(make([]byte, chunk), nil)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	head, ok := c.tx.NextRange(chunk)
++	if !ok {
++		t.Fatal("missing connection head")
++	}
++	if err := c.tx.Sent(head); err != nil {
++		t.Fatal(err)
++	}
++	preferred.send = make(chan wireFrame, 1)
++	booster.send = make(chan wireFrame, 1)
++	preferred.path.Rate, booster.path.Rate = preferredRate, boosterRate
++	preferred.path.SRTT = 65 * time.Millisecond
++	preferred.path.MinimumRTT = 65 * time.Millisecond
++	booster.path.SRTT = 110 * time.Millisecond
++	booster.path.MinimumRTT = 110 * time.Millisecond
++	booster.path.LastProgress = now.Add(-sentAge)
++	pathSeq, err := booster.path.Submitted(chunk, now.Add(-sentAge))
++	if err != nil {
++		t.Fatal(err)
++	}
++	c.mappings = []dataMapping{{seq: head.Seq, end: head.End(), path: 1, generation: booster.path.Generation, pathEnd: pathSeq + uint64(chunk), sentAt: now.Add(-sentAge)}}
++	t.Cleanup(func() {
++		select {
++		case f := <-preferred.send:
++			f.buffer.Release()
++		default:
++		}
++		// No real writer is started in this isolated core. Return retained frames.
++		c.tx.Close()
++		preferred.path.Close()
++		booster.path.Close()
++	})
++	return c, preferred, booster
++}
++
++func TestD2EarlyRepairBeforeStaleAtBlockedLogicalHead(t *testing.T) {
++	now := time.Now()
++	c, preferred, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	if sent, err := c.reinjectLocked(now); err != nil || sent {
++		t.Fatalf("Golden repair must still wait for stale/loss: sent=%v err=%v", sent, err)
++	}
++	if booster.path.Stale {
++		t.Fatal("test needs non-stale physical leg1")
++	}
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
++		t.Fatalf("no early head repair: sent=%v err=%v", sent, err)
++	}
++	if preferred.path.Sent != uint64(c.cfg.ChunkSize) {
++		t.Fatal("preferred did not receive one repair physical flight")
++	}
++	if c.tx.Next != uint64(c.cfg.ChunkSize) {
++		t.Fatal("repair advanced normal logical sequence")
++	}
++	if c.mappings[0].path != 1 || c.mappings[0].repairedAt.IsZero() {
++		t.Fatal("original leg1 mapping must be retained with cooldown")
++	}
++	if !booster.penaltyUntil.After(now) {
++		t.Fatal("successful early repair did not suppress new normal leg1")
++	}
++	if sent, err := c.d2OpportunisticLocked(now.Add(time.Millisecond)); err != nil || sent {
++		t.Fatal("duplicate repair within cooldown")
++	}
++}
++
++func TestD2EarlyRepairHealthyFastBoosterNotPenalized(t *testing.T) {
++	now := time.Now()
++	c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 75e6, 40*time.Millisecond)
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++		t.Fatalf("healthy fast booster incorrectly repaired: sent=%v err=%v", sent, err)
++	}
++	if !booster.penaltyUntil.IsZero() {
++		t.Fatal("healthy booster penalized")
++	}
++}
++
++func TestD2EarlyRepairScopeAndFreshHead(t *testing.T) {
++	now := time.Now()
++	for _, tc := range []struct {
++		name           string
++		server, active bool
++		age            time.Duration
++	}{
++		{"inactive", true, false, time.Second}, {"upload", false, true, time.Second}, {"fresh_head", true, true, 10 * time.Millisecond},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c, _, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, tc.age)
++			c.cfg.ServerDownload = tc.server
++			c.active.Store(tc.active)
++			if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++				t.Fatalf("out-of-scope repair sent=%v err=%v", sent, err)
++			}
++		})
++	}
++}
++
++func TestD2EarlyRepairNoRateSampleOrCompletedPhysicalHead(t *testing.T) {
++	now := time.Now()
++	t.Run("unknown_booster_rate", func(t *testing.T) {
++		c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 0, time.Second)
++		if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++			t.Fatalf("startup path repaired without delivery estimate: sent=%v err=%v", sent, err)
++		}
++		if !booster.penaltyUntil.IsZero() {
++			t.Fatal("startup booster penalized")
++		}
++	})
++	t.Run("head_already_path_confirmed", func(t *testing.T) {
++		c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, time.Second)
++		booster.path.Received = c.mappings[0].pathEnd
++		if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++			t.Fatalf("path-received bytes redundantly repaired: sent=%v err=%v", sent, err)
++		}
++	})
++}
++
++func TestD2EarlyRepairDoesNotConsumePreferredCapacityReservation(t *testing.T) {
++	now := time.Now()
++	c, _, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	controller := newPreferredCapacityController(60, time.Second, c.cfg.ChunkSize)
++	c.cfg.PreferredCapacity = controller
++	before := controller.snapshot().AssignedBytes
++	sent, err := c.d2OpportunisticLocked(now)
++	if err != nil || !sent {
++		t.Fatalf("expected physical early repair: sent=%v err=%v", sent, err)
++	}
++	if got := controller.snapshot().AssignedBytes; got != before {
++		t.Fatalf("repair incorrectly consumed normal preferred Capacity reservation: before=%d after=%d", before, got)
++	}
++}
++
++// Regression: an opportunistic repair is not a one-shot operation. If the
++// first preferred physical copy has not advanced the logical ACK, the
++// original unacknowledged head remains eligible after one preferred RTT.
++func TestD2EarlyRepairRetriesAfterMeasuredRTT(t *testing.T) {
++	now := time.Now()
++	c, preferred, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
++		t.Fatalf("first repair: sent=%v err=%v", sent, err)
++	}
++	f := <-preferred.send
++	f.buffer.Release() // Simulate completed transport write, but no Data ACK.
++	preferred.queuedBytes.Add(-int64(len(f.data)))
++	preferred.busy = false
++	before := preferred.path.Sent
++	if sent, err := c.d2OpportunisticLocked(now.Add(preferred.path.SRTT - time.Millisecond)); err != nil || sent {
++		t.Fatalf("premature retry within cooldown: sent=%v err=%v", sent, err)
++	}
++	if sent, err := c.d2OpportunisticLocked(now.Add(preferred.path.SRTT + time.Millisecond)); err != nil || !sent {
++		t.Fatalf("repair missing after RTT despite blocked head: sent=%v err=%v", sent, err)
++	}
++	if preferred.path.Sent != before+uint64(c.cfg.ChunkSize) {
++		t.Fatalf("retry physical flight not submitted: sent=%d before=%d", preferred.path.Sent, before)
++	}
++	if c.tx.Una != 0 || c.tx.Next != uint64(c.cfg.ChunkSize) {
++		t.Fatal("retry wrongly moved logical ACK or first-transmission cursor")
++	}
++}
 diff --git a/protocol/multipath/inbound.go b/protocol/multipath/inbound.go
 index 74a533d..c0efe4f 100644
 --- a/protocol/multipath/inbound.go
@@ -709,10 +1013,37 @@ index 0000000..f6bd244
 +	}
 +}
 diff --git a/protocol/multipath/scheduler.go b/protocol/multipath/scheduler.go
-index 8480c19..bcf375c 100644
+index 8480c19..5129a69 100644
 --- a/protocol/multipath/scheduler.go
 +++ b/protocol/multipath/scheduler.go
-@@ -88,7 +88,13 @@ func (c *mpCore) pumpLoop() {
+@@ -65,6 +65,9 @@ func (c *mpCore) pumpLoop() {
+ 			if leg.path.Outstanding() != 0 {
+ 				wait = min(wait, 50*time.Millisecond)
+ 			}
++			if c.cfg.ServerDownload && c.active.Load() && leg.penaltyUntil.After(now) {
++				wait = min(wait, leg.penaltyUntil.Sub(now))
++			}
+ 		}
+ 		var pumpErr error
+ 		for attempts := 0; attempts < 2; attempts++ {
+@@ -74,6 +77,16 @@ func (c *mpCore) pumpLoop() {
+ 			} else if sent {
+ 				continue
+ 			}
++			// After all Golden due repairs, Beta10 may resend a genuinely
++			// blocked connection head BEFORE its booster becomes RTO-stale.
++			// Research scope is server active download only; original
++			// recovery/repair remains the first and only due-repair owner.
++			if sent, err := c.d2OpportunisticLocked(now); err != nil {
++				pumpErr = err
++				break
++			} else if sent {
++				continue
++			}
+ 			segment, ok := c.tx.NextRange(c.cfg.ChunkSize)
+ 			if !ok {
+ 				if c.tx.Next < c.tx.WriteNext {
+@@ -88,7 +101,13 @@ func (c *mpCore) pumpLoop() {
  				if c.cfg.DownloadAudit != nil {
  					r := c.downloadRecord("WAIT")
  					r.decision = *selection.trace
@@ -727,7 +1058,7 @@ index 8480c19..bcf375c 100644
  					r.decision.Outcome = "waiting"
  					c.cfg.DownloadAudit.record(r)
  				}
-@@ -300,7 +306,14 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pa
+@@ -300,7 +319,14 @@ func (c *mpCore) choosePathForSubmitLocked(length int, now time.Time) (result pa
  		trace = &snapshot
  		observation = trace
  	}
@@ -832,7 +1163,7 @@ index 0000000..6ec4189
 +	}
 +}
 diff --git a/protocol/multipath/stream/path.go b/protocol/multipath/stream/path.go
-index f29cd76..1501850 100644
+index f29cd76..e5bb43a 100644
 --- a/protocol/multipath/stream/path.go
 +++ b/protocol/multipath/stream/path.go
 @@ -33,6 +33,7 @@ type Path struct {
@@ -853,7 +1184,39 @@ index f29cd76..1501850 100644
  			delta := rtt - p.SRTT
  			if delta < 0 {
  				delta = -delta
-@@ -186,3 +189,31 @@ func (p *Path) DrainTime(provisionalRate float64) float64 {
+@@ -174,6 +177,31 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
+ 	return maximum
+ }
+ 
++// RemainingDelivery is the Beta10 path-physical delivery estimate used by
++// the server-download opportunistic repair check. This is read-only: Golden
++// Rate, RTO, stale detection, receipts and record ownership are unchanged.
++// Source: WuSiYu/singbox-multipath multipath-beta10 stream/path.go.
++const d2InitialWindowBytes = 12 << 10
++
++func (p *Path) RemainingDelivery(pathEnd uint64, sentAt time.Time, provisionalDelay time.Duration, now time.Time) float64 {
++	if pathEnd <= p.Received {
++		return 0
++	}
++	remaining := float64(pathEnd - p.Received)
++	delay := p.MinimumRTT
++	if delay == 0 {
++		delay = max(p.SRTT, provisionalDelay)
++	}
++	if p.Rate <= 0 {
++		return math.Ceil(math.Log2(1+remaining/d2InitialWindowBytes))*delay.Seconds() + delay.Seconds()/2
++	}
++	observed := float64(0)
++	if p.recentRTT > 0 {
++		observed = max(0, (p.recentRTT - p.MinimumRTT/2).Seconds())
++	}
++	return max(remaining/p.Rate+delay.Seconds()/2, observed-now.Sub(sentAt).Seconds())
++}
++
+ // DrainTime mirrors the basis of Linux's default MPTCP scheduler: outstanding
+ // work divided by service rate. A measured peer rate replaces initial estimates.
+ func (p *Path) DrainTime(provisionalRate float64) float64 {
+@@ -186,3 +214,31 @@ func (p *Path) DrainTime(provisionalRate float64) float64 {
  	}
  	return float64(p.Outstanding()) / rate
  }
@@ -935,7 +1298,7 @@ index 017a578..32dcfb0 100644
  	if b.refs <= 0 {
  		panic("multipath: retaining released buffer")
 diff --git a/protocol/multipath/types.go b/protocol/multipath/types.go
-index a8cc9a6..f70cb58 100644
+index a8cc9a6..926ede1 100644
 --- a/protocol/multipath/types.go
 +++ b/protocol/multipath/types.go
 @@ -36,6 +36,7 @@ type coreConfig struct {
@@ -946,7 +1309,15 @@ index a8cc9a6..f70cb58 100644
  }
  
  type legFailureStage string
-@@ -240,44 +241,47 @@ type mpCore struct {
+@@ -172,6 +173,7 @@ type mpLeg struct {
+ 	startupFeedback               *wireFrame
+ 	path                          stream.Path
+ 	busy                          bool
++	penaltyUntil                  time.Time // D2-B server normal-DATA penalty following early repair; stateMu
+ 	received                      stream.Receipt
+ 	inflight                      atomic.Int64
+ 	prepaidFlights                int
+@@ -240,44 +242,47 @@ type mpCore struct {
  	replayTO                   atomic.Uint64
  	backpressE                 atomic.Uint64
  	backpressNS                atomic.Uint64
