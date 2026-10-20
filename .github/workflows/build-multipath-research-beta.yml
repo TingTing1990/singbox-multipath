@@ -85,11 +85,11 @@ jobs:
             'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
             'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
             'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
-            'protocol/multipath/scheduler.go':'909b8dfb00bf0318ec4da95cfb9685da0c5d3d8fa43f2d78648e4dc5f910f533',
-            'protocol/multipath/stream/path.go':'5206cd82bb3202afe95624a1fa1beb4d4d28ebc38ce646b08dc71d0e315e7129',
+            'protocol/multipath/scheduler.go':'85c5081ba9b606ef251849860756b176fed4416987ddf4d672ebc2fbc1321f25',
+            'protocol/multipath/stream/path.go':'c05cbfdea19616c908f03dfaf7a0fd5bedd726ce3000e8d649030450cc7e24c7',
             'protocol/multipath/stream/send.go':'55319d5d10544446c5c9dde2fca689df87e8a69ccfb3568d6b3786ca4bca0f5b',
             'protocol/multipath/transport.go':'6f950ab8b6df2c3fd988d6ff2423bb10ab5a8baed3c87d4d2b6aa28127d6aa8c',
-            'protocol/multipath/types.go':'2a8ff47c153e0072f63a4caae7ba21ca3ab908e58d0671c32bdd735e73ed4aa5',
+            'protocol/multipath/types.go':'af853ef6c09c7524c6dd46d05ac1a69db6639c8f939e67b33835e2185ebae6d9',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
             'protocol/multipath/f01_staged_ack_test.go':'6afeef726bad4179002866cebaf0556f4e6a30775de20f31b288d75ec22b9b5d',
@@ -129,12 +129,14 @@ jobs:
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
             'protocol/multipath/wire.go':'83001bd9eee88537fcec3714338585123cc35622bd8c6497f96d695c566929f9',
-            'protocol/multipath/d2_ecf.go':'78b6d7f6770a0ed032b57a8ceabd13b5a03f5dcdd48f00b67dc1c45668d4dcd3',
+            'protocol/multipath/d2_ecf.go':'86ae23fc3a062c514d4e3e8f566b55d0ef5a8a63d90a86d319ada3573341e729',
             'protocol/multipath/d2_ecf_test.go':'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
             'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'tools/research-b10-s1-d2.patch':'0a195fef4d08c5c6bcf0e120bbd1d15f8483a6641501622d20689d99ca7c5209',
-            'tools/verify-download-boundary.py':'9d756d52e5b13f70664e8284a57d6d1dfed73cc96eaacf5492ac9827ea2da3b5',
+            'protocol/multipath/d2_opportunistic.go':'3ddd93054f9c00b1825ed684c47a19d924f8272c54636cc82ffeaf50aeecf87d',
+            'protocol/multipath/d2_opportunistic_test.go':'3d32e2ed9ee87763ed784d3d65add0d1af4d78a63f749fbc688be86069ed335b',
+            'tools/research-b10-s1-d2.patch':'c83c720c51168a401704985fca0f22660b7c05b8a91ac04287ccd70025ddcb5c',
+            'tools/verify-download-boundary.py':'b5fad4c0674224bcb9d6284e0916f25f3f0cecaaeaf9f788a22428c2c9d0f5e3',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -217,19 +219,21 @@ jobs:
              'protocol/multipath/d2_ecf.go','protocol/multipath/d2_ecf_test.go',
              'protocol/multipath/research_b10_performance_test.go',
              'protocol/multipath/stream/headroom_s1_test.go',
+             'protocol/multipath/d2_opportunistic.go',
+             'protocol/multipath/d2_opportunistic_test.go',
              'tools/research-b10-s1-d2.patch'}
           F01={
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
-            'protocol/multipath/core.go':'50577e0b8a883aeaf9321798fe0971ec19609a19e0f38ba9c5e8a253839f8e18',
+            'protocol/multipath/core.go':'ed7a1681314c757cd69a714279d47fded4d5fc8f84243f0f55fe1fffe7fe2b56',
             'protocol/multipath/f01_memory_test.go':'e1c5106a67879f7ff043aba94de9d310c3e0687497894f5d74b2001dbfbc4a9b',
             'protocol/multipath/f01_retention_contract_test.go':'331426c6e4ad825c56bacc066412ced5dc4debfa4fab6fdb3e30af5f41f0eeed',
-            'protocol/multipath/scheduler.go':'0915d96d0a8a79f5815581513329e8c866bb9344ec1d25f570d12365518f30ca',
-            'protocol/multipath/stream/path.go':'940da47ac9427c4d7f9d9e45f1633d1126320dbe6ae31f53b10bc36ccda6c00f',
+            'protocol/multipath/scheduler.go':'85c5081ba9b606ef251849860756b176fed4416987ddf4d672ebc2fbc1321f25',
+            'protocol/multipath/stream/path.go':'c05cbfdea19616c908f03dfaf7a0fd5bedd726ce3000e8d649030450cc7e24c7',
             'protocol/multipath/stream/records.go':'b4f90337ff63bf6af531dada54aa5b508c6ba883334de290e73e96ed472f1903',
-            'protocol/multipath/stream/send.go':'9788e65272784f6bda9364c68043e12c81636a2a5d452fae6d76814dbbd9c489',
+            'protocol/multipath/stream/send.go':'55319d5d10544446c5c9dde2fca689df87e8a69ccfb3568d6b3786ca4bca0f5b',
             'protocol/multipath/transport.go':'141a760282dca81dbe516a2d8054ca0ec0bb05a00d6a6d4bed774336b2c10b57',
-            'protocol/multipath/types.go':'36816988d72ac672e438e41899becfd9abeb2457326de1a0de6b7ef55172349c'}
+            'protocol/multipath/types.go':'af853ef6c09c7524c6dd46d05ac1a69db6639c8f939e67b33835e2185ebae6d9'}
           FORBIDDEN=('pendingReclaim','reclaimIssued','reclaimCompleted','reclaimRunning','memoryIdleReclaimDelay',
                      'memoryScavenge','retireDetached','reclaimCutoff','waitReclaim','prepareReservedRelease',
                      'prepareRelease','NewManagedBuffer','debug.FreeOSMemory')
@@ -758,7 +762,7 @@ jobs:
           set -euo pipefail
           python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/research-candidate-reversal.log"
           CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF)' \
+            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF|TestD2EarlyRepair)' \
             ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/research-S1-D2-race-x10.log"
 
       - name: Research B10 actual server scope and Capacity V2 A/B performance
@@ -798,6 +802,7 @@ jobs:
             protocol/multipath/outbound.go protocol/multipath/scheduler.go protocol/multipath/stream/path.go
             protocol/multipath/stream/send.go protocol/multipath/transport.go protocol/multipath/types.go
             protocol/multipath/d2_ecf.go protocol/multipath/d2_ecf_test.go
+            protocol/multipath/d2_opportunistic.go protocol/multipath/d2_opportunistic_test.go
             protocol/multipath/stream/headroom_s1_test.go protocol/multipath/wire.go
             protocol/multipath/research_b10_performance_test.go
             protocol/multipath/f01_memory_test.go protocol/multipath/f01_retention_contract_test.go
@@ -848,8 +853,8 @@ jobs:
             set +e
             (
               cd "$tree"
+              # Race is covered by independent steps; do not distort throughput.
               CGO_ENABLED=1 go test \
-                -race \
                 -count=1 \
                 -timeout=5m \
                 -v \
