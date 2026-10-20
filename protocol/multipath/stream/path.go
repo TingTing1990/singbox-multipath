@@ -177,6 +177,31 @@ func (p *Path) Pipeline(initial, maximum uint64) uint64 {
 	return maximum
 }
 
+// RemainingDelivery is the Beta10 path-physical delivery estimate used by
+// the server-download opportunistic repair check. This is read-only: Golden
+// Rate, RTO, stale detection, receipts and record ownership are unchanged.
+// Source: WuSiYu/singbox-multipath multipath-beta10 stream/path.go.
+const d2InitialWindowBytes = 12 << 10
+
+func (p *Path) RemainingDelivery(pathEnd uint64, sentAt time.Time, provisionalDelay time.Duration, now time.Time) float64 {
+	if pathEnd <= p.Received {
+		return 0
+	}
+	remaining := float64(pathEnd - p.Received)
+	delay := p.MinimumRTT
+	if delay == 0 {
+		delay = max(p.SRTT, provisionalDelay)
+	}
+	if p.Rate <= 0 {
+		return math.Ceil(math.Log2(1+remaining/d2InitialWindowBytes))*delay.Seconds() + delay.Seconds()/2
+	}
+	observed := float64(0)
+	if p.recentRTT > 0 {
+		observed = max(0, (p.recentRTT - p.MinimumRTT/2).Seconds())
+	}
+	return max(remaining/p.Rate+delay.Seconds()/2, observed-now.Sub(sentAt).Seconds())
+}
+
 // DrainTime mirrors the basis of Linux's default MPTCP scheduler: outstanding
 // work divided by service rate. A measured peer rate replaces initial estimates.
 func (p *Path) DrainTime(provisionalRate float64) float64 {
