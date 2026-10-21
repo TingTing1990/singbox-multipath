@@ -864,16 +864,20 @@ jobs:
             ) 2>&1 | tee "$log"
             local rc=${PIPESTATUS[0]}
             set -e
+            # Preserve all four process results and run all paired measurements.
+            # A Golden historical beta3 assertion may fail before the repaired
+            # candidate is measured. It remains a HARD failure at the final gate.
+            printf '%s\n' "$rc" > "$LOG_DIR/${label}-${run_id}.rc"
             echo "${label}_run_${run_id}_go_test_rc=${rc}"
             if (( rc != 0 )); then
-              echo "FAIL ${label} run ${run_id}: go test exited ${rc}" >&2
-              return "$rc"
+              echo "RECORDED ${label} run ${run_id}: go test exited ${rc}; continue collecting A/B evidence" >&2
             fi
           }
           run_perf "$PARENT_DIR" golden 1
           run_perf "$GITHUB_WORKSPACE" repaired 1
           run_perf "$PARENT_DIR" golden 2
           run_perf "$GITHUB_WORKSPACE" repaired 2
+          cp -a "$LOG_DIR" "${EVIDENCE_DIR}/zero-field-performance"
           python3 - "$LOG_DIR" <<'PY'
           from pathlib import Path
           import re, statistics, sys
@@ -889,24 +893,44 @@ jobs:
               'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
           )
           diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
+          status_re=re.compile(r'^\s*--- (PASS|FAIL): TestPerformanceHealthyLinks/(.+?) \(')
           def parse(p):
               text=p.read_text(encoding='utf-8',errors='replace')
               for x in forbidden:
                   if x in text: raise SystemExit(f'FAIL {p.name}: unsafe fixture result: {x}')
-              cur=None; values={}
+              cur=None; values={}; statuses={}; regressions=set()
               for line in text.splitlines():
                   d=diagnostic_re.search(line)
                   if d:
                       msg=d.group(1)
+                      if msg.startswith('throughput regression:') and cur: regressions.add(cur)
                       if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
                           raise SystemExit(f'FAIL {p.name}: unexpected performance diagnostic: {msg}')
+                  status=status_re.search(line)
+                  if status:
+                      case=status.group(2)
+                      if case in statuses: raise SystemExit(f'FAIL {p.name}: duplicate test status {case}')
+                      statuses[case]=status.group(1)
                   m=run_re.search(line)
                   if m: cur=m.group(1); continue
                   m=rate_re.search(line)
                   if m and cur: values[cur]=float(m.group(1))
               missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
               if missing or extra: raise SystemExit(f'FAIL {p.name}: missing={missing} extra={extra}')
+              if set(statuses)!=set(expected): raise SystemExit(f'FAIL {p.name}: incomplete test statuses')
+              failed_cases={case for case,state in statuses.items() if state=='FAIL'}
+              if failed_cases != regressions: raise SystemExit(f'FAIL {p.name}: unexplained/missing failed subtests {failed_cases ^ regressions}')
               return values
+          # A nonzero go test exit is never waived, even when every fixture
+          # emitted a throughput number. Preserve historical beta3 assertion.
+          results={}
+          for label in ('golden','repaired'):
+              for run_id in (1,2):
+                  rc_path=d/f'{label}-{run_id}.rc'
+                  rc_text=rc_path.read_text(encoding='ascii').strip()
+                  if not rc_text.isdecimal():
+                      raise SystemExit(f'FAIL invalid test exit status {rc_path.name}: {rc_text!r}')
+                  results[(label,run_id)]=int(rc_text)
           samples={k:[parse(d/f'{k}-1.log'),parse(d/f'{k}-2.log')] for k in ('golden','repaired')}
           failed=False
           for case in expected:
@@ -914,8 +938,19 @@ jobs:
               ratio=statistics.median(rv)/statistics.median(gv)
               print(f'{case}: golden={gv} repaired={rv} ratio={ratio:.4f}')
               failed |= ratio < 0.98
-          if failed: raise SystemExit('FAIL repaired zero-field performance below 98% Golden')
-          print('PASS repaired retains >=98% Golden performance for all fixtures')
+          # Do not replace either independent gate with the other: the
+          # historical absolute beta3 test and paired relative test both apply.
+          for label in ('golden','repaired'):
+              for run_id in (1,2):
+                  print(f'{label} run {run_id}: go_test_rc={results[(label,run_id)]}')
+          if failed:
+              print('FAIL repaired zero-field performance below 98% Golden')
+          nonzero={f'{k}-{n}':rc for (k,n),rc in results.items() if rc != 0}
+          if nonzero:
+              print(f'FAIL historical absolute performance / go test process status: {nonzero}')
+          if failed or nonzero:
+              raise SystemExit('FAIL zero-field performance gate: all measured; absolute and relative thresholds enforced')
+          print('PASS historical absolute tests AND repaired retains >=98% Golden performance for all fixtures')
           PY
 
       - name: Remove runner-only V3 FIELD replay fixtures
