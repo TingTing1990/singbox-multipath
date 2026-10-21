@@ -1,6 +1,7 @@
 package multipath
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -176,5 +177,78 @@ func TestD2EarlyRepairRetriesAfterMeasuredRTT(t *testing.T) {
 	}
 	if c.tx.Una != 0 || c.tx.Next != uint64(c.cfg.ChunkSize) {
 		t.Fatal("retry wrongly moved logical ACK or first-transmission cursor")
+	}
+}
+
+// Source-semantic regression: the real Beta10 stuck branch must not be
+// overridden by an unrealistically high rate learned before a long stall.
+func TestD2EarlyRepairStuckDespiteOldOptimisticRate(t *testing.T) {
+	now := time.Now()
+	c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 500e6, 400*time.Millisecond)
+	booster.path.MinimumRTT = 5 * time.Millisecond
+	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
+		t.Fatalf("stuck head with old optimistic rate was not repaired: sent=%v err=%v", sent, err)
+	}
+}
+
+func TestD2EarlyRepairRejectsNonFiniteRate(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name       string
+		fast, slow float64
+	}{
+		{"preferred_nan", math.NaN(), 200_000},
+		{"preferred_inf", math.Inf(1), 200_000},
+		{"booster_nan", 20e6, math.NaN()},
+		{"booster_inf", 20e6, math.Inf(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, booster := d2EarlyRepairFixture(t, now, tc.fast, tc.slow, time.Second)
+			if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
+				t.Fatalf("invalid Rate allowed speculative repair: sent=%v err=%v", sent, err)
+			}
+			if !booster.penaltyUntil.IsZero() {
+				t.Fatal("invalid Rate penalized a booster")
+			}
+		})
+	}
+}
+
+// A physically confirmed speculative copy must not be sent again solely
+// because the connection-level ordered Data ACK is delayed.
+func TestD2EarlyRepairPhysicalReceiptDefersDuplicateUntilRTO(t *testing.T) {
+	now := time.Now()
+	c, preferred, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
+	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
+		t.Fatalf("first repair: sent=%v err=%v", sent, err)
+	}
+	frame := <-preferred.send
+	frame.buffer.Release()
+	preferred.queuedBytes.Add(-int64(len(frame.data)))
+	preferred.busy = false
+	originalEnd := preferred.path.Sent
+	if c.mappings[0].repairGeneration != preferred.path.Generation || c.mappings[0].repairPathEnd != originalEnd {
+		t.Fatal("speculative physical flight identity not retained")
+	}
+	preferred.path.Received = originalEnd // path receipt, not Data ACK
+	if sent, err := c.d2OpportunisticLocked(now.Add(preferred.path.SRTT + time.Millisecond)); err != nil || sent {
+		t.Fatalf("physically confirmed repair duplicated before RTO: sent=%v err=%v", sent, err)
+	}
+	if preferred.path.Sent != originalEnd || c.tx.Una != 0 {
+		t.Fatal("path receipt changed logical ACK or submitted an extra repair")
+	}
+}
+
+// No observed sender pressure means the upstream opportunistic trigger is
+// closed, even if the logical head is old and the weak path has stopped.
+func TestD2EarlyRepairDoesNotSpeculateWithoutSenderPressure(t *testing.T) {
+	now := time.Now()
+	c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, time.Second)
+	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+	if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
+		t.Fatalf("unblocked sender unexpectedly repaired: sent=%v err=%v", sent, err)
+	}
+	if !booster.penaltyUntil.IsZero() {
+		t.Fatal("unblocked sender spuriously penalized booster")
 	}
 }

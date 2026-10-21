@@ -518,6 +518,9 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
 		mapping.path, mapping.generation = target.id, target.path.Generation
 		mapping.pathEnd = target.path.Sent
 		mapping.sentAt, mapping.repairedAt = now, now
+		// The authoritative stale/lost/pruned reinjection changes mapping
+		// ownership. A prior speculative repair identity must not survive it.
+		mapping.repairGeneration, mapping.repairPathEnd = 0, 0
 		c.fallbackB.Add(uint64(segment.Length))
 		c.fallbackF.Add(1)
 		c.fallbackE.Add(1)

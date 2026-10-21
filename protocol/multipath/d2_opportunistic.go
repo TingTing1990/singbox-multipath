@@ -1,6 +1,7 @@
 package multipath
 
 import (
+	"math"
 	"time"
 )
 
@@ -37,19 +38,28 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 	// Beta10's opportunistic repair uses a measured-RTT cooldown, not a
 	// permanent ban after the first physical copy. A missing Data ACK may
 	// otherwise strand the connection head even after that copy is lost.
-	if !head.repairedAt.IsZero() && now.Sub(head.repairedAt) < fast.path.SRTT {
+	if !head.repairedAt.IsZero() {
+		// A physically acknowledged repair can still be waiting for ordered
+		// Data ACK. Do not duplicate it after only one RTT. Preserve original
+		// RTO recovery if that ACK never arrives.
+		if head.repairPathEnd != 0 && head.repairGeneration == fast.path.Generation &&
+			fast.path.Received >= head.repairPathEnd &&
+			now.Sub(head.repairedAt) < fast.path.RTO(c.cfg.ReplayTimeout) {
+			return false, nil
+		}
+		if now.Sub(head.repairedAt) < fast.path.SRTT {
+			return false, nil
+		}
+	}
+	// A missing or non-finite delivery sample cannot justify speculative
+	// retransmission, even if the old path has made no progress.
+	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 ||
+		math.IsNaN(fast.path.Rate) || math.IsInf(fast.path.Rate, 0) || math.IsNaN(slow.path.Rate) || math.IsInf(slow.path.Rate, 0) || slow.path.LastProgress.IsZero() {
 		return false, nil
 	}
-	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 {
-		return false, nil
-	}
-	// Golden's receiver WindowEnd never shrinks: the original Beta10
-	// window/history-only trigger can remain false throughout an R2 HOL
-	// episode. A head whose logical ACK has not advanced for a full
-	// measured RTT is also blocked, but still needs the independent
-	// delivery-time comparison below (no RTT-only repair).
-	headBlocked := head.seq <= c.tx.Una && now.Sub(head.sentAt) >= max(slow.path.SRTT, fast.path.SRTT)
-	if !windowBlocked && !historyBlocked && !headBlocked {
+	// Preserve upstream pressure gating: age or lack of path progress
+	// alone cannot authorize speculative repair of an unblocked sender.
+	if !windowBlocked && !historyBlocked {
 		return false, nil
 	}
 	// A blocked receive window alone does not justify replaying a newly
@@ -75,9 +85,15 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 	provisionalRate, provisionalDelay := c.beta10ProvisionalLocked()
 	fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
 	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
-	// Even after a missing progress sample, do not replay a head for
-	// which its original physical path has the earlier delivery estimate.
-	if !(fastArrival+0.002 < slowArrival) {
+	// Beta10 allows a head with no physical progress for a measured RTT
+	// to be repaired despite an optimistic stale Rate estimate. The other
+	// path must still be eligible, the head old enough, and the sender
+	// blocked. Do not accept NaN/Inf estimates as proof of a late arrival.
+	if math.IsNaN(fastArrival) || math.IsInf(fastArrival, 0) || math.IsNaN(slowArrival) || math.IsInf(slowArrival, 0) {
+		return false, nil
+	}
+	late := fastArrival+0.002 < slowArrival
+	if !late && !stuck {
 		return false, nil
 	}
 	segment, ok := c.tx.Range(max(head.seq, c.tx.Una), int(length))
@@ -90,6 +106,8 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 		return false, err
 	}
 	head.repairedAt = now
+	head.repairGeneration = fast.path.Generation
+	head.repairPathEnd = fast.path.Sent
 	// Beta10's RTT-based penalty follows EARLY repair rather than waiting
 	// for the RTO/stale event (where the old D2-R1 penalty was ineffective).
 	penalty := slow.path.SRTT

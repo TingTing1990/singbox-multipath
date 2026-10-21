@@ -291,6 +291,10 @@ type dataMapping struct {
 	generation, pathEnd uint64
 	sentAt              time.Time
 	repairedAt          time.Time
+	// Identity of the most recent speculative leg0 physical copy. Unlike
+	// data ACK, path receipt proves only that the copy reached that leg.
+	repairGeneration uint64
+	repairPathEnd    uint64
 }
 
 func (l *mpLeg) Done() <-chan struct{} {
