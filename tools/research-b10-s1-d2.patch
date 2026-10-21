@@ -526,13 +526,14 @@ index 0000000..c9875bc
 +}
 diff --git a/protocol/multipath/d2_opportunistic.go b/protocol/multipath/d2_opportunistic.go
 new file mode 100644
-index 0000000..04e5a05
+index 0000000..0fa9b86
 --- /dev/null
 +++ b/protocol/multipath/d2_opportunistic.go
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,121 @@
 +package multipath
 +
 +import (
++	"math"
 +	"time"
 +)
 +
@@ -569,19 +570,28 @@ index 0000000..04e5a05
 +	// Beta10's opportunistic repair uses a measured-RTT cooldown, not a
 +	// permanent ban after the first physical copy. A missing Data ACK may
 +	// otherwise strand the connection head even after that copy is lost.
-+	if !head.repairedAt.IsZero() && now.Sub(head.repairedAt) < fast.path.SRTT {
++	if !head.repairedAt.IsZero() {
++		// A physically acknowledged repair can still be waiting for ordered
++		// Data ACK. Do not duplicate it after only one RTT. Preserve original
++		// RTO recovery if that ACK never arrives.
++		if head.repairPathEnd != 0 && head.repairGeneration == fast.path.Generation &&
++			fast.path.Received >= head.repairPathEnd &&
++			now.Sub(head.repairedAt) < fast.path.RTO(c.cfg.ReplayTimeout) {
++			return false, nil
++		}
++		if now.Sub(head.repairedAt) < fast.path.SRTT {
++			return false, nil
++		}
++	}
++	// A missing or non-finite delivery sample cannot justify speculative
++	// retransmission, even if the old path has made no progress.
++	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 ||
++		math.IsNaN(fast.path.Rate) || math.IsInf(fast.path.Rate, 0) || math.IsNaN(slow.path.Rate) || math.IsInf(slow.path.Rate, 0) || slow.path.LastProgress.IsZero() {
 +		return false, nil
 +	}
-+	if fast.busy || !fast.ready.Load() || fast.path.Stale || slow.path.Stale || fast.path.SRTT <= 0 || slow.path.SRTT <= 0 || fast.path.Rate <= 0 || slow.path.Rate <= 0 {
-+		return false, nil
-+	}
-+	// Golden's receiver WindowEnd never shrinks: the original Beta10
-+	// window/history-only trigger can remain false throughout an R2 HOL
-+	// episode. A head whose logical ACK has not advanced for a full
-+	// measured RTT is also blocked, but still needs the independent
-+	// delivery-time comparison below (no RTT-only repair).
-+	headBlocked := head.seq <= c.tx.Una && now.Sub(head.sentAt) >= max(slow.path.SRTT, fast.path.SRTT)
-+	if !windowBlocked && !historyBlocked && !headBlocked {
++	// Preserve upstream pressure gating: age or lack of path progress
++	// alone cannot authorize speculative repair of an unblocked sender.
++	if !windowBlocked && !historyBlocked {
 +		return false, nil
 +	}
 +	// A blocked receive window alone does not justify replaying a newly
@@ -607,9 +617,15 @@ index 0000000..04e5a05
 +	provisionalRate, provisionalDelay := c.beta10ProvisionalLocked()
 +	fastArrival := fast.path.CompletionTime(int(length), provisionalRate, provisionalDelay, now)
 +	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
-+	// Even after a missing progress sample, do not replay a head for
-+	// which its original physical path has the earlier delivery estimate.
-+	if !(fastArrival+0.002 < slowArrival) {
++	// Beta10 allows a head with no physical progress for a measured RTT
++	// to be repaired despite an optimistic stale Rate estimate. The other
++	// path must still be eligible, the head old enough, and the sender
++	// blocked. Do not accept NaN/Inf estimates as proof of a late arrival.
++	if math.IsNaN(fastArrival) || math.IsInf(fastArrival, 0) || math.IsNaN(slowArrival) || math.IsInf(slowArrival, 0) {
++		return false, nil
++	}
++	late := fastArrival+0.002 < slowArrival
++	if !late && !stuck {
 +		return false, nil
 +	}
 +	segment, ok := c.tx.Range(max(head.seq, c.tx.Una), int(length))
@@ -622,6 +638,8 @@ index 0000000..04e5a05
 +		return false, err
 +	}
 +	head.repairedAt = now
++	head.repairGeneration = fast.path.Generation
++	head.repairPathEnd = fast.path.Sent
 +	// Beta10's RTT-based penalty follows EARLY repair rather than waiting
 +	// for the RTO/stale event (where the old D2-R1 penalty was ineffective).
 +	penalty := slow.path.SRTT
@@ -635,13 +653,14 @@ index 0000000..04e5a05
 +}
 diff --git a/protocol/multipath/d2_opportunistic_test.go b/protocol/multipath/d2_opportunistic_test.go
 new file mode 100644
-index 0000000..2e0ec52
+index 0000000..d820fcd
 --- /dev/null
 +++ b/protocol/multipath/d2_opportunistic_test.go
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,254 @@
 +package multipath
 +
 +import (
++	"math"
 +	"testing"
 +	"time"
 +
@@ -817,6 +836,79 @@ index 0000000..2e0ec52
 +	}
 +	if c.tx.Una != 0 || c.tx.Next != uint64(c.cfg.ChunkSize) {
 +		t.Fatal("retry wrongly moved logical ACK or first-transmission cursor")
++	}
++}
++
++// Source-semantic regression: the real Beta10 stuck branch must not be
++// overridden by an unrealistically high rate learned before a long stall.
++func TestD2EarlyRepairStuckDespiteOldOptimisticRate(t *testing.T) {
++	now := time.Now()
++	c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 500e6, 400*time.Millisecond)
++	booster.path.MinimumRTT = 5 * time.Millisecond
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
++		t.Fatalf("stuck head with old optimistic rate was not repaired: sent=%v err=%v", sent, err)
++	}
++}
++
++func TestD2EarlyRepairRejectsNonFiniteRate(t *testing.T) {
++	now := time.Now()
++	for _, tc := range []struct {
++		name       string
++		fast, slow float64
++	}{
++		{"preferred_nan", math.NaN(), 200_000},
++		{"preferred_inf", math.Inf(1), 200_000},
++		{"booster_nan", 20e6, math.NaN()},
++		{"booster_inf", 20e6, math.Inf(1)},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c, _, booster := d2EarlyRepairFixture(t, now, tc.fast, tc.slow, time.Second)
++			if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++				t.Fatalf("invalid Rate allowed speculative repair: sent=%v err=%v", sent, err)
++			}
++			if !booster.penaltyUntil.IsZero() {
++				t.Fatal("invalid Rate penalized a booster")
++			}
++		})
++	}
++}
++
++// A physically confirmed speculative copy must not be sent again solely
++// because the connection-level ordered Data ACK is delayed.
++func TestD2EarlyRepairPhysicalReceiptDefersDuplicateUntilRTO(t *testing.T) {
++	now := time.Now()
++	c, preferred, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || !sent {
++		t.Fatalf("first repair: sent=%v err=%v", sent, err)
++	}
++	frame := <-preferred.send
++	frame.buffer.Release()
++	preferred.queuedBytes.Add(-int64(len(frame.data)))
++	preferred.busy = false
++	originalEnd := preferred.path.Sent
++	if c.mappings[0].repairGeneration != preferred.path.Generation || c.mappings[0].repairPathEnd != originalEnd {
++		t.Fatal("speculative physical flight identity not retained")
++	}
++	preferred.path.Received = originalEnd // path receipt, not Data ACK
++	if sent, err := c.d2OpportunisticLocked(now.Add(preferred.path.SRTT + time.Millisecond)); err != nil || sent {
++		t.Fatalf("physically confirmed repair duplicated before RTO: sent=%v err=%v", sent, err)
++	}
++	if preferred.path.Sent != originalEnd || c.tx.Una != 0 {
++		t.Fatal("path receipt changed logical ACK or submitted an extra repair")
++	}
++}
++
++// No observed sender pressure means the upstream opportunistic trigger is
++// closed, even if the logical head is old and the weak path has stopped.
++func TestD2EarlyRepairDoesNotSpeculateWithoutSenderPressure(t *testing.T) {
++	now := time.Now()
++	c, _, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, time.Second)
++	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++		t.Fatalf("unblocked sender unexpectedly repaired: sent=%v err=%v", sent, err)
++	}
++	if !booster.penaltyUntil.IsZero() {
++		t.Fatal("unblocked sender spuriously penalized booster")
 +	}
 +}
 diff --git a/protocol/multipath/inbound.go b/protocol/multipath/inbound.go
@@ -1013,7 +1105,7 @@ index 0000000..f6bd244
 +	}
 +}
 diff --git a/protocol/multipath/scheduler.go b/protocol/multipath/scheduler.go
-index 8480c19..5129a69 100644
+index 8480c19..b516ba2 100644
 --- a/protocol/multipath/scheduler.go
 +++ b/protocol/multipath/scheduler.go
 @@ -65,6 +65,9 @@ func (c *mpCore) pumpLoop() {
@@ -1074,6 +1166,16 @@ index 8480c19..5129a69 100644
  	if observation != nil {
  		if chosen != nil {
  			trace.Candidate = int(chosen.id)
+@@ -492,6 +518,9 @@ func (c *mpCore) reinjectLocked(now time.Time) (bool, error) {
+ 		mapping.path, mapping.generation = target.id, target.path.Generation
+ 		mapping.pathEnd = target.path.Sent
+ 		mapping.sentAt, mapping.repairedAt = now, now
++		// The authoritative stale/lost/pruned reinjection changes mapping
++		// ownership. A prior speculative repair identity must not survive it.
++		mapping.repairGeneration, mapping.repairPathEnd = 0, 0
+ 		c.fallbackB.Add(uint64(segment.Length))
+ 		c.fallbackF.Add(1)
+ 		c.fallbackE.Add(1)
 diff --git a/protocol/multipath/stream/headroom_s1_test.go b/protocol/multipath/stream/headroom_s1_test.go
 new file mode 100644
 index 0000000..6ec4189
@@ -1298,7 +1400,7 @@ index 017a578..32dcfb0 100644
  	if b.refs <= 0 {
  		panic("multipath: retaining released buffer")
 diff --git a/protocol/multipath/types.go b/protocol/multipath/types.go
-index a8cc9a6..926ede1 100644
+index a8cc9a6..92ab6ae 100644
 --- a/protocol/multipath/types.go
 +++ b/protocol/multipath/types.go
 @@ -36,6 +36,7 @@ type coreConfig struct {
@@ -1403,6 +1505,17 @@ index a8cc9a6..926ede1 100644
  }
  
  type dataMapping struct {
+@@ -286,6 +291,10 @@ type dataMapping struct {
+ 	generation, pathEnd uint64
+ 	sentAt              time.Time
+ 	repairedAt          time.Time
++	// Identity of the most recent speculative leg0 physical copy. Unlike
++	// data ACK, path receipt proves only that the copy reached that leg.
++	repairGeneration uint64
++	repairPathEnd    uint64
+ }
+ 
+ func (l *mpLeg) Done() <-chan struct{} {
 diff --git a/protocol/multipath/wire.go b/protocol/multipath/wire.go
 index b6081bb..eb8fcd0 100644
 --- a/protocol/multipath/wire.go
