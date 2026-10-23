@@ -57,9 +57,11 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 		math.IsNaN(fast.path.Rate) || math.IsInf(fast.path.Rate, 0) || math.IsNaN(slow.path.Rate) || math.IsInf(slow.path.Rate, 0) || slow.path.LastProgress.IsZero() {
 		return false, nil
 	}
-	// Preserve upstream pressure gating: age or lack of path progress
-	// alone cannot authorize speculative repair of an unblocked sender.
-	if !windowBlocked && !historyBlocked {
+	// Candidate D2-B HOL extension: normal sender pressure is one trigger;
+	// a second, independently grounded trigger requires physical receipt of
+	// later logical DATA on leg0 while this leg1 head is still unreceived.
+	// An aged but otherwise idle head is NOT sufficient evidence.
+	if !windowBlocked && !historyBlocked && !c.d2ConfirmedHOLLocked(head, fast) {
 		return false, nil
 	}
 	// A blocked receive window alone does not justify replaying a newly
@@ -87,8 +89,8 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
 	// Beta10 allows a head with no physical progress for a measured RTT
 	// to be repaired despite an optimistic stale Rate estimate. The other
-	// path must still be eligible, the head old enough, and the sender
-	// blocked. Do not accept NaN/Inf estimates as proof of a late arrival.
+	// path must still be eligible and the head old enough. Do not accept
+	// NaN/Inf estimates as proof of a late arrival.
 	if math.IsNaN(fastArrival) || math.IsInf(fastArrival, 0) || math.IsNaN(slowArrival) || math.IsInf(slowArrival, 0) {
 		return false, nil
 	}
@@ -118,4 +120,27 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 	c.fallbackB.Add(uint64(segment.Length))
 	c.fallbackF.Add(1)
 	return true, nil
+}
+
+// d2ConfirmedHOLLocked identifies receiver-side head-of-line blocking from
+// existing path receipts; it is never inferred from a stale Data ACK alone.
+// The mapping must be newer in logical sequence, fully physically received
+// on the current preferred generation, while the leg1 head remains missing.
+// This is a research-only admission extension, not an upstream Beta10 rule.
+// Caller holds stateMu. No new state, wire format, or credit accounting.
+func (c *mpCore) d2ConfirmedHOLLocked(head *dataMapping, fast *mpLeg) bool {
+	if fast.path.Received == 0 || len(c.mappings)-c.mappingHead < 2 {
+		return false
+	}
+	for i := len(c.mappings) - 1; i > c.mappingHead; i-- {
+		later := &c.mappings[i]
+		if later.seq < head.end || later.path != 0 ||
+			later.generation != fast.path.Generation || later.pathEnd == 0 {
+			continue
+		}
+		if later.pathEnd <= fast.path.Received {
+			return true
+		}
+	}
+	return false
 }

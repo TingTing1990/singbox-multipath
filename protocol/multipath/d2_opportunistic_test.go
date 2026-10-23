@@ -252,3 +252,105 @@ func TestD2EarlyRepairDoesNotSpeculateWithoutSenderPressure(t *testing.T) {
 		t.Fatal("unblocked sender spuriously penalized booster")
 	}
 }
+
+// D2-B regression: a later logical mapping is physically received on leg0,
+// while the earlier leg1 head remains physically unreceived and Data ACK
+// remains stalled. The sender has spare window and replay capacity.
+// Unlike an aged but merely idle head, this exhibits receiver-side HOL evidence.
+func TestD2UnblockedHOLLaterPathReceiptRequiresEarlyRepair(t *testing.T) {
+	now := time.Now()
+	c, preferred, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
+	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+	tail, ok := c.tx.NextRange(c.cfg.ChunkSize)
+	if !ok {
+		t.Fatal("second mapping missing")
+	}
+	if err := c.tx.Sent(tail); err != nil {
+		t.Fatal(err)
+	}
+	pathSeq, err := preferred.path.Submitted(tail.Length, now.Add(-200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mappings = append(c.mappings, dataMapping{
+		seq: tail.Seq, end: tail.End(), path: 0, generation: preferred.path.Generation,
+		pathEnd: pathSeq + uint64(tail.Length), sentAt: now.Add(-200 * time.Millisecond),
+	})
+	if err := preferred.path.Feedback(stream.Receipt{
+		Generation: preferred.path.Generation, Next: pathSeq + uint64(tail.Length),
+		ReceivedAt: 500000, FirstNext: 0,
+	}, now.Add(-50*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if c.tx.Una != 0 || c.tx.Next != c.tx.WriteNext || c.tx.Next >= c.tx.WindowEnd {
+		t.Fatal("fixture must have stale ordered ACK, no unsent data, open send window")
+	}
+	if c.tx.Buffered() >= uint64(c.cfg.ReplayBytes) {
+		t.Fatal("fixture must have spare replay history")
+	}
+	if booster.path.Received >= c.mappings[0].pathEnd {
+		t.Fatal("head is already path confirmed")
+	}
+	sent, err := c.d2OpportunisticLocked(now)
+	if err != nil || !sent {
+		t.Fatalf("physical later DATA arrived but unreceived head did not repair: sent=%v err=%v", sent, err)
+	}
+}
+
+// Negative companion: elapsed time without physical later-data evidence is
+// not sufficient to speculate on an otherwise unblocked sender.
+func TestD2UnblockedHOLWithoutLaterReceiptMustNotRepair(t *testing.T) {
+	now := time.Now()
+	c, _, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
+	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+	if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
+		t.Fatalf("no downstream HOL evidence: sent=%v err=%v", sent, err)
+	}
+}
+
+// Even with physical progress on the preferred leg, only a fully received
+// later DATA mapping in the same path generation proves this specific HOL gap.
+func TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		oldGeneration, partial bool
+	}{
+		{name: "later_partial_receipt", partial: true},
+		{name: "later_old_generation", oldGeneration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			c, preferred, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
+			c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+			tail, ok := c.tx.NextRange(c.cfg.ChunkSize)
+			if !ok {
+				t.Fatal("missing tail")
+			}
+			if err := c.tx.Sent(tail); err != nil {
+				t.Fatal(err)
+			}
+			pathSeq, err := preferred.path.Submitted(tail.Length, now.Add(-200*time.Millisecond))
+			if err != nil {
+				t.Fatal(err)
+			}
+			generation := preferred.path.Generation
+			if tc.oldGeneration {
+				generation++
+			}
+			c.mappings = append(c.mappings, dataMapping{
+				seq: tail.Seq, end: tail.End(), path: 0, generation: generation,
+				pathEnd: pathSeq + uint64(tail.Length), sentAt: now.Add(-200 * time.Millisecond),
+			})
+			receipt := pathSeq + uint64(tail.Length)
+			if tc.partial {
+				receipt--
+			}
+			if err := preferred.path.Feedback(stream.Receipt{Generation: preferred.path.Generation, Next: receipt, ReceivedAt: 500000}, now.Add(-50*time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
+				t.Fatalf("unproven HOL caused repair: sent=%v err=%v", sent, err)
+			}
+		})
+	}
+}
