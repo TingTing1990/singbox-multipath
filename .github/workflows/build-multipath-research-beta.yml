@@ -133,10 +133,10 @@ jobs:
             'protocol/multipath/d2_ecf_test.go':'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
             'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'protocol/multipath/d2_opportunistic.go':'223f355475b8f002fd33fff7b16e0c45431d9ed5d72b7838b72de883c3eab169',
-            'protocol/multipath/d2_opportunistic_test.go':'1c2079bd1642564195ba2fbca6c518486d41273990e80325348306d78a4c211c',
-            'tools/research-b10-s1-d2.patch':'d15b92f9e5bdd226026dbb68535889de9a4a270ddccea5de62531e91f7473a4a',
-            'tools/verify-download-boundary.py':'d6ada947457713a3e41475d931400b28ea4e387e46ffc96d2bcb353787bf46aa',
+            'protocol/multipath/d2_opportunistic.go':'8882737cdf054b5253dcb26e1c96b8d192a59a64806453276bece64c8fd77a07',
+            'protocol/multipath/d2_opportunistic_test.go':'4b0677eeda1f1240fa972242da8d2f2c8070c087672b0e7646923a30e32f0fe6',
+            'tools/research-b10-s1-d2.patch':'874a3cc135914f4920c52e939cdc7c0e4a5a76abf34bf652bb54025c5fcf4743',
+            'tools/verify-download-boundary.py':'340ac0665ad32070f26e79828806385d52ad60638a7563cf6699f3b1dc65619e',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
