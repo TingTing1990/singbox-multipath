@@ -1,5 +1,5 @@
 diff --git a/protocol/multipath/core.go b/protocol/multipath/core.go
-index 711cfbd..a3250c6 100644
+index 711cfbdfe1c95ce2c79f1f4a9b78b2346c26c11e..a3250c6dc99e1ee5d414da5b533a1dcceed8589d 100644
 --- a/protocol/multipath/core.go
 +++ b/protocol/multipath/core.go
 @@ -221,6 +221,11 @@ func (c *mpCore) addLegWithReadPreamble(id uint8, conn net.Conn, onClose func(er
@@ -66,7 +66,7 @@ index 711cfbd..a3250c6 100644
  		c.stateMu.Lock()
 diff --git a/protocol/multipath/d2_ecf.go b/protocol/multipath/d2_ecf.go
 new file mode 100644
-index 0000000..c82e783
+index 0000000000000000000000000000000000000000..c82e783499f50a89df11c484968a3a82e2de412b
 --- /dev/null
 +++ b/protocol/multipath/d2_ecf.go
 @@ -0,0 +1,165 @@
@@ -237,7 +237,7 @@ index 0000000..c82e783
 +}
 diff --git a/protocol/multipath/d2_ecf_test.go b/protocol/multipath/d2_ecf_test.go
 new file mode 100644
-index 0000000..c9875bc
+index 0000000000000000000000000000000000000000..c9875bc747058cf850175dddcac15a39dc299751
 --- /dev/null
 +++ b/protocol/multipath/d2_ecf_test.go
 @@ -0,0 +1,283 @@
@@ -526,10 +526,10 @@ index 0000000..c9875bc
 +}
 diff --git a/protocol/multipath/d2_opportunistic.go b/protocol/multipath/d2_opportunistic.go
 new file mode 100644
-index 0000000..0fa9b86
+index 0000000000000000000000000000000000000000..32252c56232f6ac9c1d3695b9f3197474ee3874c
 --- /dev/null
 +++ b/protocol/multipath/d2_opportunistic.go
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,146 @@
 +package multipath
 +
 +import (
@@ -589,9 +589,11 @@ index 0000000..0fa9b86
 +		math.IsNaN(fast.path.Rate) || math.IsInf(fast.path.Rate, 0) || math.IsNaN(slow.path.Rate) || math.IsInf(slow.path.Rate, 0) || slow.path.LastProgress.IsZero() {
 +		return false, nil
 +	}
-+	// Preserve upstream pressure gating: age or lack of path progress
-+	// alone cannot authorize speculative repair of an unblocked sender.
-+	if !windowBlocked && !historyBlocked {
++	// Candidate D2-B HOL extension: normal sender pressure is one trigger;
++	// a second, independently grounded trigger requires physical receipt of
++	// later logical DATA on leg0 while this leg1 head is still unreceived.
++	// An aged but otherwise idle head is NOT sufficient evidence.
++	if !windowBlocked && !historyBlocked && !c.d2ConfirmedHOLLocked(head, fast) {
 +		return false, nil
 +	}
 +	// A blocked receive window alone does not justify replaying a newly
@@ -619,8 +621,8 @@ index 0000000..0fa9b86
 +	slowArrival := slow.path.RemainingDelivery(head.pathEnd, head.sentAt, provisionalDelay, now)
 +	// Beta10 allows a head with no physical progress for a measured RTT
 +	// to be repaired despite an optimistic stale Rate estimate. The other
-+	// path must still be eligible, the head old enough, and the sender
-+	// blocked. Do not accept NaN/Inf estimates as proof of a late arrival.
++	// path must still be eligible and the head old enough. Do not accept
++	// NaN/Inf estimates as proof of a late arrival.
 +	if math.IsNaN(fastArrival) || math.IsInf(fastArrival, 0) || math.IsNaN(slowArrival) || math.IsInf(slowArrival, 0) {
 +		return false, nil
 +	}
@@ -651,12 +653,35 @@ index 0000000..0fa9b86
 +	c.fallbackF.Add(1)
 +	return true, nil
 +}
++
++// d2ConfirmedHOLLocked identifies receiver-side head-of-line blocking from
++// existing path receipts; it is never inferred from a stale Data ACK alone.
++// The mapping must be newer in logical sequence, fully physically received
++// on the current preferred generation, while the leg1 head remains missing.
++// This is a research-only admission extension, not an upstream Beta10 rule.
++// Caller holds stateMu. No new state, wire format, or credit accounting.
++func (c *mpCore) d2ConfirmedHOLLocked(head *dataMapping, fast *mpLeg) bool {
++	if fast.path.Received == 0 || len(c.mappings)-c.mappingHead < 2 {
++		return false
++	}
++	for i := len(c.mappings) - 1; i > c.mappingHead; i-- {
++		later := &c.mappings[i]
++		if later.seq < head.end || later.path != 0 ||
++			later.generation != fast.path.Generation || later.pathEnd == 0 {
++			continue
++		}
++		if later.pathEnd <= fast.path.Received {
++			return true
++		}
++	}
++	return false
++}
 diff --git a/protocol/multipath/d2_opportunistic_test.go b/protocol/multipath/d2_opportunistic_test.go
 new file mode 100644
-index 0000000..d820fcd
+index 0000000000000000000000000000000000000000..61706b9ac6025e193d302c10fa9eccdd1a9e90ca
 --- /dev/null
 +++ b/protocol/multipath/d2_opportunistic_test.go
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,356 @@
 +package multipath
 +
 +import (
@@ -911,8 +936,110 @@ index 0000000..d820fcd
 +		t.Fatal("unblocked sender spuriously penalized booster")
 +	}
 +}
++
++// D2-B regression: a later logical mapping is physically received on leg0,
++// while the earlier leg1 head remains physically unreceived and Data ACK
++// remains stalled. The sender has spare window and replay capacity.
++// Unlike an aged but merely idle head, this exhibits receiver-side HOL evidence.
++func TestD2UnblockedHOLLaterPathReceiptRequiresEarlyRepair(t *testing.T) {
++	now := time.Now()
++	c, preferred, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
++	tail, ok := c.tx.NextRange(c.cfg.ChunkSize)
++	if !ok {
++		t.Fatal("second mapping missing")
++	}
++	if err := c.tx.Sent(tail); err != nil {
++		t.Fatal(err)
++	}
++	pathSeq, err := preferred.path.Submitted(tail.Length, now.Add(-200*time.Millisecond))
++	if err != nil {
++		t.Fatal(err)
++	}
++	c.mappings = append(c.mappings, dataMapping{
++		seq: tail.Seq, end: tail.End(), path: 0, generation: preferred.path.Generation,
++		pathEnd: pathSeq + uint64(tail.Length), sentAt: now.Add(-200 * time.Millisecond),
++	})
++	if err := preferred.path.Feedback(stream.Receipt{
++		Generation: preferred.path.Generation, Next: pathSeq + uint64(tail.Length),
++		ReceivedAt: 500000, FirstNext: 0,
++	}, now.Add(-50*time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	if c.tx.Una != 0 || c.tx.Next != c.tx.WriteNext || c.tx.Next >= c.tx.WindowEnd {
++		t.Fatal("fixture must have stale ordered ACK, no unsent data, open send window")
++	}
++	if c.tx.Buffered() >= uint64(c.cfg.ReplayBytes) {
++		t.Fatal("fixture must have spare replay history")
++	}
++	if booster.path.Received >= c.mappings[0].pathEnd {
++		t.Fatal("head is already path confirmed")
++	}
++	sent, err := c.d2OpportunisticLocked(now)
++	if err != nil || !sent {
++		t.Fatalf("physical later DATA arrived but unreceived head did not repair: sent=%v err=%v", sent, err)
++	}
++}
++
++// Negative companion: elapsed time without physical later-data evidence is
++// not sufficient to speculate on an otherwise unblocked sender.
++func TestD2UnblockedHOLWithoutLaterReceiptMustNotRepair(t *testing.T) {
++	now := time.Now()
++	c, _, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++	c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
++	if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++		t.Fatalf("no downstream HOL evidence: sent=%v err=%v", sent, err)
++	}
++}
++
++// Even with physical progress on the preferred leg, only a fully received
++// later DATA mapping in the same path generation proves this specific HOL gap.
++func TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt(t *testing.T) {
++	for _, tc := range []struct {
++		name                   string
++		oldGeneration, partial bool
++	}{
++		{name: "later_partial_receipt", partial: true},
++		{name: "later_old_generation", oldGeneration: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			now := time.Now()
++			c, preferred, _ := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
++			c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
++			tail, ok := c.tx.NextRange(c.cfg.ChunkSize)
++			if !ok {
++				t.Fatal("missing tail")
++			}
++			if err := c.tx.Sent(tail); err != nil {
++				t.Fatal(err)
++			}
++			pathSeq, err := preferred.path.Submitted(tail.Length, now.Add(-200*time.Millisecond))
++			if err != nil {
++				t.Fatal(err)
++			}
++			generation := preferred.path.Generation
++			if tc.oldGeneration {
++				generation++
++			}
++			c.mappings = append(c.mappings, dataMapping{
++				seq: tail.Seq, end: tail.End(), path: 0, generation: generation,
++				pathEnd: pathSeq + uint64(tail.Length), sentAt: now.Add(-200 * time.Millisecond),
++			})
++			receipt := pathSeq + uint64(tail.Length)
++			if tc.partial {
++				receipt--
++			}
++			if err := preferred.path.Feedback(stream.Receipt{Generation: preferred.path.Generation, Next: receipt, ReceivedAt: 500000}, now.Add(-50*time.Millisecond)); err != nil {
++				t.Fatal(err)
++			}
++			if sent, err := c.d2OpportunisticLocked(now); err != nil || sent {
++				t.Fatalf("unproven HOL caused repair: sent=%v err=%v", sent, err)
++			}
++		})
++	}
++}
 diff --git a/protocol/multipath/inbound.go b/protocol/multipath/inbound.go
-index 74a533d..c0efe4f 100644
+index 74a533d286ef0709745fb6c1627946e949415350..c0efe4fffd52b44d5b7e729b430d782b5036ba55 100644
 --- a/protocol/multipath/inbound.go
 +++ b/protocol/multipath/inbound.go
 @@ -310,6 +310,7 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
@@ -925,7 +1052,7 @@ index 74a533d..c0efe4f 100644
  	}
 diff --git a/protocol/multipath/research_b10_performance_test.go b/protocol/multipath/research_b10_performance_test.go
 new file mode 100644
-index 0000000..f6bd244
+index 0000000000000000000000000000000000000000..f6bd2443b8c901ad56d4d2ce58a41ce3c822916c
 --- /dev/null
 +++ b/protocol/multipath/research_b10_performance_test.go
 @@ -0,0 +1,175 @@
@@ -1105,7 +1232,7 @@ index 0000000..f6bd244
 +	}
 +}
 diff --git a/protocol/multipath/scheduler.go b/protocol/multipath/scheduler.go
-index 8480c19..b516ba2 100644
+index 8480c19dc7bd742dcfda43d5eeef82c73847186a..b516ba2e78a763954a1ac87b5f003b795835c71a 100644
 --- a/protocol/multipath/scheduler.go
 +++ b/protocol/multipath/scheduler.go
 @@ -65,6 +65,9 @@ func (c *mpCore) pumpLoop() {
@@ -1178,7 +1305,7 @@ index 8480c19..b516ba2 100644
  		c.fallbackE.Add(1)
 diff --git a/protocol/multipath/stream/headroom_s1_test.go b/protocol/multipath/stream/headroom_s1_test.go
 new file mode 100644
-index 0000000..6ec4189
+index 0000000000000000000000000000000000000000..6ec4189389cfa8c1035a6acc0a3a1d04b4cdbeb3
 --- /dev/null
 +++ b/protocol/multipath/stream/headroom_s1_test.go
 @@ -0,0 +1,82 @@
@@ -1265,7 +1392,7 @@ index 0000000..6ec4189
 +	}
 +}
 diff --git a/protocol/multipath/stream/path.go b/protocol/multipath/stream/path.go
-index f29cd76..e5bb43a 100644
+index f29cd76734b79bf0889ae956e5fb7169c0dd6fcb..e5bb43a3ca1602947276206e317b3778ad685b44 100644
 --- a/protocol/multipath/stream/path.go
 +++ b/protocol/multipath/stream/path.go
 @@ -33,6 +33,7 @@ type Path struct {
@@ -1351,7 +1478,7 @@ index f29cd76..e5bb43a 100644
 +	return estimate
 +}
 diff --git a/protocol/multipath/stream/send.go b/protocol/multipath/stream/send.go
-index 017a578..32dcfb0 100644
+index 017a57839e9aaa5aaba6e18e3682ac3597af4011..32dcfb0db9030355efe201bd9e67b215ec6ff2c2 100644
 --- a/protocol/multipath/stream/send.go
 +++ b/protocol/multipath/stream/send.go
 @@ -1,6 +1,9 @@
@@ -1400,7 +1527,7 @@ index 017a578..32dcfb0 100644
  	if b.refs <= 0 {
  		panic("multipath: retaining released buffer")
 diff --git a/protocol/multipath/types.go b/protocol/multipath/types.go
-index a8cc9a6..92ab6ae 100644
+index a8cc9a600d432ea4b13e198439bbcab26f52b5ac..92ab6aee6f6e1f327a4bed1715f55a462228adb3 100644
 --- a/protocol/multipath/types.go
 +++ b/protocol/multipath/types.go
 @@ -36,6 +36,7 @@ type coreConfig struct {
@@ -1517,7 +1644,7 @@ index a8cc9a6..92ab6ae 100644
  
  func (l *mpLeg) Done() <-chan struct{} {
 diff --git a/protocol/multipath/wire.go b/protocol/multipath/wire.go
-index b6081bb..eb8fcd0 100644
+index b6081bb2c0c800b248e9fface3c9f18178584f92..eb8fcd082f74a29c8afc8f5ad5be99e7a43031d3 100644
 --- a/protocol/multipath/wire.go
 +++ b/protocol/multipath/wire.go
 @@ -87,6 +87,15 @@ func readFlow(conn net.Conn) (flowMessage, error) {
