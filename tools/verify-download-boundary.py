@@ -27,8 +27,8 @@ RESEARCH_CHANGED = {
 RESEARCH_ADDED = {
     'protocol/multipath/d2_ecf.go': '86ae23fc3a062c514d4e3e8f566b55d0ef5a8a63d90a86d319ada3573341e729',
     'protocol/multipath/d2_ecf_test.go': 'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
-    'protocol/multipath/d2_opportunistic.go': '8882737cdf054b5253dcb26e1c96b8d192a59a64806453276bece64c8fd77a07',
-    'protocol/multipath/d2_opportunistic_test.go': '4b0677eeda1f1240fa972242da8d2f2c8070c087672b0e7646923a30e32f0fe6',
+    'protocol/multipath/d2_opportunistic.go': '98f5cab4c525c0f32fb179e5b841d32de47fc85e7eec24096795e5f8cdc9fddd',
+    'protocol/multipath/d2_opportunistic_test.go': '17c23fd3477a00021e09565c70ef26fcc344fdcfd70bfa194d1ffaff2ad7f450',
     'protocol/multipath/research_b10_performance_test.go': '72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
     'protocol/multipath/stream/headroom_s1_test.go': 'd6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
 }
