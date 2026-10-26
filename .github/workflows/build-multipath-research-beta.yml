@@ -133,10 +133,10 @@ jobs:
             'protocol/multipath/d2_ecf_test.go':'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
             'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'protocol/multipath/d2_opportunistic.go':'8882737cdf054b5253dcb26e1c96b8d192a59a64806453276bece64c8fd77a07',
-            'protocol/multipath/d2_opportunistic_test.go':'4b0677eeda1f1240fa972242da8d2f2c8070c087672b0e7646923a30e32f0fe6',
-            'tools/research-b10-s1-d2.patch':'874a3cc135914f4920c52e939cdc7c0e4a5a76abf34bf652bb54025c5fcf4743',
-            'tools/verify-download-boundary.py':'340ac0665ad32070f26e79828806385d52ad60638a7563cf6699f3b1dc65619e',
+            'protocol/multipath/d2_opportunistic.go':'98f5cab4c525c0f32fb179e5b841d32de47fc85e7eec24096795e5f8cdc9fddd',
+            'protocol/multipath/d2_opportunistic_test.go':'17c23fd3477a00021e09565c70ef26fcc344fdcfd70bfa194d1ffaff2ad7f450',
+            'tools/research-b10-s1-d2.patch':'d21061dc7f6b9b455207e3828e835c9fa98afb23904f822c9e2af1e4c3b0f747',
+            'tools/verify-download-boundary.py':'88fac0c962600a51301bd477091097f8c2180d9d5790073edbfc9812b8342689',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -683,6 +683,22 @@ jobs:
           temp=Path(os.environ['MUTANT_ROOT'])
           tags=os.environ['BUILD_TAGS']
           mutations=[
+            ('07-d2-missing-repair-decision','protocol/multipath/d2_opportunistic.go',
+             'c.cfg.DownloadAudit.record(repairRecord)',
+             '// MUTANT: omit the physical repair assignment journal.',
+             '^TestD2EarlyRepairAuditTrail$','native'),
+            ('08-d2-remove-hol-trigger','protocol/multipath/d2_opportunistic.go',
+             '!windowBlocked && !historyBlocked && !c.d2ConfirmedHOLLocked(head, fast)',
+             '!windowBlocked && !historyBlocked',
+             '^TestD2UnblockedHOLLaterPathReceiptRequiresEarlyRepair$','native'),
+            ('09-d2-accept-old-generation','protocol/multipath/d2_opportunistic.go',
+             'later.generation != fast.path.Generation || later.pathEnd == 0',
+             'later.pathEnd == 0',
+             '^TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt/later_old_generation$','native'),
+            ('10-d2-accept-partial-receipt','protocol/multipath/d2_opportunistic.go',
+             'later.pathEnd <= fast.path.Received',
+             'later.pathEnd-1 <= fast.path.Received',
+             '^TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt/later_partial_receipt$','native'),
             ('06-observer-memory-side-effect','protocol/multipath/download_audit.go',
              'm, _ := downloadMemory(a.memory)',
              'a.memory.snapshot(); m, _ := downloadMemory(a.memory)',
@@ -737,7 +753,7 @@ jobs:
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 6 REPAIR MUTANTS KILLED')
+          print('ALL 10 REPAIR MUTANTS KILLED')
           PY
 
       - name: Server download producer and independent rejection contracts
@@ -762,7 +778,7 @@ jobs:
           set -euo pipefail
           python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/research-candidate-reversal.log"
           CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF|TestD2EarlyRepair)' \
+            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF|TestD2EarlyRepair|TestD2UnblockedHOL)' \
             ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/research-S1-D2-race-x10.log"
 
       - name: Research B10 actual server scope and Capacity V2 A/B performance
