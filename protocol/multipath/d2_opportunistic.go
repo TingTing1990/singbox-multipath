@@ -104,7 +104,32 @@ func (c *mpCore) d2OpportunisticLocked(now time.Time) (bool, error) {
 	}
 	// This is original submitLocked repair ownership, never a new logical
 	// first transmission. A failing submit remains a normal fatal error.
-	if err := c.submitLocked(fast, segment, true, now); err != nil {
+	// Match authoritative reinjection's observation contract. Snapshot before
+	// submit changes busy/outstanding; count only the actual submit result.
+	var repairRecord downloadRecord
+	if c.cfg.DownloadAudit != nil {
+		repairRecord = c.downloadRecord("DECISION")
+		repairRecord.decision = c.downloadDecision(segment.Length)
+		repairRecord.decision.LogicalSeq = segment.Seq
+		repairRecord.decision.Selected = int(fast.id)
+		repairRecord.decision.Candidate = int(fast.id)
+		repairRecord.decision.Repair = true
+		repairRecord.decision.Reason = "d2_early_repair_confirmed_hol"
+		if windowBlocked {
+			repairRecord.decision.Reason = "d2_early_repair_window"
+		} else if historyBlocked {
+			repairRecord.decision.Reason = "d2_early_repair_history"
+		}
+	}
+	err := c.submitLocked(fast, segment, true, now)
+	if c.cfg.DownloadAudit != nil {
+		repairRecord.decision.Outcome = "submitted"
+		if err != nil {
+			repairRecord.decision.Outcome = "failed"
+		}
+		c.cfg.DownloadAudit.record(repairRecord)
+	}
+	if err != nil {
 		return false, err
 	}
 	head.repairedAt = now

@@ -1,10 +1,16 @@
 package multipath
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/protocol/multipath/audit"
+	D "github.com/sagernet/sing-box/protocol/multipath/downloadevidence"
 	"github.com/sagernet/sing-box/protocol/multipath/stream"
 )
 
@@ -55,6 +61,145 @@ func d2EarlyRepairFixture(t *testing.T, now time.Time, preferredRate, boosterRat
 		booster.path.Close()
 	})
 	return c, preferred, booster
+}
+
+// Compare the real submitted physical frame with the encoded producer journal
+// and offline accounting. Internal counters alone would miss a producer which
+// silently omits both the DECISION event and its cumulative repair total.
+func TestD2EarlyRepairAuditTrail(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		fail, reject bool
+	}{
+		{name: "window", reason: "d2_early_repair_window"},
+		{name: "history", reason: "d2_early_repair_history"},
+		{name: "confirmed_hol", reason: "d2_early_repair_confirmed_hol"},
+		{name: "submit_failure", reason: "d2_early_repair_window", fail: true},
+		{name: "upload_out_of_scope", reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			c, preferred, booster := d2EarlyRepairFixture(t, now, 20e6, 200_000, 400*time.Millisecond)
+			if tc.name == "history" {
+				c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+				c.cfg.ReplayBytes = int64(c.tx.Buffered())
+			}
+			if tc.name == "confirmed_hol" {
+				c.tx.WindowEnd = c.tx.WriteNext + uint64(c.cfg.ChunkSize)*8
+				tail, ok := c.tx.NextRange(c.cfg.ChunkSize)
+				if !ok {
+					t.Fatal("missing later DATA")
+				}
+				if err := c.tx.Sent(tail); err != nil {
+					t.Fatal(err)
+				}
+				pathSeq, err := preferred.path.Submitted(tail.Length, now.Add(-200*time.Millisecond))
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.mappings = append(c.mappings, dataMapping{seq: tail.Seq, end: tail.End(), path: 0,
+					generation: preferred.path.Generation, pathEnd: pathSeq + uint64(tail.Length), sentAt: now.Add(-200 * time.Millisecond)})
+				if err := preferred.path.Feedback(stream.Receipt{Generation: preferred.path.Generation,
+					Next: pathSeq + uint64(tail.Length), ReceivedAt: 500000}, now.Add(-50*time.Millisecond)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.fail {
+				c.memory = newMemoryBudget(1, false)
+				preferred.prepaidFlights = 16 // Exhaust the existing reserved fallback too.
+			}
+			if tc.reject {
+				c.cfg.ServerDownload = false
+			}
+			c.cfg.Memory = c.memory
+			c.cfg.DownloadSession = "d2-audit-fixture"
+			var output bytes.Buffer
+			observer, err := newDownloadAudit("d2-audit", c.cfg, func(s string) { fmt.Fprintln(&output, s) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			observer.start()
+			t.Cleanup(func() { observer.close(); <-observer.done })
+			c.cfg.DownloadAudit = observer
+			beforeNext, beforeUna := c.tx.Next, c.tx.Una
+			sent, err := c.d2OpportunisticLocked(now)
+			if tc.fail {
+				if sent || err != errMemoryLimit {
+					t.Fatalf("injected submission failure: sent=%v err=%v", sent, err)
+				}
+			} else if err != nil || sent == tc.reject {
+				t.Fatalf("unexpected submission: sent=%v err=%v", sent, err)
+			}
+			var physical wireFrame
+			if sent {
+				physical = <-preferred.send
+				defer physical.buffer.Release()
+				preferred.queuedBytes.Add(-int64(len(physical.data)))
+				preferred.busy = false
+				if again, err := c.d2OpportunisticLocked(now.Add(time.Millisecond)); again || err != nil {
+					t.Fatalf("cooldown allowed another submission: sent=%v err=%v", again, err)
+				}
+			} else if len(preferred.send) != 0 || c.fallbackB.Load() != 0 || !booster.penaltyUntil.IsZero() {
+				t.Fatal("failed/rejected assignment changed successful repair state")
+			}
+			if c.tx.Next != beforeNext || c.tx.Una != beforeUna {
+				t.Fatal("repair moved logical first-transmission or ACK cursor")
+			}
+			// Give START and STOP a real interval on coarse platform clocks.
+			time.Sleep(time.Millisecond)
+			observer.close()
+			<-observer.done
+			report, err := audit.AnalyzeServerDownload(strings.NewReader(output.String()), "d2-audit", "")
+			if err != nil || !report.Complete {
+				t.Fatalf("producer journal did not replay completely: %v", err)
+			}
+			var decisions []D.Decision
+			var final D.Snapshot
+			for _, event := range report.Events {
+				if event.Kind == "DECISION" {
+					var d D.Decision
+					if err := json.Unmarshal(event.Data, &d); err != nil {
+						t.Fatal(err)
+					}
+					decisions = append(decisions, d)
+				}
+				if event.Kind == "STOP" {
+					if err := json.Unmarshal(event.Data, &final); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if tc.reject {
+				if len(decisions) != 0 || final.Totals != (D.Totals{}) {
+					t.Fatal("out-of-scope rejection fabricated an assignment")
+				}
+				return
+			}
+			if len(decisions) != 1 {
+				t.Fatalf("actual D2 submission attempt missing from journal: decisions=%d want=1", len(decisions))
+			}
+			d := decisions[0]
+			if !d.Repair || d.Selected != 0 || d.Candidate != 0 || d.Reason != tc.reason || d.Paths[0].Busy {
+				t.Fatalf("wrong repair identity or snapshot taken after submission: %+v", d)
+			}
+			want := D.Totals{Decisions: 1}
+			if tc.fail {
+				want.SubmitFailures = 1
+				if d.Outcome != "failed" || d.Length != c.cfg.ChunkSize || d.LogicalSeq != beforeUna {
+					t.Fatalf("failed attempt misreported: %+v", d)
+				}
+			} else {
+				want.AssignedRepair[0] = uint64(len(physical.data))
+				if d.Outcome != "submitted" || !physical.replay || d.Length != len(physical.data) ||
+					d.LogicalSeq != physical.seq || d.Paths[0].Generation != physical.generation {
+					t.Fatalf("journal differs from actual queued repair: %+v", d)
+				}
+			}
+			if final.Totals != want {
+				t.Fatalf("repair counters differ from physical submission: got=%+v want=%+v", final.Totals, want)
+			}
+		})
+	}
 }
 
 func TestD2EarlyRepairBeforeStaleAtBlockedLogicalHead(t *testing.T) {
