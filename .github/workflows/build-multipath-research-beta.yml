@@ -1,4 +1,4 @@
-name: Build Multipath Research Beta
+name: Build Multipath S1 D2 Increment
 
 on:
   workflow_dispatch:
@@ -78,6 +78,16 @@ jobs:
           from pathlib import Path
           import hashlib
           expected={
+            'protocol/shadowsocks/inbound.go':'4ed8c85bbf08066c4ddce9630b0d448052a476c9c2eef8ea48ed82950e8efcbc',
+            'protocol/shadowsocks/s1_detour_test.go':'43ff5757f2ad168ac9b960a9085f900be6c3ceee3203a76fa69f9651e24e9679',
+            'tools/test-s1-detour.py':'bbee947fae484edc8377ddd45e9b95860de4ad2cd2baf34770f5f1bde67509ce',
+            'tools/s1-contracts/audit_oracle_test.go.txt':'3e23c1853a52e9cae9ae25f82a3edfd053971d2cbd9434e46a6cb37db808a95b',
+            'tools/s1-contracts/fault_proxy_test.go.txt':'f5e407971b22e467e4bc05200cf6c01c536a545aa7480c7387b7908d832243ba',
+            'tools/s1-contracts/guard_observer.go.txt':'895461b01c5db5b3889c6f89b94f0f60ccdc422bb0669f6954dd77825ae1e741',
+            'tools/s1-contracts/lifecycle_test.go.txt':'aff20a484b7ac94d1e89c9fa198c3049085bc70269918629768dbe12f38b1e02',
+            'tools/s1-contracts/matrix_test.go.txt':'2c1d173c09914289f8e4925c47c3371717e00491520475d8c5eeb8a58566007c',
+            'tools/s1-contracts/platform_fixture_test.go.txt':'7610db94030eff344f60c35ce04837bd7d433109942b9f657f8038b9ee56e3d2',
+            'protocol/multipath/repair_contract_test.go':'a4da07a3a7483fdedd9d4df378e60b92f0b8acf862de82dac662445777918f8f',
             'protocol/multipath/budget_stream.go':'129209b2029e94b4af8fa8f8860b4673310b33371c6d89523fbdceb02a3888be',
             'protocol/multipath/capacity.go':'b20e5703a8642a0e353f548b5f48a39d89a80c3aa2d9f626c18ace32d880b1dd',
             'protocol/multipath/core.go':'ed7a1681314c757cd69a714279d47fded4d5fc8f84243f0f55fe1fffe7fe2b56',
@@ -85,7 +95,7 @@ jobs:
             'protocol/multipath/memory.go':'9a1d52ccd0c0fe7330c36e02804347df73707c058cbefcc638cbc8ce9688f68b',
             'protocol/multipath/memory_available_linux.go':'3899d38edce4f92092018a04b45d9d9276922b687643dc5c8075d4a10c2436d3',
             'protocol/multipath/outbound.go':'6111a45f12aeb58b9e21e272db4e76798facddf80d0a0458efc3b0f406d34854',
-            'protocol/multipath/scheduler.go':'7b4d184e05f471bf4a7b7678497d3ec442128610b976eb1fe405b6e203872073',
+            'protocol/multipath/scheduler.go':'80c0e64a541dd95afef9f17f2c3e2a5cdd1df9059f3e02c0d1c629d49df03eca',
             'protocol/multipath/stream/path.go':'c05cbfdea19616c908f03dfaf7a0fd5bedd726ce3000e8d649030450cc7e24c7',
             'protocol/multipath/stream/send.go':'55319d5d10544446c5c9dde2fca689df87e8a69ccfb3568d6b3786ca4bca0f5b',
             'protocol/multipath/transport.go':'6f950ab8b6df2c3fd988d6ff2423bb10ab5a8baed3c87d4d2b6aa28127d6aa8c',
@@ -122,21 +132,21 @@ jobs:
             'protocol/multipath/audit/server_download.go':'17af0a2f809a6f9a94d43372c0375ac96573d1847594efa41f4b39d1c40c551f',
             'protocol/multipath/audit/server_download_bundle.go':'3cd2168a8787ae2150a310a3045c8f3e966e7b1704db28146c5df34aaac83b56',
             'protocol/multipath/audit/server_download_test.go':'1e3f307f883e3c45222d5a62cc4447bcc2dc81ada3ec7b9c7e76734e5c31c727',
-            'protocol/multipath/download_audit.go':'c64462b69c7d46932994eefd29bbf31fbf1f18911642fc9078658ccb662b7b72',
+            'protocol/multipath/download_audit.go':'4706b7cd1f4b196c6bb19baabb87e3db3d3a7a1368df22059fe2b2382172e188',
             'protocol/multipath/download_audit_test.go':'96b1879384baa03a2f979fdbfd59608a838b91d299bcc156f7a804608ae736bc',
             'protocol/multipath/downloadevidence/schema.go':'3dbc1fcbef06a11afa8bc0d2e21723558936c7d76356477311255c492be0b852',
             'tools/collect-multipath-download.py':'4c1976f9819e614b91f56dfb445b76f998c806e4af7e0bd26c1c5ac1e5e97e98',
             'tools/download-observation.patch':'bb13719f2aa6dff921fe9b3aaaad053a6e26ea4cf141a437bb28f2ce04b737dc',
             'tools/test-download-collector.py':'01cf9d8401c78a055ad2e9e4c15bd5bdbf073840df5fc9fd835c12952aabd391',
             'protocol/multipath/wire.go':'83001bd9eee88537fcec3714338585123cc35622bd8c6497f96d695c566929f9',
-            'protocol/multipath/d2_ecf.go':'86ae23fc3a062c514d4e3e8f566b55d0ef5a8a63d90a86d319ada3573341e729',
+            'protocol/multipath/d2_ecf.go':'73f5844d02680752a89240f62ae6bb0acabd3e95216e52152897a9b7b0349d10',
             'protocol/multipath/d2_ecf_test.go':'b0a4943bc8ec174ed38b8efa548209a814a2634c20f1d6ae5ee8c3297abb4057',
-            'protocol/multipath/research_b10_performance_test.go':'72c666bb64a34f742ef2f1090d19ce303ab0a4bf0cd546935cde72b3bc5c2581',
+            'protocol/multipath/research_b10_performance_test.go':'e11058cbe4b46918596b69e0488b63d8c9bcf9343f3aa1c8eaae7a8b83f7b39e',
             'protocol/multipath/stream/headroom_s1_test.go':'d6b410ecc0672b056a8a4350fdb95006a58e2ff180644aaa0249f2e6e478a8de',
-            'protocol/multipath/d2_opportunistic.go':'98f5cab4c525c0f32fb179e5b841d32de47fc85e7eec24096795e5f8cdc9fddd',
-            'protocol/multipath/d2_opportunistic_test.go':'17c23fd3477a00021e09565c70ef26fcc344fdcfd70bfa194d1ffaff2ad7f450',
-            'tools/research-b10-s1-d2.patch':'d21061dc7f6b9b455207e3828e835c9fa98afb23904f822c9e2af1e4c3b0f747',
-            'tools/verify-download-boundary.py':'88fac0c962600a51301bd477091097f8c2180d9d5790073edbfc9812b8342689',
+            'protocol/multipath/d2_opportunistic.go':'91f4ff3f406f0e26300222e7e32ddd7739c136f49f37f9b482d71bd586de364f',
+            'protocol/multipath/d2_opportunistic_test.go':'10b39b08e312691c77b3d6f53be0c8406d09fc378d4347cdfa1336900f8456bd',
+            'tools/research-b10-s1-d2.patch':'2b79ddea120b5933035c8f5154a2cf6e05e1541ac5617f984e203ddfdbcbbcbd',
+            'tools/verify-download-boundary.py':'c746d7a9e91995fbe84bbcf98bb474dbdd6f2a3697247b8d36b8e23c82791b5d',
           }
           for rel,want in expected.items():
               got=hashlib.sha256(Path(rel).read_bytes()).hexdigest()
@@ -183,6 +193,7 @@ jobs:
           ROOT=Path(os.environ['GITHUB_WORKSPACE'])
           GOLDEN=Path(os.environ['GOLDEN_DIR'])
           MOD={
+            'protocol/shadowsocks/inbound.go',
             'option/multipath.go',
             'protocol/multipath/budget_stream.go','protocol/multipath/capacity.go','protocol/multipath/core.go',
             'protocol/multipath/inbound.go','protocol/multipath/memory.go','protocol/multipath/memory_available_linux.go',
@@ -190,6 +201,15 @@ jobs:
              'protocol/multipath/stream/send.go','protocol/multipath/transport.go','protocol/multipath/types.go',
              'protocol/multipath/wire.go'}
           ADD={
+            'protocol/shadowsocks/s1_detour_test.go',
+            'tools/test-s1-detour.py',
+            'tools/s1-contracts/audit_oracle_test.go.txt',
+            'tools/s1-contracts/fault_proxy_test.go.txt',
+            'tools/s1-contracts/guard_observer.go.txt',
+            'tools/s1-contracts/lifecycle_test.go.txt',
+            'tools/s1-contracts/matrix_test.go.txt',
+            'tools/s1-contracts/platform_fixture_test.go.txt',
+            'protocol/multipath/repair_contract_test.go',
             'cmd/multipath-download-audit/main.go',
             'protocol/multipath/audit/server_download.go',
             'protocol/multipath/audit/server_download_bundle.go',
@@ -278,6 +298,12 @@ jobs:
               if rel in MOD: continue
               req(rel in rt and rt[rel]==(mode,oid),'unapproved Golden drift '+rel)
           print('PASS complete-tree freeze outside authorized paths')
+          ss_before=(GOLDEN/'protocol/shadowsocks/inbound.go').read_text()
+          needle='\tmetadata.InboundType = h.Type()\n\treturn h.router.RouteConnection(ctx, conn, metadata)'
+          replacement='\tmetadata.InboundType = h.Type()\n\t//nolint:staticcheck\n\tmetadata.InboundDetour = h.listener.ListenOptions().Detour\n\treturn h.router.RouteConnection(ctx, conn, metadata)'
+          req(ss_before.count(needle)==1,'frozen SS callback identity unexpected')
+          req((ROOT/'protocol/shadowsocks/inbound.go').read_text()==ss_before.replace(needle,replacement),'SS change exceeds exact TCP Detour metadata restoration')
+          print('PASS single-user SS delta is exactly configured TCP Detour restoration')
           for rel,want in F01.items(): req(sha(ROOT/rel)==want,'F01 byte drift '+rel)
           print('PASS F01/A identity after reversing approved download observation patch')
           for rel in ('protocol/multipath/wire.go','protocol/multipath/protocol.go','protocol/multipath/activation.go',
@@ -683,22 +709,6 @@ jobs:
           temp=Path(os.environ['MUTANT_ROOT'])
           tags=os.environ['BUILD_TAGS']
           mutations=[
-            ('07-d2-missing-repair-decision','protocol/multipath/d2_opportunistic.go',
-             'c.cfg.DownloadAudit.record(repairRecord)',
-             '// MUTANT: omit the physical repair assignment journal.',
-             '^TestD2EarlyRepairAuditTrail$','native'),
-            ('08-d2-remove-hol-trigger','protocol/multipath/d2_opportunistic.go',
-             '!windowBlocked && !historyBlocked && !c.d2ConfirmedHOLLocked(head, fast)',
-             '!windowBlocked && !historyBlocked',
-             '^TestD2UnblockedHOLLaterPathReceiptRequiresEarlyRepair$','native'),
-            ('09-d2-accept-old-generation','protocol/multipath/d2_opportunistic.go',
-             'later.generation != fast.path.Generation || later.pathEnd == 0',
-             'later.pathEnd == 0',
-             '^TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt/later_old_generation$','native'),
-            ('10-d2-accept-partial-receipt','protocol/multipath/d2_opportunistic.go',
-             'later.pathEnd <= fast.path.Received',
-             'later.pathEnd-1 <= fast.path.Received',
-             '^TestD2UnblockedHOLRejectsPartialOrOldGenerationReceipt/later_partial_receipt$','native'),
             ('06-observer-memory-side-effect','protocol/multipath/download_audit.go',
              'm, _ := downloadMemory(a.memory)',
              'a.memory.snapshot(); m, _ := downloadMemory(a.memory)',
@@ -753,7 +763,7 @@ jobs:
                   print('KILLED',name,'BY',test)
               finally:
                   subprocess.run(['git','worktree','remove','--force',str(work)],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-          print('ALL 10 REPAIR MUTANTS KILLED')
+          print('ALL 6 REPAIR MUTANTS KILLED')
           PY
 
       - name: Server download producer and independent rejection contracts
@@ -778,7 +788,7 @@ jobs:
           set -euo pipefail
           python3 -B tools/verify-download-boundary.py | tee "${EVIDENCE_DIR}/research-candidate-reversal.log"
           CGO_ENABLED=1 go test -race -count=10 -timeout=10m -tags "$BUILD_TAGS" \
-            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2ECF|TestD2EarlyRepair|TestD2UnblockedHOL)' \
+            -run '^(TestS1Headroom|TestS1Buffer|TestS1Reserved|TestS1WireFrame|TestS1InactiveServer|TestD2|TestIndependentD2|TestResearchS1ByteFIFO|TestResearchS1WriterCompletion)' \
             ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/research-S1-D2-race-x10.log"
 
       - name: Research B10 actual server scope and Capacity V2 A/B performance
@@ -790,7 +800,7 @@ jobs:
           # PreferredCapacity controller (also includes preferred-only S1).
           # The candidate/control ratio remains >=98%; never relax this gate.
           CGO_ENABLED=1 go test -count=1 -timeout=20m -tags "$BUILD_TAGS" \
-            -run '^TestResearchB10(ServerDownloadCapacityHealthyAB|SingleLegServerHeadroomAB|WeakBoosterAB)$' \
+            -run '^TestResearch(B10|S1)' \
             ./protocol/multipath 2>&1 | tee "${EVIDENCE_DIR}/research-scoped-S1-D2-performance.log"
 
       - name: Check formatting of exact repair write-set
@@ -798,6 +808,8 @@ jobs:
         run: |
           set -euo pipefail
           files=(
+            protocol/shadowsocks/inbound.go protocol/shadowsocks/s1_detour_test.go
+            protocol/multipath/repair_contract_test.go
             cmd/multipath-download-audit/main.go
             option/multipath.go
             protocol/multipath/audit/server_download.go
@@ -840,7 +852,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go vet -tags "$BUILD_TAGS" ./protocol/multipath/...
+          go vet -tags "$BUILD_TAGS" ./protocol/multipath/... ./protocol/shadowsocks
 
       - name: Compile all repository packages without running tests
         shell: bash
@@ -853,121 +865,299 @@ jobs:
         run: |
           set -euo pipefail
           CGO_ENABLED=1 go test -race -count=1 -timeout=20m -skip '^TestPerformanceHealthyLinks$' \
-            -tags "$BUILD_TAGS" ./protocol/multipath/... 2>&1 | tee "${EVIDENCE_DIR}/multipath-full-race.log"
+            -tags "$BUILD_TAGS" ./protocol/multipath/... ./protocol/shadowsocks 2>&1 | tee "${EVIDENCE_DIR}/multipath-full-race.log"
 
-      - name: Golden vs repaired zero-field performance differential
+      - name: Dedicated SS Detour real application contracts
         shell: bash
         run: |
           set -euo pipefail
-          LOG_DIR="${RUNNER_TEMP}/capacity-v2-perf"
+          python3 -B tools/test-s1-detour.py --source "$GITHUB_WORKSPACE" --output "${EVIDENCE_DIR}/s1-detour-application"
+
+      - name: Strict repaired absolute performance and frozen negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="${RUNNER_TEMP}/strict-candidate-repair"
+          export LOG_DIR
           mkdir -p "$LOG_DIR"
-          run_perf() {
-            local tree="$1"
-            local label="$2"
-            local run_id="$3"
-            local log="$LOG_DIR/${label}-${run_id}.log"
-            set +e
-            (
-              cd "$tree"
-              # Race is covered by independent steps; do not distort throughput.
-              CGO_ENABLED=1 go test \
-                -count=1 \
-                -timeout=5m \
-                -v \
-                -tags "$BUILD_TAGS" \
-                -run '^TestPerformanceHealthyLinks$' \
-                ./protocol/multipath
-            ) 2>&1 | tee "$log"
-            local rc=${PIPESTATUS[0]}
-            set -e
-            # Preserve all four process results and run all paired measurements.
-            # A Golden historical beta3 assertion may fail before the repaired
-            # candidate is measured. It remains a HARD failure at the final gate.
-            printf '%s\n' "$rc" > "$LOG_DIR/${label}-${run_id}.rc"
-            echo "${label}_run_${run_id}_go_test_rc=${rc}"
-            if (( rc != 0 )); then
-              echo "RECORDED ${label} run ${run_id}: go test exited ${rc}; continue collecting A/B evidence" >&2
-            fi
-          }
-          run_perf "$PARENT_DIR" golden 1
-          run_perf "$GITHUB_WORKSPACE" repaired 1
-          run_perf "$PARENT_DIR" golden 2
-          run_perf "$GITHUB_WORKSPACE" repaired 2
-          cp -a "$LOG_DIR" "${EVIDENCE_DIR}/zero-field-performance"
-          python3 - "$LOG_DIR" <<'PY'
-          from pathlib import Path
-          import re, statistics, sys
-          d=Path(sys.argv[1])
-          expected=['1_160+600Mbps_65+110ms','8_160+600Mbps_65+110ms','32_160+600Mbps_65+110ms',
-                    '1_40+50Mbps_65+110ms','8_40+50Mbps_65+110ms','1_160+600Mbps_65+400ms',
-                    '8_160+600Mbps_65+400ms','1_160+600Mbps_110+65ms','1_160+600Mbps_5+10ms',
-                    '8_160+600Mbps_5+10ms','1_1000+1000Mbps_65+110ms']
-          run_re=re.compile(r'^=== RUN\s+TestPerformanceHealthyLinks/(.+)$')
-          rate_re=re.compile(r'performance_test\.go:\d+: flows=\d+ .*?Mbps=([0-9]+(?:\.[0-9]+)?)')
-          forbidden=(
-              'healthy reliable legs triggered replay','unused window credit caused memory pressure',
-              'memory budget exceeded','short stream:','panic:','fatal error:','test timed out','DATA RACE',
-          )
-          diagnostic_re=re.compile(r'performance_test\.go:\d+: (.*)$')
-          status_re=re.compile(r'^\s*--- (PASS|FAIL): TestPerformanceHealthyLinks/(.+?) \(')
-          def parse(p):
-              text=p.read_text(encoding='utf-8',errors='replace')
-              for x in forbidden:
-                  if x in text: raise SystemExit(f'FAIL {p.name}: unsafe fixture result: {x}')
-              cur=None; values={}; statuses={}; regressions=set()
-              for line in text.splitlines():
-                  d=diagnostic_re.search(line)
-                  if d:
-                      msg=d.group(1)
-                      if msg.startswith('throughput regression:') and cur: regressions.add(cur)
-                      if not (msg.startswith('throughput regression:') or msg.startswith('flows=')):
-                          raise SystemExit(f'FAIL {p.name}: unexpected performance diagnostic: {msg}')
-                  status=status_re.search(line)
-                  if status:
-                      case=status.group(2)
-                      if case in statuses: raise SystemExit(f'FAIL {p.name}: duplicate test status {case}')
-                      statuses[case]=status.group(1)
-                  m=run_re.search(line)
-                  if m: cur=m.group(1); continue
-                  m=rate_re.search(line)
-                  if m and cur: values[cur]=float(m.group(1))
-              missing=sorted(set(expected)-set(values)); extra=sorted(set(values)-set(expected))
-              if missing or extra: raise SystemExit(f'FAIL {p.name}: missing={missing} extra={extra}')
-              if set(statuses)!=set(expected): raise SystemExit(f'FAIL {p.name}: incomplete test statuses')
-              failed_cases={case for case,state in statuses.items() if state=='FAIL'}
-              if failed_cases != regressions: raise SystemExit(f'FAIL {p.name}: unexplained/missing failed subtests {failed_cases ^ regressions}')
-              return values
-          # A nonzero go test exit is never waived, even when every fixture
-          # emitted a throughput number. Preserve historical beta3 assertion.
-          results={}
-          for label in ('golden','repaired'):
-              for run_id in (1,2):
-                  rc_path=d/f'{label}-{run_id}.rc'
-                  rc_text=rc_path.read_text(encoding='ascii').strip()
-                  if not rc_text.isdecimal():
-                      raise SystemExit(f'FAIL invalid test exit status {rc_path.name}: {rc_text!r}')
-                  results[(label,run_id)]=int(rc_text)
-          samples={k:[parse(d/f'{k}-1.log'),parse(d/f'{k}-2.log')] for k in ('golden','repaired')}
-          failed=False
-          for case in expected:
-              gv=[x[case] for x in samples['golden']]; rv=[x[case] for x in samples['repaired']]
-              ratio=statistics.median(rv)/statistics.median(gv)
-              print(f'{case}: golden={gv} repaired={rv} ratio={ratio:.4f}')
-              failed |= ratio < 0.98
-          # Do not replace either independent gate with the other: the
-          # historical absolute beta3 test and paired relative test both apply.
-          for label in ('golden','repaired'):
-              for run_id in (1,2):
-                  print(f'{label} run {run_id}: go_test_rc={results[(label,run_id)]}')
-          if failed:
-              print('FAIL repaired zero-field performance below 98% Golden')
-          nonzero={f'{k}-{n}':rc for (k,n),rc in results.items() if rc != 0}
-          if nonzero:
-              print(f'FAIL historical absolute performance / go test process status: {nonzero}')
-          if failed or nonzero:
-              raise SystemExit('FAIL zero-field performance gate: all measured; absolute and relative thresholds enforced')
-          print('PASS historical absolute tests AND repaired retains >=98% Golden performance for all fixtures')
+          python3 <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          d=pathlib.Path(os.environ['LOG_DIR'])
+          for label,n in [('golden',1),('repaired',1),('golden',2),('repaired',2)]:
+              tree=pathlib.Path(os.environ['PARENT_DIR'] if label=='golden' else os.environ['GITHUB_WORKSPACE'])
+              key=f'{label}-{n}'
+              cmd=['go','test','-mod=readonly','-count=1','-timeout=5m','-json','-tags',os.environ['BUILD_TAGS'],'-run','^TestPerformanceHealthyLinks$','./protocol/multipath']
+              metadata={'go_version':subprocess.check_output(['go','env','GOVERSION'],cwd=tree,text=True).strip(),'fixture_sha256':hashlib.sha256((tree/'protocol/multipath/performance_test.go').read_bytes()).hexdigest(),'command':cmd,'source_path':str(tree),'capture':'direct file descriptor; no tee subprocess'}
+              with (d/(key+'.jsonl')).open('w') as log:
+                  p=subprocess.run(cmd,cwd=tree,env=dict(os.environ,CGO_ENABLED='1'),stdout=log,stderr=subprocess.STDOUT)
+              (d/(key+'.rc')).write_text(str(p.returncode)+'\n')
+              (d/(key+'.tee.rc')).write_text('0\n')
+              (d/(key+'.meta.json')).write_text(json.dumps(metadata,indent=2)+'\n')
+              print(key,'raw_go_test_rc',p.returncode,flush=True)
           PY
+          cp -a "$LOG_DIR" "${EVIDENCE_DIR}/strict-candidate-repair"
+          cat > "${RUNNER_TEMP}/strict-candidate-repair.py" <<'PY_GATE'
+          #!/usr/bin/env python3
+          """Strict candidate repair gate. Candidate failures are never inherited.
+          Frozen Golden is a negative control with its original two reproducible failures.
+          All candidate tests and unchanged absolute thresholds must actually pass.
+          """
+          import argparse
+          import json
+          import math
+          import re
+          import statistics
+          from decimal import Decimal
+          from fractions import Fraction
+          from pathlib import Path
+
+          PACKAGE = "github.com/sagernet/sing-box/protocol/multipath"
+          PARENT = "TestPerformanceHealthyLinks"
+          EXPECTED = {
+              "1_160+600Mbps_65+110ms": 506.8,
+              "8_160+600Mbps_65+110ms": 447.0,
+              "32_160+600Mbps_65+110ms": 318.4,
+              "1_40+50Mbps_65+110ms": 87.8,
+              "8_40+50Mbps_65+110ms": 43.5,
+              "1_160+600Mbps_65+400ms": 437.7,
+              "8_160+600Mbps_65+400ms": 447.0,
+              "1_160+600Mbps_110+65ms": 504.1,
+              "1_160+600Mbps_5+10ms": 518.1,
+              "8_160+600Mbps_5+10ms": 449.8,
+              "1_1000+1000Mbps_65+110ms": 1920.8,
+          }
+          KNOWN = {"8_160+600Mbps_65+400ms", "1_1000+1000Mbps_65+110ms"}
+          FIXTURE_SHA256 = "cbf7bc2012ce8ce1a18dedf75cc5177a64c7a77aee676acf5a9eea84705a1037"
+          TESTS = {PARENT} | {PARENT + "/" + n for n in EXPECTED}
+          METRIC = re.compile(
+              r"    performance_test\.go:184: flows=(\d+) duration=(\S+) Mbps=(\d+\.\d) "
+              r"fallback=(\d+\.\d{2})MiB leg1=(\d+\.\d{2})MiB timeouts=(\d+) "
+              r"queue_block=(\S+) mem_peak_TX=(\d+\.\d)MiB RX=(\d+\.\d)MiB pressure=(\d+)/(\d+)\n"
+          )
+          ASSERTION = re.compile(r"    performance_test\.go:173: throughput regression: (\d+\.\d) Mbps, beta3 (\d+\.\d)\n")
+          SUMMARY = re.compile(r"\s*--- (PASS|FAIL): (\S+) \(\d+(?:\.\d+)?s\)\n")
+          TOTAL_BYTES = 256 << 20  # Bound to the unchanged fixture hash above.
+
+
+          class Rejected(ValueError):
+              pass
+
+
+          def require(ok, message):
+              if not ok:
+                  raise Rejected(message)
+
+
+          def unique_object(pairs):
+              out = {}
+              for key, value in pairs:
+                  require(key not in out, "duplicate JSON key")
+                  out[key] = value
+              return out
+
+
+          def load_json(text):
+              return json.loads(text, object_pairs_hook=unique_object,
+                                parse_constant=lambda x: (_ for _ in ()).throw(Rejected("non-finite JSON value")))
+
+
+          def duration_ns(text):
+              units = {"h": 3600_000_000_000, "m": 60_000_000_000, "s": 1_000_000_000,
+                       "ms": 1_000_000, "us": 1000, "µs": 1000, "ns": 1}
+              parts = re.findall(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)", text)
+              require(parts and "".join(n + u for n, u in parts) == text, "invalid duration")
+              ns = sum(Decimal(n) * units[u] for n, u in parts)
+              require(0 < ns <= 2 ** 63 - 1 and ns == ns.to_integral_value(), "out-of-range/sub-nanosecond duration")
+              return int(ns)
+
+
+          def parse_run(path, rc, tee_rc, metadata):
+              require(type(rc) is int and rc in (0, 1), f"{path.name}: unexpected go exit {rc}")
+              require(type(tee_rc) is int and tee_rc == 0, f"{path.name}: log collection failed")
+              require(isinstance(metadata, dict), "metadata object required")
+              require(metadata.get("go_version") == "go1.25.5", "unapproved toolchain")
+              require(metadata.get("fixture_sha256") == FIXTURE_SHA256, "frozen fixture changed")
+              raw = path.read_text(encoding="utf-8", errors="strict")
+              require(raw and raw.endswith("\n"), "empty or truncated JSON stream")
+              started = set()
+              ended = {}
+              run_lines = set()
+              summaries = {}
+              values = {}
+              displayed = {}
+              assertions = {}
+              phases = {}
+              package_phase = 0
+              package_started = False
+              package_ended = False
+              package_markers = []
+              package_result_lines = []
+              for number, line in enumerate(raw.splitlines(), 1):
+                  e = load_json(line)
+                  require(isinstance(e, dict), f"line {number}: JSON object required")
+                  require(not package_ended, "event after package terminal event")
+                  require(e.get("Package") == PACKAGE, "unexpected package/build failure")
+                  action, test = e.get("Action"), e.get("Test")
+                  require(action in {"start", "run", "output", "pass", "fail"}, "unknown/unsafe event action")
+                  allowed = {"Time", "Action", "Package"}
+                  if action in {"run", "output", "pass", "fail"}:
+                      allowed.add("Test")
+                  if action == "output":
+                      allowed.add("Output")
+                  if action in {"pass", "fail"}:
+                      allowed.add("Elapsed")
+                  require(set(e) <= allowed, "unexpected field for event action")
+                  require(isinstance(e.get("Time"), str) and re.fullmatch(
+                      r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)", e["Time"]),
+                      "invalid/missing event timestamp")
+                  require("Test" not in e or isinstance(test, str), "invalid test name")
+                  if "Elapsed" in e:
+                      require(type(e["Elapsed"]) in (int, float) and math.isfinite(e["Elapsed"])
+                              and e["Elapsed"] >= 0, "invalid elapsed")
+                  if action == "start":
+                      require(number == 1 and not package_started and test is None, "invalid package start")
+                      package_started = True
+                      continue
+                  require(package_started, "event before package start")
+                  if action == "run":
+                      require(test in TESTS and test not in started, "unexpected/duplicate test run")
+                      require(package_phase == 0, "test after package finish began")
+                      require(test == PARENT or phases.get(PARENT) == "run_output", "child outside parent")
+                      require(not started - set(ended) - {PARENT}, "overlapping serial child tests")
+                      started.add(test)
+                      phases[test] = "run"
+                      continue
+                  if action in {"pass", "fail"}:
+                      if test is None:
+                          require(set(ended) == TESTS, "package ended before all tests")
+                          require(package_phase == 2, "package terminal before finish outputs")
+                          require(action == ended[PARENT], "package/parent result disagreement")
+                          package_ended = True
+                      else:
+                          require(test in started and test not in ended, "terminal event without unique run")
+                          require(phases[test] == "summary", "terminal before complete test output")
+                          require(summaries.get(test) == action, "terminal event/summary disagreement")
+                          require(test != PARENT or set(ended) == TESTS - {PARENT}, "parent ended before children")
+                          ended[test] = action
+                      continue
+                  output = e.get("Output")
+                  require(isinstance(output, str) and output.endswith("\n"), "missing/truncated output")
+                  require(test is None or test in started and test not in ended, "output outside live test")
+                  for text in output.splitlines(keepends=True):
+                      if test is None:
+                          require(set(ended) == TESTS, "package output before all test terminals")
+                          if text in {"PASS\n", "FAIL\n"}:
+                              require(package_phase == 0, "duplicate/out-of-order package marker")
+                              package_markers.append(text.strip().lower())
+                              package_phase = 1
+                              continue
+                          m = re.fullmatch(r"(ok  |FAIL)\t" + re.escape(PACKAGE) + r"\t(\d+(?:\.\d+)?)s\n", text)
+                          require(m is not None, "unexpected package output (compiler/panic/race/timeout/unknown)")
+                          require(package_phase == 1, "package result before marker")
+                          package_result_lines.append("pass" if m[1] == "ok  " else "fail")
+                          package_phase = 2
+                          continue
+                      if text == "=== RUN   " + test + "\n":
+                          require(test not in run_lines and phases[test] == "run", "duplicate/out-of-order RUN output")
+                          run_lines.add(test)
+                          phases[test] = "run_output"
+                          continue
+                      m = SUMMARY.fullmatch(text)
+                      if m:
+                          require(m[2] == test and test not in summaries, "wrong/duplicate summary")
+                          require(phases[test] == ("run_output" if test == PARENT else "metric"), "summary before complete test output")
+                          require(test != PARENT or set(ended) == TESTS - {PARENT}, "parent summary before children ended")
+                          summaries[test] = m[1].lower()
+                          phases[test] = "summary"
+                          continue
+                      require(test != PARENT, "unexpected parent assertion/output")
+                      case = test[len(PARENT) + 1:]
+                      m = ASSERTION.fullmatch(text)
+                      if m:
+                          require(phases[test] == "run_output", "assertion out of order")
+                          require(case in KNOWN and case not in assertions, "new/duplicate assertion")
+                          require(Fraction(m[2]) == Fraction(str(EXPECTED[case])), "changed beta3 threshold")
+                          assertions[case] = Fraction(m[1])
+                          phases[test] = "assertion"
+                          continue
+                      m = METRIC.fullmatch(text)
+                      require(m is not None and case not in values, "unknown diagnostic or duplicate metric")
+                      require(phases[test] in {"run_output", "assertion"}, "metric out of order")
+                      require(int(m[1]) == int(case.split("_", 1)[0]), "flow-count mismatch")
+                      require(float(m[3]) > 0 and float(m[4]) == 0 and int(m[6]) == 0
+                              and int(m[10]) == 0 and int(m[11]) == 0, "unsafe/invalid fixture metric")
+                      require(float(m[8]) <= 512 and float(m[9]) <= 512, "memory-budget metric exceeded")
+                      # Original fixture computes Mbps from exactly 256 MiB and this
+                      # nanosecond-precision duration. Do not let one-decimal rounding
+                      # convert a true 97.99% ratio into an apparent 98% pass.
+                      precise = Fraction(TOTAL_BYTES * 8 * 1000, duration_ns(m[2]))
+                      require(abs(precise - Fraction(m[3])) <= Fraction(".050001"), "duration/throughput mismatch")
+                      displayed[case] = Fraction(m[3])
+                      values[case] = precise
+                      phases[test] = "metric"
+              require(package_started and package_ended, "missing package terminal event")
+              require(started == TESTS and run_lines == TESTS and set(ended) == TESTS, "incomplete test lifecycle")
+              require(set(values) == set(EXPECTED), "incomplete metrics")
+              failures = {n for n in EXPECTED if ended[PARENT + "/" + n] == "fail"}
+              require(failures == set(assertions), "failed cases and exact assertions disagree")
+              for name, value in values.items():
+                  if name in failures:
+                      require(assertions[name] == displayed[name], "assertion/metric throughput mismatch")
+                      require(value < Fraction(str(EXPECTED[name])) * Fraction(98, 100), "failure not below absolute floor")
+                  else:
+                      require(value >= Fraction(str(EXPECTED[name])) * Fraction(98, 100), "pass metric below absolute floor")
+              expected_result = "fail" if failures else "pass"
+              require(ended[PARENT] == expected_result, "parent result does not match children")
+              require(package_markers == [expected_result] and package_result_lines == [expected_result], "missing/duplicate package finish output")
+              require(rc == int(bool(failures)), "process exit disagrees with complete test result")
+              return {"values": values, "failures": sorted(failures), "rc": rc}
+
+
+          def evaluate(directory):
+              directory = Path(directory)
+              runs = {}
+              for label in ("golden", "repaired"):
+                  for n in (1, 2):
+                      key = f"{label}-{n}"
+                      def read_rc(suffix):
+                          value = (directory / (key + suffix)).read_text(encoding="ascii").strip()
+                          require(re.fullmatch(r"0|[1-9][0-9]*", value), "invalid exit-code file")
+                          return int(value)
+                      runs[key] = parse_run(directory / (key + ".jsonl"), read_rc(".rc"), read_rc(".tee.rc"),
+                                            load_json((directory / (key + ".meta.json")).read_text()))
+              for n in (1, 2):
+                  require(set(runs[f"golden-{n}"]["failures"]) == KNOWN, "frozen Golden negative control changed")
+                  require(not runs[f"repaired-{n}"]["failures"] and runs[f"repaired-{n}"]["rc"] == 0, "candidate must pass every original assertion; no inherited failures")
+              ratios = {}
+              for name in EXPECTED:
+                  golden = statistics.median(runs[f"golden-{n}"]["values"][name] for n in (1, 2))
+                  repaired = statistics.median(runs[f"repaired-{n}"]["values"][name] for n in (1, 2))
+                  ratios[name] = repaired / golden
+                  require(ratios[name] >= Fraction(98, 100), f"relative performance below 98%: {name}")
+              return {"decision": "PASS_CANDIDATE_REPAIR", "absolute_performance": "CANDIDATE_ALL_PASS",
+                      "golden_negative_controls": sorted(KNOWN), "ratios": ratios,
+                      "exact_ratios": {n: f"{v.numerator}/{v.denominator}" for n, v in ratios.items()}, "runs": runs}
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("directory")
+              args = ap.parse_args()
+              try:
+                  report = evaluate(args.directory)
+              except (Rejected, ValueError, OSError, KeyError, TypeError) as exc:
+                  print(json.dumps({"decision": "REJECT", "reason": str(exc)}))
+                  return 1
+              print(json.dumps(report, indent=2, default=lambda value: float(value) if isinstance(value, Fraction) else str(value)))
+              return 0
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY_GATE
+          # The immutable old version is a negative control, never a passing candidate.
+          # Repaired runs must have zero failures and satisfy both unchanged absolute
+          # floors and >=98% Golden relative performance. No inherited-failure mode.
+          python3 "${RUNNER_TEMP}/strict-candidate-repair.py" "$LOG_DIR" | tee "${EVIDENCE_DIR}/strict-candidate-repair-result.json"
 
       - name: Remove runner-only V3 FIELD replay fixtures
         if: always()
